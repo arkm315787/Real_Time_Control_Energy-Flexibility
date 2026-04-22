@@ -1078,8 +1078,13 @@ def solve_mpc_step(
     return {"status": LpStatus[problem.status], "controls": schedule.iloc[0].to_dict(), "schedule": schedule}
 
 
-def _available_up_down(row: pd.Series, state: Dict[str, float], fleet_meta: Dict[str, float]) -> Dict[str, float]:
-    dt_h = row["dt_h"]
+def _available_up_down(
+    row: pd.Series,
+    state: Dict[str, float],
+    fleet_meta: Dict[str, float],
+    dt_h_override: float | None = None,
+) -> Dict[str, float]:
+    dt_h = float(dt_h_override if dt_h_override is not None else row["dt_h"])
     eta_c = 0.95
     eta_d = 0.95
 
@@ -1116,6 +1121,220 @@ def _available_up_down(row: pd.Series, state: Dict[str, float], fleet_meta: Dict
     }
 
 
+def build_inner_tracking_window(
+    df: pd.DataFrame,
+    preview_4s: pd.DataFrame | None,
+    row_idx: int,
+    dt_seconds: int = 4,
+) -> pd.DataFrame:
+    row = df.iloc[row_idx]
+    next_idx = min(row_idx + 1, len(df) - 1)
+    next_row = df.iloc[next_idx]
+    interval_seconds = max(int(round(float(row["dt_h"]) * 3600.0)), dt_seconds)
+    steps = max(interval_seconds // dt_seconds, 1)
+    start_ts = pd.Timestamp(row.name)
+    inner_index = pd.date_range(start_ts, periods=steps, freq=f"{dt_seconds}s")
+
+    fine = pd.DataFrame(index=inner_index)
+    preview_window = pd.DataFrame()
+    if preview_4s is not None and not preview_4s.empty:
+        preview_window = preview_4s.reindex(inner_index)
+
+    current_fcr = float(row["fcr_up_act_frac"] - row["fcr_down_act_frac"])
+    next_fcr = float(next_row["fcr_up_act_frac"] - next_row["fcr_down_act_frac"])
+    current_afrr = float(row["afrr_up_act_frac"] - row["afrr_down_act_frac"])
+    next_afrr = float(next_row["afrr_up_act_frac"] - next_row["afrr_down_act_frac"])
+
+    if not preview_window.empty and preview_window[["fcr_signal_norm", "afrr_signal_norm", "frequency_hz"]].notna().all().all():
+        fine["fcr_signal_norm"] = preview_window["fcr_signal_norm"].astype(float).clip(-1.0, 1.0)
+        fine["afrr_signal_norm"] = preview_window["afrr_signal_norm"].astype(float).clip(-1.0, 1.0)
+        fine["frequency_hz"] = preview_window["frequency_hz"].astype(float)
+    else:
+        fine["fcr_signal_norm"] = np.linspace(current_fcr, next_fcr, steps)
+        fine["afrr_signal_norm"] = np.linspace(current_afrr, next_afrr, steps)
+        fine["frequency_hz"] = 50.0 - 0.1 * fine["fcr_signal_norm"]
+
+    fine["fcr_up_act_frac"] = np.clip(fine["fcr_signal_norm"], 0.0, 1.0)
+    fine["fcr_down_act_frac"] = np.clip(-fine["fcr_signal_norm"], 0.0, 1.0)
+    fine["afrr_up_act_frac"] = np.clip(fine["afrr_signal_norm"], 0.0, 1.0)
+    fine["afrr_down_act_frac"] = np.clip(-fine["afrr_signal_norm"], 0.0, 1.0)
+    return fine
+
+
+def simulate_tracking_interval(
+    row: pd.Series,
+    fine_signals: pd.DataFrame,
+    plan: Dict[str, float],
+    state: Dict[str, float],
+    fleet_meta: Dict[str, float],
+    market_mode: str,
+    dt_seconds: int = 4,
+) -> tuple[Dict[str, float], pd.DataFrame]:
+    dt_h = dt_seconds / 3600.0
+    eta_c = 0.95
+    eta_d = 0.95
+    outer_dt_h = float(row["dt_h"])
+    temp_alpha_sub = 0.90 ** (dt_h / max(outer_dt_h, 1e-6))
+    temp_beta_sub = 0.16 * dt_h
+    bess_tau_s = 2.0
+    ev_tau_s = 4.0
+    hvac_tau_s = float(fleet_meta.get("hvac_response_s", default_hvac_response_seconds(str(fleet_meta.get("hvac_mode", HVAC_MODES[0])))))
+    alpha_bess = min(1.0, dt_seconds / max(bess_tau_s, 1e-6))
+    alpha_ev = min(1.0, dt_seconds / max(ev_tau_s, 1e-6))
+    alpha_hvac = min(1.0, dt_seconds / max(hvac_tau_s, 1e-6))
+
+    dispatch_state = {
+        "bess_dispatch_kw": float(state.get("bess_dispatch_kw", 0.0)),
+        "ev_dispatch_kw": float(state.get("ev_dispatch_kw", 0.0)),
+        "hvac_dispatch_kw": float(state.get("hvac_dispatch_kw", 0.0)),
+    }
+    inner_records: List[Dict[str, float]] = []
+
+    for ts, signal in fine_signals.iterrows():
+        avail = _available_up_down(row, state, fleet_meta, dt_h_override=dt_h)
+        fcr_signal = float(signal["fcr_signal_norm"]) if market_mode in {"FCR-N", "Combined"} else 0.0
+        afrr_signal = float(signal["afrr_signal_norm"]) if market_mode in {"aFRR", "Combined"} else 0.0
+
+        req_components = {
+            "bess_fcr": fcr_signal * float(plan.get("bess_fcr_kw", 0.0)),
+            "ev_fcr": fcr_signal * float(plan.get("ev_fcr_kw", 0.0)),
+            "hvac_fcr": fcr_signal * float(plan.get("hvac_fcr_kw", 0.0)),
+            "bess_afrr": max(afrr_signal, 0.0) * float(plan.get("bess_afrr_up_kw", 0.0)) - max(-afrr_signal, 0.0) * float(plan.get("bess_afrr_down_kw", 0.0)),
+            "ev_afrr": max(afrr_signal, 0.0) * float(plan.get("ev_afrr_up_kw", 0.0)) - max(-afrr_signal, 0.0) * float(plan.get("ev_afrr_down_kw", 0.0)),
+            "hvac_afrr": max(afrr_signal, 0.0) * float(plan.get("hvac_afrr_up_kw", 0.0)) - max(-afrr_signal, 0.0) * float(plan.get("hvac_afrr_down_kw", 0.0)),
+        }
+
+        pv_dispatch_kw = -min(max(-afrr_signal, 0.0) * float(plan.get("pv_afrr_down_kw", 0.0)), avail["pv_down_av"])
+        targets = {
+            "bess_dispatch_kw": float(np.clip(req_components["bess_fcr"] + req_components["bess_afrr"], -avail["bess_down_av"], avail["bess_up_av"])),
+            "ev_dispatch_kw": float(np.clip(req_components["ev_fcr"] + req_components["ev_afrr"], -avail["ev_down_av"], avail["ev_up_av"])),
+            "hvac_dispatch_kw": float(np.clip(req_components["hvac_fcr"] + req_components["hvac_afrr"], -avail["hvac_down_av"], avail["hvac_up_av"])),
+        }
+
+        dispatch_state["bess_dispatch_kw"] = float(
+            np.clip(
+                dispatch_state["bess_dispatch_kw"] + alpha_bess * (targets["bess_dispatch_kw"] - dispatch_state["bess_dispatch_kw"]),
+                -avail["bess_down_av"],
+                avail["bess_up_av"],
+            )
+        )
+        dispatch_state["ev_dispatch_kw"] = float(
+            np.clip(
+                dispatch_state["ev_dispatch_kw"] + alpha_ev * (targets["ev_dispatch_kw"] - dispatch_state["ev_dispatch_kw"]),
+                -avail["ev_down_av"],
+                avail["ev_up_av"],
+            )
+        )
+        dispatch_state["hvac_dispatch_kw"] = float(
+            np.clip(
+                dispatch_state["hvac_dispatch_kw"] + alpha_hvac * (targets["hvac_dispatch_kw"] - dispatch_state["hvac_dispatch_kw"]),
+                -avail["hvac_down_av"],
+                avail["hvac_up_av"],
+            )
+        )
+
+        actual_signed = {
+            "bess": dispatch_state["bess_dispatch_kw"],
+            "ev": dispatch_state["ev_dispatch_kw"],
+            "hvac": dispatch_state["hvac_dispatch_kw"],
+        }
+
+        def _split_actual(actual_kw: float, fcr_req_kw: float, afrr_req_kw: float) -> tuple[float, float]:
+            total_abs = abs(fcr_req_kw) + abs(afrr_req_kw)
+            if total_abs <= 1e-9:
+                return 0.0, 0.0
+            return actual_kw * abs(fcr_req_kw) / total_abs, actual_kw * abs(afrr_req_kw) / total_abs
+
+        bess_fcr_actual_signed, bess_afrr_actual_signed = _split_actual(actual_signed["bess"], req_components["bess_fcr"], req_components["bess_afrr"])
+        ev_fcr_actual_signed, ev_afrr_actual_signed = _split_actual(actual_signed["ev"], req_components["ev_fcr"], req_components["ev_afrr"])
+        hvac_fcr_actual_signed, hvac_afrr_actual_signed = _split_actual(actual_signed["hvac"], req_components["hvac_fcr"], req_components["hvac_afrr"])
+
+        bess_up = max(actual_signed["bess"], 0.0)
+        bess_down = max(-actual_signed["bess"], 0.0)
+        ev_up = max(actual_signed["ev"], 0.0)
+        ev_down = max(-actual_signed["ev"], 0.0)
+        hvac_up = max(actual_signed["hvac"], 0.0)
+        hvac_down = max(-actual_signed["hvac"], 0.0)
+        pv_down = max(-pv_dispatch_kw, 0.0)
+
+        requested_signed_total = sum(req_components.values()) + pv_dispatch_kw
+        delivered_signed_total = actual_signed["bess"] + actual_signed["ev"] + actual_signed["hvac"] + pv_dispatch_kw
+
+        state["bess_soc_mwh"] += dt_h / 1000.0 * (eta_c * bess_down - bess_up / eta_d)
+        state["ev_soc_delta_mwh"] += dt_h / 1000.0 * (eta_c * ev_down - ev_up / eta_d)
+        state["temp_delta_c"] = temp_alpha_sub * state["temp_delta_c"] + temp_beta_sub * ((hvac_down - hvac_up) / max(fleet_meta["n_hvac"], 1))
+        state["bess_dispatch_kw"] = dispatch_state["bess_dispatch_kw"]
+        state["ev_dispatch_kw"] = dispatch_state["ev_dispatch_kw"]
+        state["hvac_dispatch_kw"] = dispatch_state["hvac_dispatch_kw"]
+
+        inner_records.append(
+            {
+                "timestamp": ts,
+                "frequency_hz": float(signal["frequency_hz"]),
+                "fcr_signal_norm": fcr_signal,
+                "afrr_signal_norm": afrr_signal,
+                "requested_up_kw": max(requested_signed_total, 0.0),
+                "requested_down_kw": max(-requested_signed_total, 0.0),
+                "delivered_up_kw": max(delivered_signed_total, 0.0),
+                "delivered_down_kw": max(-delivered_signed_total, 0.0),
+                "bess_up_kw": bess_up,
+                "bess_down_kw": bess_down,
+                "ev_up_kw": ev_up,
+                "ev_down_kw": ev_down,
+                "hvac_up_kw": hvac_up,
+                "hvac_down_kw": hvac_down,
+                "pv_down_kw": pv_down,
+                "bess_fcr_up_kw": max(bess_fcr_actual_signed, 0.0),
+                "bess_fcr_down_kw": max(-bess_fcr_actual_signed, 0.0),
+                "ev_fcr_up_kw": max(ev_fcr_actual_signed, 0.0),
+                "ev_fcr_down_kw": max(-ev_fcr_actual_signed, 0.0),
+                "hvac_fcr_up_kw": max(hvac_fcr_actual_signed, 0.0),
+                "hvac_fcr_down_kw": max(-hvac_fcr_actual_signed, 0.0),
+                "bess_afrr_up_kw": max(bess_afrr_actual_signed, 0.0),
+                "bess_afrr_down_kw": max(-bess_afrr_actual_signed, 0.0),
+                "ev_afrr_up_kw": max(ev_afrr_actual_signed, 0.0),
+                "ev_afrr_down_kw": max(-ev_afrr_actual_signed, 0.0),
+                "hvac_afrr_up_kw": max(hvac_afrr_actual_signed, 0.0),
+                "hvac_afrr_down_kw": max(-hvac_afrr_actual_signed, 0.0),
+                "pv_afrr_down_kw": pv_down,
+                "bess_soc_mwh": state["bess_soc_mwh"],
+                "ev_soc_mwh": row["ev_soc_ref_mwh"] + state["ev_soc_delta_mwh"],
+                "indoor_temp_c": row["indoor_temp_c_ref"] + state["temp_delta_c"],
+                "optimized_net_load_kw": row["net_load_baseline_kw"] - max(delivered_signed_total, 0.0) + max(-delivered_signed_total, 0.0),
+                "baseline_net_load_kw": row["net_load_baseline_kw"],
+            }
+        )
+
+    tracking_df = pd.DataFrame(inner_records).set_index("timestamp")
+    aggregated = {
+        "frequency_hz": float(tracking_df["frequency_hz"].mean()),
+        "requested_up_kw": float(tracking_df["requested_up_kw"].mean()),
+        "requested_down_kw": float(tracking_df["requested_down_kw"].mean()),
+        "delivered_up_kw": float(tracking_df["delivered_up_kw"].mean()),
+        "delivered_down_kw": float(tracking_df["delivered_down_kw"].mean()),
+        "bess_up_kw": float(tracking_df["bess_up_kw"].mean()),
+        "bess_down_kw": float(tracking_df["bess_down_kw"].mean()),
+        "ev_up_kw": float(tracking_df["ev_up_kw"].mean()),
+        "ev_down_kw": float(tracking_df["ev_down_kw"].mean()),
+        "hvac_up_kw": float(tracking_df["hvac_up_kw"].mean()),
+        "hvac_down_kw": float(tracking_df["hvac_down_kw"].mean()),
+        "pv_down_kw": float(tracking_df["pv_down_kw"].mean()),
+        "hvac_fcr_up_kw": float(tracking_df["hvac_fcr_up_kw"].mean()),
+        "hvac_fcr_down_kw": float(tracking_df["hvac_fcr_down_kw"].mean()),
+        "bess_fcr_up_kw": float(tracking_df["bess_fcr_up_kw"].mean()),
+        "bess_fcr_down_kw": float(tracking_df["bess_fcr_down_kw"].mean()),
+        "ev_fcr_up_kw": float(tracking_df["ev_fcr_up_kw"].mean()),
+        "ev_fcr_down_kw": float(tracking_df["ev_fcr_down_kw"].mean()),
+        "bess_soc_mwh": float(state["bess_soc_mwh"]),
+        "ev_soc_mwh": float(tracking_df["ev_soc_mwh"].iloc[-1]),
+        "indoor_temp_c": float(tracking_df["indoor_temp_c"].iloc[-1]),
+        "optimized_net_load_kw": float(tracking_df["optimized_net_load_kw"].mean()),
+        "baseline_net_load_kw": float(tracking_df["baseline_net_load_kw"].mean()),
+        "tracking_samples": len(tracking_df),
+    }
+    return aggregated, tracking_df
+
+
 def run_mpc_controller(
     df: pd.DataFrame,
     models: Dict[str, ForecastSpec],
@@ -1125,6 +1344,7 @@ def run_mpc_controller(
     horizon_hours: int,
     dispatch_hours: int,
     penalty_weights: Dict[str, float],
+    preview_4s: pd.DataFrame | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> Dict[str, object]:
     sim_steps = min(int(dispatch_hours / df["dt_h"].iloc[0]), len(df) - 2)
@@ -1133,14 +1353,18 @@ def run_mpc_controller(
         "bess_soc_mwh": float(df["bess_soc_ref_mwh"].iloc[0]),
         "ev_soc_delta_mwh": 0.0,
         "temp_delta_c": 0.0,
+        "bess_dispatch_kw": 0.0,
+        "ev_dispatch_kw": 0.0,
+        "hvac_dispatch_kw": 0.0,
     }
     history: List[Dict[str, float]] = []
     schedule_snapshots: List[pd.DataFrame] = []
-    total_work = max(sim_steps * (horizon_steps + 1), 1)
+    tracking_history: List[pd.DataFrame] = []
+    total_work = max(sim_steps * (horizon_steps + 2), 1)
 
     for t in range(sim_steps):
         base_slice = df.iloc[t + 1 : t + 1 + horizon_steps].copy()
-        base_progress = t * (horizon_steps + 1)
+        base_progress = t * (horizon_steps + 2)
 
         def _forecast_step_callback(step_idx: int, step_total: int) -> None:
             if progress_callback:
@@ -1198,56 +1422,37 @@ def run_mpc_controller(
         schedule_snapshots.append(solution["schedule"])
         plan = solution["controls"]
         row = df.iloc[t]
-        avail = _available_up_down(row, state, fleet_meta)
         dt_h = row["dt_h"]
-        eta_c = 0.95
-        eta_d = 0.95
-        temp_alpha = 0.90
-        temp_beta = 0.16 * dt_h
-
-        fcr_up_frac = row["fcr_up_act_frac"] if market_mode in {"FCR-N", "Combined"} else 0.0
-        fcr_down_frac = row["fcr_down_act_frac"] if market_mode in {"FCR-N", "Combined"} else 0.0
-        afrr_up_frac = row["afrr_up_act_frac"] if market_mode in {"aFRR", "Combined"} else 0.0
-        afrr_down_frac = row["afrr_down_act_frac"] if market_mode in {"aFRR", "Combined"} else 0.0
-
-        bess_fcr_av = min(plan.get("bess_fcr_kw", 0.0), avail["bess_up_av"], avail["bess_down_av"])
-        ev_fcr_av = min(plan.get("ev_fcr_kw", 0.0), avail["ev_up_av"], avail["ev_down_av"])
-        hvac_fcr_av = min(plan.get("hvac_fcr_kw", 0.0), avail["hvac_fast_av"])
-        bess_afrr_up = min(plan.get("bess_afrr_up_kw", 0.0), max(avail["bess_up_av"] - bess_fcr_av, 0.0))
-        bess_afrr_down = min(plan.get("bess_afrr_down_kw", 0.0), max(avail["bess_down_av"] - bess_fcr_av, 0.0))
-        ev_afrr_up = min(plan.get("ev_afrr_up_kw", 0.0), max(avail["ev_up_av"] - ev_fcr_av, 0.0))
-        ev_afrr_down = min(plan.get("ev_afrr_down_kw", 0.0), max(avail["ev_down_av"] - ev_fcr_av, 0.0))
-        hvac_afrr_up = min(plan.get("hvac_afrr_up_kw", 0.0), max(avail["hvac_up_av"] - hvac_fcr_av, 0.0))
-        hvac_afrr_down = min(plan.get("hvac_afrr_down_kw", 0.0), max(avail["hvac_down_av"] - hvac_fcr_av, 0.0))
-        pv_afrr_down = min(plan.get("pv_afrr_down_kw", 0.0), avail["pv_down_av"])
-
-        actual_bess_up = fcr_up_frac * bess_fcr_av + afrr_up_frac * bess_afrr_up
-        actual_bess_down = fcr_down_frac * bess_fcr_av + afrr_down_frac * bess_afrr_down
-        actual_ev_up = fcr_up_frac * ev_fcr_av + afrr_up_frac * ev_afrr_up
-        actual_ev_down = fcr_down_frac * ev_fcr_av + afrr_down_frac * ev_afrr_down
-        actual_hvac_fcr_up = fcr_up_frac * hvac_fcr_av
-        actual_hvac_fcr_down = fcr_down_frac * hvac_fcr_av
-        actual_hvac_up = actual_hvac_fcr_up + afrr_up_frac * hvac_afrr_up
-        actual_hvac_down = actual_hvac_fcr_down + afrr_down_frac * hvac_afrr_down
-        actual_pv_down = afrr_down_frac * pv_afrr_down
-
-        requested_up = fcr_up_frac * (plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0) + plan.get("hvac_fcr_kw", 0.0)) + afrr_up_frac * (
-            plan.get("bess_afrr_up_kw", 0.0) + plan.get("ev_afrr_up_kw", 0.0) + plan.get("hvac_afrr_up_kw", 0.0)
+        fine_signals = build_inner_tracking_window(df, preview_4s, t)
+        if progress_callback:
+            progress_callback(
+                base_progress + horizon_steps + 2,
+                total_work,
+                f"Tracking 4-second controller for MPC interval {t + 1}/{sim_steps}",
+            )
+        interval_summary, interval_tracking = simulate_tracking_interval(
+            row=row,
+            fine_signals=fine_signals,
+            plan=plan,
+            state=state,
+            fleet_meta=fleet_meta,
+            market_mode=market_mode,
         )
-        requested_down = fcr_down_frac * (plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0) + plan.get("hvac_fcr_kw", 0.0)) + afrr_down_frac * (
-            plan.get("bess_afrr_down_kw", 0.0)
-            + plan.get("ev_afrr_down_kw", 0.0)
-            + plan.get("hvac_afrr_down_kw", 0.0)
-            + plan.get("pv_afrr_down_kw", 0.0)
-        )
-        delivered_up = actual_bess_up + actual_ev_up + actual_hvac_up
-        delivered_down = actual_bess_down + actual_ev_down + actual_hvac_down + actual_pv_down
+        tracking_history.append(interval_tracking)
 
-        state["bess_soc_mwh"] += dt_h / 1000.0 * (eta_c * actual_bess_down - actual_bess_up / eta_d)
-        state["ev_soc_delta_mwh"] += dt_h / 1000.0 * (eta_c * actual_ev_down - actual_ev_up / eta_d)
-        state["temp_delta_c"] = temp_alpha * state["temp_delta_c"] + temp_beta * (
-            (actual_hvac_down - actual_hvac_up) / max(fleet_meta["n_hvac"], 1)
-        )
+        actual_bess_up = interval_summary["bess_up_kw"]
+        actual_bess_down = interval_summary["bess_down_kw"]
+        actual_ev_up = interval_summary["ev_up_kw"]
+        actual_ev_down = interval_summary["ev_down_kw"]
+        actual_hvac_fcr_up = interval_summary["hvac_fcr_up_kw"]
+        actual_hvac_fcr_down = interval_summary["hvac_fcr_down_kw"]
+        actual_hvac_up = interval_summary["hvac_up_kw"]
+        actual_hvac_down = interval_summary["hvac_down_kw"]
+        actual_pv_down = interval_summary["pv_down_kw"]
+        requested_up = interval_summary["requested_up_kw"]
+        requested_down = interval_summary["requested_down_kw"]
+        delivered_up = interval_summary["delivered_up_kw"]
+        delivered_down = interval_summary["delivered_down_kw"]
 
         fcr_bid_kw = plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0) + plan.get("hvac_fcr_kw", 0.0)
         afrr_up_bid_kw = plan.get("bess_afrr_up_kw", 0.0) + plan.get("ev_afrr_up_kw", 0.0) + plan.get("hvac_afrr_up_kw", 0.0)
@@ -1277,9 +1482,9 @@ def run_mpc_controller(
         history.append(
             {
                 "timestamp": row.name,
-                "baseline_net_load_kw": row["net_load_baseline_kw"],
-                "optimized_net_load_kw": row["net_load_baseline_kw"] - delivered_up + delivered_down,
-                "frequency_hz": row["frequency_hz"],
+                "baseline_net_load_kw": interval_summary["baseline_net_load_kw"],
+                "optimized_net_load_kw": interval_summary["optimized_net_load_kw"],
+                "frequency_hz": interval_summary["frequency_hz"],
                 "fcr_bid_kw": fcr_bid_kw,
                 "afrr_up_bid_kw": afrr_up_bid_kw,
                 "afrr_down_bid_kw": afrr_down_bid_kw,
@@ -1301,11 +1506,12 @@ def run_mpc_controller(
                 "degradation_cost_eur": degradation_cost,
                 "comfort_penalty_eur": comfort_penalty,
                 "net_revenue_eur": capacity_revenue + activation_revenue - degradation_cost - comfort_penalty,
-                "bess_soc_mwh": state["bess_soc_mwh"],
-                "ev_soc_mwh": row["ev_soc_ref_mwh"] + state["ev_soc_delta_mwh"],
-                "indoor_temp_c": row["indoor_temp_c_ref"] + state["temp_delta_c"],
+                "bess_soc_mwh": interval_summary["bess_soc_mwh"],
+                "ev_soc_mwh": interval_summary["ev_soc_mwh"],
+                "indoor_temp_c": interval_summary["indoor_temp_c"],
                 "fcr_accuracy_ratio": delivered_up / requested_up if requested_up > 1 else np.nan,
                 "down_accuracy_ratio": delivered_down / requested_down if requested_down > 1 else np.nan,
+                "inner_tracking_samples": interval_summary["tracking_samples"],
             }
         )
 
@@ -1413,6 +1619,7 @@ def run_mpc_controller(
     }
     return {
         "history": result_df,
+        "tracking_4s": pd.concat(tracking_history) if tracking_history else pd.DataFrame(),
         "summary": summary,
         "compliance": compliance,
         "first_schedule": schedule_snapshots[0] if schedule_snapshots else pd.DataFrame(),
@@ -1638,7 +1845,17 @@ def sensitivity_scan(
                 "hvac_mode": base_params.get("hvac_mode", HVAC_MODES[0]),
                 "hvac_response_s": base_params.get("hvac_response_s", default_hvac_response_seconds(str(base_params.get("hvac_mode", HVAC_MODES[0])))),
             }
-            result = run_mpc_controller(df, models, fleet_meta, market_mode, resource_mode, horizon_hours, dispatch_hours, penalty_weights)
+            result = run_mpc_controller(
+                df,
+                models,
+                fleet_meta,
+                market_mode,
+                resource_mode,
+                horizon_hours,
+                dispatch_hours,
+                penalty_weights,
+                preview_4s=bundle["preview_4s"],
+            )
             records.append({"price_multiplier": price_mult, "bess_pen": bess_pen, "revenue_eur": result["summary"].get("total_revenue_eur", 0.0)})
             if progress_callback:
                 progress_callback(case_idx, total_cases, f"Finished scenario {case_idx}/{total_cases}")
@@ -1962,7 +2179,10 @@ def main() -> None:
 
     with tabs[4]:
         st.subheader("MPC Optimizer & Market Participation")
-        st.caption(f"The synthetic portfolio, forecasting loop, and MPC controller are all running at a {freq_minutes}-minute interval in this scenario.")
+        st.caption(
+            f"The outer MPC, synthetic portfolio, and forecasting loop run at a {freq_minutes}-minute interval. "
+            "Inside each MPC interval, a 4-second tracking controller updates BESS, EV, and HVAC dispatch against the reserve signals."
+        )
         opt1, opt2, opt3, opt4 = st.columns(4)
         market_mode = opt1.selectbox("Market product", ["Combined", "FCR-N", "aFRR"], help="Combined allows the MPC to split the portfolio across both products.")
         resource_mode = opt2.selectbox("Resource strategy", ["Hybrid portfolio", "Fast only"], help="Fast only uses BESS + EV. Hybrid also activates HVAC and PV for aFRR.")
@@ -2010,6 +2230,7 @@ def main() -> None:
                     horizon_hours=horizon_hours,
                     dispatch_hours=dispatch_hours,
                     penalty_weights={"degradation": degradation_w, "comfort": comfort_w, "departure": departure_w},
+                    preview_4s=preview_4s,
                     progress_callback=lambda current, total, message: mpc_tracker(
                         8 + int(round((current / max(total, 1)) * 92)),
                         100,
@@ -2017,7 +2238,10 @@ def main() -> None:
                     ),
                 )
                 mpc_tracker(100, 100, "MPC dispatch finished")
-        result = st.session_state.get("mpc_result", {"history": pd.DataFrame(), "summary": {}, "compliance": {}, "first_schedule": pd.DataFrame()})
+        result = st.session_state.get(
+            "mpc_result",
+            {"history": pd.DataFrame(), "tracking_4s": pd.DataFrame(), "summary": {}, "compliance": {}, "first_schedule": pd.DataFrame()},
+        )
         result_df = result["history"]
 
         if result_df.empty:
@@ -2082,6 +2306,7 @@ def main() -> None:
             st.info("Run the MPC tab to populate the simulation results.")
         else:
             result_df = result["history"]
+            tracking_df = result.get("tracking_4s", pd.DataFrame())
             s = result["summary"]
             ts_left, ts_right = st.columns([1.45, 1.0])
             ts_left.plotly_chart(
@@ -2127,6 +2352,39 @@ def main() -> None:
             heat_cols[0].plotly_chart(apply_chart_style(availability_heatmap(result_df, "fcr_bid_kw", "FCR/aFRR bid heatmap", "PuBu"), template, height=320), use_container_width=True)
             heat_cols[1].plotly_chart(apply_chart_style(availability_heatmap(bid_success, "success", "Bid success heatmap", "Greens"), template, height=320), use_container_width=True)
 
+            if not tracking_df.empty:
+                st.markdown("### 4-second inner-loop tracking")
+                st.caption("This view shows the fast inner controller tracking the reserve request inside the slower outer MPC interval.")
+                tracking_window = tracking_df.iloc[: min(len(tracking_df), max(450, int(3600 / 4)))]
+                tracking_fig = go.Figure()
+                tracking_fig.add_trace(
+                    go.Scatter(
+                        x=tracking_window.index,
+                        y=(tracking_window["requested_up_kw"] - tracking_window["requested_down_kw"]) / 1000.0,
+                        name="Requested reserve (MW)",
+                        line={"color": RESOURCE_COLORS["Frequency"], "dash": "dot"},
+                    )
+                )
+                tracking_fig.add_trace(
+                    go.Scatter(
+                        x=tracking_window.index,
+                        y=(tracking_window["delivered_up_kw"] - tracking_window["delivered_down_kw"]) / 1000.0,
+                        name="Delivered reserve (MW)",
+                        line={"color": RESOURCE_COLORS["Net"], "width": 3},
+                    )
+                )
+                tracking_fig.add_trace(
+                    go.Scatter(x=tracking_window.index, y=tracking_window["bess_up_kw"] / 1000.0, name="BESS up", line={"color": RESOURCE_COLORS["BESS"]})
+                )
+                tracking_fig.add_trace(
+                    go.Scatter(x=tracking_window.index, y=-tracking_window["ev_down_kw"] / 1000.0, name="EV down", line={"color": RESOURCE_COLORS["EV"]})
+                )
+                tracking_fig.add_trace(
+                    go.Scatter(x=tracking_window.index, y=tracking_window["hvac_up_kw"] / 1000.0, name="HVAC up", line={"color": RESOURCE_COLORS["HVAC"]})
+                )
+                tracking_fig.update_layout(yaxis_title="MW")
+                st.plotly_chart(apply_chart_style(tracking_fig, template, height=380, title="Inner-loop tracking response (first interval window)"), use_container_width=True)
+
             st.markdown("### What-if scenario playground")
             wf1, wf2, wf3 = st.columns(3)
             price_multiplier = wf1.slider("Price multiplier", 0.7, 1.5, 1.0, 0.05)
@@ -2169,6 +2427,7 @@ def main() -> None:
                         st.session_state["mpc_config"]["horizon_hours"],
                         st.session_state["mpc_config"]["dispatch_hours"],
                         {"degradation": degradation_w, "comfort": comfort_w, "departure": departure_w},
+                        preview_4s=preview_4s,
                         progress_callback=lambda current, total, message: whatif_tracker(
                             18 + int(round((current / max(total, 1)) * 76)),
                             100,
@@ -2191,11 +2450,17 @@ def main() -> None:
     with tabs[6]:
         st.subheader("Advanced / Export")
         config = st.session_state.get("mpc_config", {"market_mode": "Combined", "resource_mode": "Hybrid portfolio", "horizon_hours": 24, "dispatch_hours": 24})
-        result = st.session_state.get("mpc_result", {"history": pd.DataFrame(), "summary": {}, "compliance": {}})
+        result = st.session_state.get("mpc_result", {"history": pd.DataFrame(), "tracking_4s": pd.DataFrame(), "summary": {}, "compliance": {}})
+        tracking_export = result.get("tracking_4s", pd.DataFrame())
 
         export_left, export_right = st.columns([1, 1])
         export_left.download_button("Download simulation bundle (JSON)", data=json.dumps(summary, indent=2).encode("utf-8"), file_name="flexihome_summary.json", mime="application/json")
-        export_right.download_button("Download high-resolution preview (CSV)", data=preview_4s.to_csv().encode("utf-8"), file_name="flexihome_4s_preview.csv", mime="text/csv")
+        export_right.download_button(
+            "Download 4-second tracking results (CSV)",
+            data=(tracking_export if not tracking_export.empty else preview_4s).to_csv().encode("utf-8"),
+            file_name="flexihome_4s_tracking.csv",
+            mime="text/csv",
+        )
 
         if result.get("summary"):
             pdf_bytes = make_pdf_summary(result["summary"], result["compliance"], config)

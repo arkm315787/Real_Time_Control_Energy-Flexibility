@@ -1,0 +1,3 @@
+# Optional add-on for the LSTM forecaster in the Forecasting Lab.
+# The dashboard runs without this file; install it only if you want LSTM support.
+tensorflow>=2.18

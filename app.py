@@ -23,9 +23,10 @@ import io
 import json
 import math
 import pickle
+import time
 import textwrap
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -285,22 +286,44 @@ def default_hvac_response_seconds(hvac_mode: str) -> float:
 
 
 def apply_chart_style(fig: go.Figure, template: str, height: int | None = None, title: str | None = None) -> go.Figure:
-    resolved_title = title if title is not None else (fig.layout.title.text if fig.layout.title and fig.layout.title.text else None)
+    existing_title = fig.layout.title.text if fig.layout.title and fig.layout.title.text else None
+    if isinstance(existing_title, str) and existing_title.strip().lower() == "undefined":
+        existing_title = None
+    resolved_title = title if title not in {None, "undefined"} else existing_title
     layout_updates = dict(
         template=template,
         height=height if height is not None else fig.layout.height,
         font=dict(size=16),
-        title_font=dict(size=22),
         legend=dict(font=dict(size=16), title_font=dict(size=17)),
         hoverlabel=dict(font_size=16),
         margin=dict(l=20, r=20, t=50, b=12),
     )
     if resolved_title:
-        layout_updates["title"] = resolved_title
+        layout_updates["title"] = dict(text=resolved_title, font=dict(size=22))
+    else:
+        fig.update_layout(title=None)
     fig.update_layout(**layout_updates)
     fig.update_xaxes(title_font=dict(size=18), tickfont=dict(size=15))
     fig.update_yaxes(title_font=dict(size=18), tickfont=dict(size=15))
     return fig
+
+
+def make_progress_tracker(
+    progress_bar,
+    text_placeholder,
+    label: str,
+) -> Callable[[int, int, str], None]:
+    started = time.perf_counter()
+
+    def update(current: int, total: int, message: str) -> None:
+        total = max(int(total), 1)
+        current = max(0, min(int(current), total))
+        fraction = current / total
+        elapsed = time.perf_counter() - started
+        progress_bar.progress(fraction)
+        text_placeholder.caption(f"{label}: {message} • {fraction:.0%} complete • {elapsed:.1f}s elapsed")
+
+    return update
 
 
 def styled_dataframe(frame: pd.DataFrame) -> pd.io.formats.style.Styler:
@@ -783,6 +806,7 @@ def iterative_forecast(
     horizon_steps: int,
     models: Dict[str, ForecastSpec],
     targets: List[str],
+    step_callback: Callable[[int, int], None] | None = None,
 ) -> pd.DataFrame:
     work = df.copy()
     future_slice = work.iloc[: current_pos + horizon_steps + 1].copy()
@@ -798,6 +822,8 @@ def iterative_forecast(
             prediction = float(spec.model.predict(row)[0])
             future_slice.loc[future_slice.index[pred_pos], target] = prediction
             output.loc[future_slice.index[pred_pos], target] = prediction
+        if step_callback:
+            step_callback(step_ahead, horizon_steps)
     return output
 
 
@@ -1099,6 +1125,7 @@ def run_mpc_controller(
     horizon_hours: int,
     dispatch_hours: int,
     penalty_weights: Dict[str, float],
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> Dict[str, object]:
     sim_steps = min(int(dispatch_hours / df["dt_h"].iloc[0]), len(df) - 2)
     horizon_steps = min(int(horizon_hours / df["dt_h"].iloc[0]), len(df) - 2)
@@ -1109,10 +1136,34 @@ def run_mpc_controller(
     }
     history: List[Dict[str, float]] = []
     schedule_snapshots: List[pd.DataFrame] = []
+    total_work = max(sim_steps * (horizon_steps + 1), 1)
 
     for t in range(sim_steps):
         base_slice = df.iloc[t + 1 : t + 1 + horizon_steps].copy()
-        preds = iterative_forecast(df, t, horizon_steps, models, list(dict.fromkeys(SUPPORTED_MPC_TARGETS)))
+        base_progress = t * (horizon_steps + 1)
+
+        def _forecast_step_callback(step_idx: int, step_total: int) -> None:
+            if progress_callback:
+                progress_callback(
+                    base_progress + step_idx,
+                    total_work,
+                    f"Forecasting horizon {step_idx}/{step_total} for MPC interval {t + 1}/{sim_steps}",
+                )
+
+        preds = iterative_forecast(
+            df,
+            t,
+            horizon_steps,
+            models,
+            list(dict.fromkeys(SUPPORTED_MPC_TARGETS)),
+            step_callback=_forecast_step_callback,
+        )
+        if progress_callback:
+            progress_callback(
+                base_progress + horizon_steps + 1,
+                total_work,
+                f"Solving MPC interval {t + 1}/{sim_steps}",
+            )
         for col in preds.columns:
             base_slice[col] = preds[col].values
         forecast = base_slice[
@@ -1261,6 +1312,8 @@ def run_mpc_controller(
     result_df = pd.DataFrame(history).set_index("timestamp")
     if result_df.empty:
         return {"history": result_df, "summary": {}, "compliance": {}, "first_schedule": pd.DataFrame()}
+    if progress_callback:
+        progress_callback(total_work, total_work, "Simulation finished")
 
     resource_revenue = {
         "BESS": float(
@@ -1542,10 +1595,16 @@ def sensitivity_scan(
     horizon_hours: int,
     dispatch_hours: int,
     penalty_weights: Dict[str, float],
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> pd.DataFrame:
     records = []
+    total_cases = max(len(price_multipliers) * len(bess_pen_options), 1)
+    case_idx = 0
     for price_mult in price_multipliers:
         for bess_pen in bess_pen_options:
+            case_idx += 1
+            if progress_callback:
+                progress_callback(case_idx - 1, total_cases, f"Preparing scenario {case_idx}/{total_cases}")
             bundle = generate_synthetic_portfolio(
                 start_date=base_params["start_date"],
                 days=1,
@@ -1581,6 +1640,8 @@ def sensitivity_scan(
             }
             result = run_mpc_controller(df, models, fleet_meta, market_mode, resource_mode, horizon_hours, dispatch_hours, penalty_weights)
             records.append({"price_multiplier": price_mult, "bess_pen": bess_pen, "revenue_eur": result["summary"].get("total_revenue_eur", 0.0)})
+            if progress_callback:
+                progress_callback(case_idx, total_cases, f"Finished scenario {case_idx}/{total_cases}")
     return pd.DataFrame(records)
 
 
@@ -1728,7 +1789,10 @@ def main() -> None:
         fig_ts.add_trace(go.Scatter(x=df.index, y=df["hvac_baseline_kw"] / 1000.0, name="HVAC baseline", line={"color": RESOURCE_COLORS["HVAC"]}))
         fig_ts.add_trace(go.Scatter(x=df.index, y=df["net_load_baseline_kw"] / 1000.0, name="Net baseline load", line={"color": RESOURCE_COLORS["Net"], "width": 3}))
         fig_ts.update_layout(yaxis_title="MW")
-        st.plotly_chart(apply_chart_style(fig_ts, template, height=430), use_container_width=True)
+        st.plotly_chart(
+            apply_chart_style(fig_ts, template, height=430, title="Synthetic portfolio baseline and resource traces"),
+            use_container_width=True,
+        )
 
         col_a, col_b = st.columns(2)
         with col_a:
@@ -1796,7 +1860,10 @@ def main() -> None:
             template=template,
             title="Animated reserve activation playback",
         )
-        st.plotly_chart(apply_chart_style(anim_fig, template, height=420), use_container_width=True)
+        st.plotly_chart(
+            apply_chart_style(anim_fig, template, height=420, title="Animated reserve activation playback"),
+            use_container_width=True,
+        )
 
         bode_cols = st.columns(2)
         with bode_cols[0]:
@@ -1880,7 +1947,7 @@ def main() -> None:
                 "importance", ascending=False
             )
             imp_fig = px.bar(importance.head(12), x="importance", y="feature", orientation="h", template=template, title="Top feature importances")
-            st.plotly_chart(apply_chart_style(imp_fig, template, height=380), use_container_width=True)
+            st.plotly_chart(apply_chart_style(imp_fig, template, height=380, title="Top feature importances"), use_container_width=True)
 
             model_bytes = serialize_forecast_spec(spec)
             st.download_button("Download trained model", data=model_bytes, file_name=f"{spec.target}_xgboost.pkl", mime="application/octet-stream")
@@ -1912,9 +1979,14 @@ def main() -> None:
             f"{int(dispatch_hours / (freq_minutes / 60.0))} MPC intervals over the full dispatch simulation."
         )
         run_mpc = st.button("Run MPC dispatch", type="primary")
+        mpc_progress_bar = st.progress(0.0)
+        mpc_progress_text = st.empty()
         if run_mpc:
             with st.spinner("Training default MPC forecasters and running receding-horizon optimization..."):
+                mpc_tracker = make_progress_tracker(mpc_progress_bar, mpc_progress_text, "MPC dispatch")
+                mpc_tracker(1, 100, "Preparing default forecasting models")
                 models = ensure_default_models(df, int(seed))
+                mpc_tracker(8, 100, "Forecasting models ready")
                 fleet_meta = {
                     "bess_energy_cap_mwh": float(df["bess_energy_cap_mwh"].iloc[0]),
                     "setpoint_c": setpoint_c,
@@ -1938,7 +2010,13 @@ def main() -> None:
                     horizon_hours=horizon_hours,
                     dispatch_hours=dispatch_hours,
                     penalty_weights={"degradation": degradation_w, "comfort": comfort_w, "departure": departure_w},
+                    progress_callback=lambda current, total, message: mpc_tracker(
+                        8 + int(round((current / max(total, 1)) * 92)),
+                        100,
+                        message,
+                    ),
                 )
+                mpc_tracker(100, 100, "MPC dispatch finished")
         result = st.session_state.get("mpc_result", {"history": pd.DataFrame(), "summary": {}, "compliance": {}, "first_schedule": pd.DataFrame()})
         result_df = result["history"]
 
@@ -2006,7 +2084,15 @@ def main() -> None:
             result_df = result["history"]
             s = result["summary"]
             ts_left, ts_right = st.columns([1.45, 1.0])
-            ts_left.plotly_chart(apply_chart_style(line_dual_axis(result_df, template), template, height=420), use_container_width=True)
+            ts_left.plotly_chart(
+                apply_chart_style(
+                    line_dual_axis(result_df, template),
+                    template,
+                    height=420,
+                    title="Optimized load, baseline, and frequency",
+                ),
+                use_container_width=True,
+            )
 
             contribution_fig = go.Figure()
             contribution_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["bess_up_kw"] / 1000.0, name="BESS", stackgroup="one", line={"color": RESOURCE_COLORS["BESS"]}))
@@ -2046,9 +2132,13 @@ def main() -> None:
             price_multiplier = wf1.slider("Price multiplier", 0.7, 1.5, 1.0, 0.05)
             cold_snap = wf2.slider("Cold snap impact (°C)", 0.0, 10.0, 2.0, 0.5)
             thermal_speed = wf3.slider("Thermal response multiplier", 0.4, 1.4, 1.0, 0.1)
+            whatif_progress_bar = st.progress(0.0)
+            whatif_progress_text = st.empty()
 
             if st.button("Re-run what-if comparison"):
                 with st.spinner("Running the what-if scenario..."):
+                    whatif_tracker = make_progress_tracker(whatif_progress_bar, whatif_progress_text, "What-if scenario")
+                    whatif_tracker(2, 100, "Preparing alternative scenario inputs")
                     alt_df = df.copy()
                     alt_df["temp_out_c"] -= cold_snap
                     alt_df["hvac_up_kw"] *= thermal_speed
@@ -2060,7 +2150,9 @@ def main() -> None:
                     alt_df["afrr_down_capacity_eur_per_mw_h"] *= price_multiplier
                     alt_df["afrr_up_energy_eur_per_mwh"] *= price_multiplier
                     alt_df["afrr_down_energy_eur_per_mwh"] *= price_multiplier
+                    whatif_tracker(12, 100, "Refreshing forecasting models for the what-if case")
                     models = ensure_default_models(alt_df, int(seed))
+                    whatif_tracker(18, 100, "Forecasting models ready")
                     alt_result = run_mpc_controller(
                         alt_df,
                         models,
@@ -2077,6 +2169,11 @@ def main() -> None:
                         st.session_state["mpc_config"]["horizon_hours"],
                         st.session_state["mpc_config"]["dispatch_hours"],
                         {"degradation": degradation_w, "comfort": comfort_w, "departure": departure_w},
+                        progress_callback=lambda current, total, message: whatif_tracker(
+                            18 + int(round((current / max(total, 1)) * 76)),
+                            100,
+                            message,
+                        ),
                     )
                     compare_df = pd.DataFrame(
                         {
@@ -2087,7 +2184,9 @@ def main() -> None:
                         }
                     )
                     compare_fig = px.bar(compare_df.melt(id_vars="Scenario", var_name="Metric", value_name="Value"), x="Metric", y="Value", color="Scenario", barmode="group", template=template)
-                    st.plotly_chart(apply_chart_style(compare_fig, template, height=360), use_container_width=True)
+                    whatif_tracker(97, 100, "Rendering what-if comparison")
+                    st.plotly_chart(apply_chart_style(compare_fig, template, height=360, title="Base vs what-if comparison"), use_container_width=True)
+                    whatif_tracker(100, 100, "What-if scenario finished")
 
     with tabs[6]:
         st.subheader("Advanced / Export")
@@ -2104,8 +2203,12 @@ def main() -> None:
 
         st.markdown("### Sensitivity analysis")
         st.caption("This runs a compact 1-day scan over BESS penetration and market scarcity/price multipliers.")
+        sensitivity_progress_bar = st.progress(0.0)
+        sensitivity_progress_text = st.empty()
         if st.button("Run sensitivity scan"):
             with st.spinner("Scanning scenario space..."):
+                sensitivity_tracker = make_progress_tracker(sensitivity_progress_bar, sensitivity_progress_text, "Sensitivity scan")
+                sensitivity_tracker(1, 100, "Preparing scan grid")
                 sens_df = sensitivity_scan(
                     base_params={
                         "start_date": str(start_date),
@@ -2132,11 +2235,18 @@ def main() -> None:
                     horizon_hours=min(config["horizon_hours"], 24),
                     dispatch_hours=min(config["dispatch_hours"], 24),
                     penalty_weights={"degradation": 18.0, "comfort": 120.0, "departure": 160.0},
+                    progress_callback=lambda current, total, message: sensitivity_tracker(
+                        5 + int(round((current / max(total, 1)) * 90)),
+                        100,
+                        message,
+                    ),
                 )
                 heat = sens_df.pivot(index="bess_pen", columns="price_multiplier", values="revenue_eur")
                 heat_fig = go.Figure(go.Heatmap(z=heat.values, x=heat.columns, y=heat.index, colorscale="Turbo", colorbar={"title": "Revenue €"}))
+                sensitivity_tracker(97, 100, "Rendering sensitivity outputs")
                 st.plotly_chart(apply_chart_style(heat_fig, template, height=380, title="Sensitivity: revenue vs BESS penetration and price multiplier"), use_container_width=True)
                 st.dataframe(styled_dataframe(sens_df), use_container_width=True, hide_index=True)
+                sensitivity_tracker(100, 100, "Sensitivity scan finished")
 
         with st.expander("Market rule references embedded in this dashboard"):
             st.markdown(

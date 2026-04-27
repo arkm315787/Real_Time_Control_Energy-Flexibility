@@ -1,0 +1,2 @@
+"""FlexiHome application package."""
+

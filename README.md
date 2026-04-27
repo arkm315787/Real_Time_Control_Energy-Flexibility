@@ -115,18 +115,135 @@ The dashboard also provides:
 
 ## Repository Files
 
-This branch currently focuses on the dashboard files:
+The project now has two entry points: the Streamlit dashboard and a FastAPI service that shares the same core optimizer logic.
 
 - [app.py](./app.py)
   - the main Streamlit application
+- [flexihome/core](./flexihome/core)
+  - Streamlit-free data generation, forecasting, response-model, and MPC logic
+- [flexihome/api](./flexihome/api)
+  - FastAPI schemas, endpoints, in-memory job store, and result serialization
 - [requirements.txt](./requirements.txt)
-  - base dependencies required to run the dashboard
+  - base dependencies required to run the dashboard and API service
 - [requirements-lstm.txt](./requirements-lstm.txt)
   - optional deep-learning dependencies for TensorFlow/LSTM-related extensions
 
 ## How To Run
 
+## Complete Windows CMD Runbook
+
+These steps run the complete local system: the FastAPI optimizer service and the Streamlit dashboard.
+
+### 1. Get the repository
+
+If you do not have the repository yet:
+
+```cmd
+cd /d "%USERPROFILE%\Documents"
+git clone https://github.com/arkm315787/Real_Time_Control_Energy-Flexibility.git
+cd Real_Time_Control_Energy-Flexibility
+```
+
+If you already cloned it:
+
+```cmd
+cd /d "C:\path\to\Real_Time_Control_Energy-Flexibility"
+git pull
+```
+
+### 2. Create and activate a virtual environment
+
+```cmd
+py -3 -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+```
+
+### 3. Install dependencies
+
+For normal dashboard and API usage:
+
+```cmd
+pip install -r requirements.txt
+```
+
+For development checks, including the API smoke test:
+
+```cmd
+pip install -r requirements-dev.txt
+```
+
+### 4. Run quick checks
+
+```cmd
+python -m py_compile app.py flexihome\core\engine.py flexihome\api\optimizer.py flexihome\api\services.py
+python scripts\api_smoke.py
+```
+
+The smoke test should print health, forecast metrics, `result status: completed`, and nonzero result row counts.
+
+### 5. Run FastAPI
+
+Keep this command running in Terminal 1:
+
+```cmd
+python -m uvicorn flexihome.api.optimizer:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Then open:
+
+- `http://127.0.0.1:8000/docs`
+- `http://127.0.0.1:8000/health`
+
+CMD health check:
+
+```cmd
+curl http://127.0.0.1:8000/health
+```
+
+CMD optimization check:
+
+```cmd
+curl -X POST "http://127.0.0.1:8000/optimize" -H "Content-Type: application/json" -d "{\"market_mode\":\"Combined\",\"resource_mode\":\"Hybrid portfolio\",\"horizon_hours\":1,\"dispatch_hours\":1,\"portfolio_config\":{\"days\":1,\"n_homes\":80,\"freq_minutes\":15,\"ev_pen\":0.2,\"bess_pen\":0.2,\"pv_pen\":0.3,\"hvac_pen\":0.5}}"
+```
+
+Copy the `results_url` from the response, then run:
+
+```cmd
+curl http://127.0.0.1:8000/results/YOUR_OPTIMIZATION_ID
+```
+
+For example, if the response says `"results_url":"/results/opt_20260427T020919_ebe5ac42"`, run:
+
+```cmd
+curl http://127.0.0.1:8000/results/opt_20260427T020919_ebe5ac42
+```
+
+### 6. Run Streamlit dashboard
+
+Open a second CMD window, activate the same virtual environment, and run:
+
+```cmd
+cd /d "C:\path\to\Real_Time_Control_Energy-Flexibility"
+.venv\Scripts\activate
+python -m streamlit run app.py
+```
+
+Then open:
+
+- `http://localhost:8501`
+
+### 7. Stop local servers
+
+In each CMD window, press:
+
+```text
+Ctrl + C
+```
+
 ## Option A: Base dashboard only
+
+This older short path is still useful if you only want to run the dashboard quickly.
 
 This is the recommended path if you want the dashboard working quickly and do not need optional LSTM/TensorFlow extras.
 
@@ -145,7 +262,44 @@ Then open:
 
 - `http://localhost:8501`
 
-## Option B: Use a short virtual environment path
+## Option B: FastAPI optimizer service
+
+Run the API service in a separate terminal from the dashboard:
+
+```cmd
+python -m uvicorn flexihome.api.optimizer:app --reload --port 8000
+```
+
+Then open:
+
+- `http://localhost:8000/docs`
+- `http://localhost:8000/health`
+
+Useful verification calls:
+
+```powershell
+Invoke-RestMethod http://localhost:8000/health
+
+$body = @{
+  market_mode = "Combined"
+  resource_mode = "Hybrid portfolio"
+  horizon_hours = 1
+  dispatch_hours = 1
+  portfolio_config = @{
+    days = 1
+    n_homes = 500
+    freq_minutes = 15
+  }
+} | ConvertTo-Json -Depth 5
+
+$job = Invoke-RestMethod -Method Post -Uri http://localhost:8000/optimize -Body $body -ContentType "application/json"
+$job
+Invoke-RestMethod "http://localhost:8000$($job.results_url)"
+```
+
+The first API implementation uses a process-local in-memory job store. That is enough to verify the decoupling and background execution locally; the store boundary is isolated so TimescaleDB can replace it later without changing the optimizer API contract.
+
+## Option C: Use a short virtual environment path
 
 This is useful on Windows if you want optional TensorFlow/LSTM dependencies and want to avoid long-path problems.
 
@@ -156,6 +310,15 @@ cd /d "C:\Users\Kasutaja\OneDrive - Tallinna Tehnikaülikool\Documents\Playgroun
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 python -m streamlit run app.py
+```
+
+## Quick Local Checks
+
+```cmd
+pip install -r requirements-dev.txt
+python -m py_compile app.py flexihome\core\engine.py flexihome\api\optimizer.py flexihome\api\services.py
+python scripts\api_smoke.py
+python -m uvicorn flexihome.api.optimizer:app --port 8000
 ```
 
 ## Optional LSTM dependencies
@@ -350,11 +513,7 @@ Fix:
 
 ## Branch Information
 
-This README was added to the branch:
-
-- `codex/flexihome-dashboard`
-
-That branch contains the Streamlit dashboard files prepared for GitHub publication.
+The current `main` branch contains the Streamlit dashboard plus the first FastAPI optimizer service layer.
 
 ## License / Usage
 

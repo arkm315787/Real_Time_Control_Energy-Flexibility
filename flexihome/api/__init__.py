@@ -1,0 +1,2 @@
+"""FastAPI surface for FlexiHome."""
+

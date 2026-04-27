@@ -187,13 +187,15 @@ The smoke test should print health, forecast metrics, `result status: completed`
 Keep this command running in Terminal 1:
 
 ```cmd
-python -m uvicorn flexihome.api.optimizer:app --host 127.0.0.1 --port 8000 --reload
+python scripts\run_api.py --reload
 ```
 
 Then open:
 
 - `http://127.0.0.1:8000/docs`
 - `http://127.0.0.1:8000/health`
+
+If Windows blocks port `8000`, the launcher prints the replacement port. Use that printed port in the browser and `curl` commands, for example `http://127.0.0.1:8010/docs`.
 
 CMD health check:
 
@@ -267,7 +269,7 @@ Then open:
 Run the API service in a separate terminal from the dashboard:
 
 ```cmd
-python -m uvicorn flexihome.api.optimizer:app --reload --port 8000
+python scripts\run_api.py --reload
 ```
 
 Then open:
@@ -318,7 +320,7 @@ python -m streamlit run app.py
 pip install -r requirements-dev.txt
 python -m py_compile app.py flexihome\core\engine.py flexihome\api\optimizer.py flexihome\api\services.py
 python scripts\api_smoke.py
-python -m uvicorn flexihome.api.optimizer:app --port 8000
+python scripts\run_api.py
 ```
 
 ## Optional LSTM dependencies
@@ -490,6 +492,29 @@ Cause:
 Fix:
 - use `requirements.txt` only for the base dashboard
 - use a short virtual environment path for optional TensorFlow installs
+
+### FastAPI fails with `[WinError 10013]`
+
+Cause:
+- Windows refused the selected port, often because port `8000` is reserved by the OS, a VPN, Hyper-V/WinNAT, security software, or another service.
+
+Fix:
+
+```cmd
+python scripts\run_api.py --reload
+```
+
+The launcher will skip blocked ports and print the working URL. You can also request a specific alternate port:
+
+```cmd
+python scripts\run_api.py --port 8010 --reload
+```
+
+To see Windows excluded TCP port ranges:
+
+```cmd
+netsh interface ipv4 show excludedportrange protocol=tcp
+```
 
 ## Suggested Run Configurations For Learning
 

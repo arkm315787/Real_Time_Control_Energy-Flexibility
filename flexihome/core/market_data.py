@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -22,6 +23,9 @@ import requests
 ENTSOE_API_URL = "https://web-api.tp.entsoe.eu/api"
 FINLAND_BIDDING_ZONE_EIC = "10YFI-1--------U"
 FINGRID_CURRENT_API_URL = "https://data.fingrid.fi/api"
+FINGRID_DEFAULT_MIN_INTERVAL_SECONDS = 2.1
+FINGRID_DEFAULT_MAX_RETRIES = 4
+_LAST_FINGRID_CALL_AT = 0.0
 
 FINGRID_DATASETS = {
     "fcrn_capacity_eur_per_mw_h": ("FLEXIHOME_FINGRID_FCRN_PRICE_DATASET_ID", 317),
@@ -243,10 +247,18 @@ def fetch_fingrid_dataset(
             "sortBy": "startTime",
             "sortOrder": "asc",
         }
-        try:
-            response = requests.get(current_url, params=params, headers=headers, timeout=timeout_seconds)
-        except requests.RequestException as exc:
-            raise RuntimeError(f"current Fingrid API request failed: {exc}") from exc
+        response = None
+        for attempt in range(_fingrid_max_retries() + 1):
+            try:
+                _sleep_before_fingrid_call()
+                response = requests.get(current_url, params=params, headers=headers, timeout=timeout_seconds)
+            except requests.RequestException as exc:
+                raise RuntimeError(f"current Fingrid API request failed: {exc}") from exc
+            if response.status_code != 429 or attempt >= _fingrid_max_retries():
+                break
+            time.sleep(_retry_delay_seconds(response.text))
+        if response is None:
+            raise RuntimeError("current Fingrid API request did not return a response")
         if not response.ok:
             raise RuntimeError(f"current Fingrid API returned HTTP {response.status_code}: {_short_response(response.text)}")
         page_rows = _extract_rows(response.json())
@@ -503,6 +515,36 @@ def _validate_identifier(value: str) -> str:
 def _short_response(text: str) -> str:
     normalized = " ".join(str(text).split())
     return normalized[:240] if normalized else "empty response"
+
+
+def _sleep_before_fingrid_call() -> None:
+    global _LAST_FINGRID_CALL_AT
+    min_interval = _fingrid_min_interval_seconds()
+    elapsed = time.monotonic() - _LAST_FINGRID_CALL_AT
+    if elapsed < min_interval:
+        time.sleep(min_interval - elapsed)
+    _LAST_FINGRID_CALL_AT = time.monotonic()
+
+
+def _retry_delay_seconds(text: str) -> float:
+    match = re.search(r"try again in\s+(\d+)\s+seconds?", str(text), flags=re.IGNORECASE)
+    if match:
+        return max(float(match.group(1)) + 0.5, _fingrid_min_interval_seconds())
+    return _fingrid_min_interval_seconds()
+
+
+def _fingrid_min_interval_seconds() -> float:
+    try:
+        return max(0.0, float(os.getenv("FLEXIHOME_FINGRID_MIN_INTERVAL_SECONDS", FINGRID_DEFAULT_MIN_INTERVAL_SECONDS)))
+    except ValueError:
+        return FINGRID_DEFAULT_MIN_INTERVAL_SECONDS
+
+
+def _fingrid_max_retries() -> int:
+    try:
+        return max(0, int(os.getenv("FLEXIHOME_FINGRID_MAX_RETRIES", str(FINGRID_DEFAULT_MAX_RETRIES))))
+    except ValueError:
+        return FINGRID_DEFAULT_MAX_RETRIES
 
 
 def _connect_timeout_seconds() -> int:

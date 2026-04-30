@@ -441,8 +441,49 @@ When TimescaleDB is configured and market-data persistence is enabled, fetched r
 - TimescaleDB persistence status and inserted row count
 
 Fingrid API calls use the current endpoint `https://data.fingrid.fi/api` with the API key in the `x-api-key` header. The old `api.fingrid.fi/v1` endpoint is not used.
+The connector paces Fingrid calls with `FLEXIHOME_FINGRID_MIN_INTERVAL_SECONDS=2.1` by default and retries HTTP `429` responses. This follows Fingrid's public API throttling guidance and prevents one dashboard refresh from exhausting the per-key request cadence.
 
 The default Fingrid dataset IDs are in `.env.example`. Override them only if Fingrid changes dataset numbering or if you want to experiment with a different reserve-market signal.
+
+## Local Module Workflow
+
+The dashboard should be treated as the visualization and operator-review surface. Forecasting and optimization can run as separate local modules from VS Code, Terminal, Docker, or CI so heavier processing does not block Streamlit.
+
+```mermaid
+flowchart LR
+    A["ENTSO-E / Fingrid APIs"] --> B["Market-data ingestion"]
+    C["Synthetic scenario generator"] --> D["Training frame"]
+    B --> D
+    D --> E["Forecasting module"]
+    D --> F["Optimization module"]
+    E --> G["Run artifacts under runs/"]
+    F --> G
+    G --> H["Streamlit dashboard visualization"]
+    G --> I["FastAPI / TimescaleDB records"]
+```
+
+Standalone forecasting:
+
+```cmd
+python scripts\run_forecasting.py --target fcrn_capacity_eur_per_mw_h --market-data-mode synthetic --days 7 --output-root runs
+```
+
+Standalone optimization:
+
+```cmd
+python scripts\run_optimization.py --market-mode Combined --resource-mode "Hybrid portfolio" --horizon-hours 24 --dispatch-hours 24 --market-data-mode synthetic --output-root runs
+```
+
+For real market data, set `ENTSOE_API_KEY` and/or `FINGRID_API_KEY`, then use `--market-data-mode auto` or `--market-data-mode real`. Each run writes CSV/JSON/model artifacts under `runs\forecast_*` or `runs\optimization_*`; `runs/` is intentionally gitignored.
+Open the dashboard's **Advanced / Export** tab to inspect those external run artifacts without retraining or resolving the optimization inside Streamlit.
+
+Recommended engineering ownership:
+- Forecasting engineer: add or replace model trainers behind `scripts\run_forecasting.py` or a new module with the same artifact contract: `forecast_summary.json`, `forecast_comparison.csv`, and `model.pkl`.
+- Optimization engineer: add solvers behind `scripts\run_optimization.py` or a new module with the same artifact contract: `optimization_summary.json`, `history.csv`, `tracking_4s.csv`, and `first_schedule.csv`.
+- Dashboard/API engineer: consume artifacts and expose visual/API status without embedding heavy training or solver logic into the UI.
+- Data engineer: maintain ENTSO-E/Fingrid ingestion, TimescaleDB schemas, throttling, and dataset IDs.
+
+GitHub CI is configured in `.github/workflows/ci.yml` to compile core modules, run the API smoke test, and smoke-test the standalone forecasting and optimization runners.
 
 ## Option C: Use a short virtual environment path
 

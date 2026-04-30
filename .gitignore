@@ -8,6 +8,7 @@ __pycache__/
 .env
 !.env.example
 *.log
+runs/
 flexihome_*.csv
 flexihome_*.json
 flexihome_*.pdf

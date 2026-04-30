@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Callable, Dict, List
 
 import numpy as np
@@ -1307,6 +1308,30 @@ def main() -> None:
         if result.get("summary"):
             pdf_bytes = make_pdf_summary(result["summary"], result["compliance"], config)
             st.download_button("Export MPC formulation summary as PDF", data=pdf_bytes, file_name="flexihome_mpc_summary.pdf", mime="application/pdf")
+
+        st.markdown("### External module artifacts")
+        run_root = Path("runs")
+        run_dirs = sorted([path for path in run_root.glob("*") if path.is_dir()], reverse=True) if run_root.exists() else []
+        if run_dirs:
+            selected_run = st.selectbox("Local run artifact", [str(path) for path in run_dirs])
+            selected_path = Path(selected_run)
+            summary_files = list(selected_path.glob("*_summary.json"))
+            if summary_files:
+                artifact_summary = json.loads(summary_files[0].read_text(encoding="utf-8"))
+                st.json(artifact_summary, expanded=False)
+            forecast_file = selected_path / "forecast_comparison.csv"
+            history_file = selected_path / "history.csv"
+            if forecast_file.exists():
+                artifact_forecast = pd.read_csv(forecast_file, index_col=0, parse_dates=True)
+                artifact_fig = signal_line_figure(artifact_forecast, ["actual", "prediction"], "External forecast artifact")
+                st.plotly_chart(apply_chart_style(artifact_fig, template, height=340), use_container_width=True)
+            if history_file.exists():
+                artifact_history = pd.read_csv(history_file, index_col=0, parse_dates=True)
+                artifact_cols = [col for col in ["fcr_bid_kw", "afrr_up_bid_kw", "afrr_down_bid_kw", "net_revenue_eur"] if col in artifact_history.columns]
+                artifact_fig = signal_line_figure(artifact_history, artifact_cols, "External optimization artifact")
+                st.plotly_chart(apply_chart_style(artifact_fig, template, height=340), use_container_width=True)
+        else:
+            st.info("Run `python scripts\\run_forecasting.py ...` or `python scripts\\run_optimization.py ...` to create local artifacts for visualization here.")
 
         st.markdown("### Sensitivity analysis")
         st.caption("This runs a compact 1-day scan over BESS penetration and market scarcity/price multipliers.")

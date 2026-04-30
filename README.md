@@ -150,7 +150,7 @@ git switch codex-fastapi-api-layer
 If you already cloned it:
 
 ```cmd
-cd /d "C:\path\to\Real_Time_Control_Energy-Flexibility"
+cd /d "C:\Users\Kasutaja\OneDrive - Tallinna Tehnikaülikool\Documents\Playground\Real_Time_Control_Energy-Flexibility"
 git fetch origin
 git switch codex-fastapi-api-layer
 git pull
@@ -233,7 +233,7 @@ curl http://127.0.0.1:8000/results/opt_20260427T020919_ebe5ac42
 Open a second CMD window, activate the same virtual environment, and run:
 
 ```cmd
-cd /d "C:\path\to\Real_Time_Control_Energy-Flexibility"
+cd /d "C:\Users\Kasutaja\OneDrive - Tallinna Tehnikaülikool\Documents\Playground\Real_Time_Control_Energy-Flexibility"
 .venv\Scripts\activate
 python -m streamlit run app.py
 ```

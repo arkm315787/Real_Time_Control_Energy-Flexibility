@@ -123,6 +123,8 @@ The project now has two entry points: the Streamlit dashboard and a FastAPI serv
   - Streamlit-free data generation, forecasting, response-model, and MPC logic
 - [flexihome/api](./flexihome/api)
   - FastAPI schemas, endpoints, in-memory/TimescaleDB job stores, and result serialization
+- [compose.yaml](./compose.yaml)
+  - local Docker Compose TimescaleDB service for API persistence
 - [requirements.txt](./requirements.txt)
   - base dependencies required to run the dashboard and API service
 - [requirements-lstm.txt](./requirements-lstm.txt)
@@ -313,6 +315,48 @@ By default, the API uses the in-memory job store and `/health` reports:
 ```
 
 To persist optimization jobs in TimescaleDB, point the API at a PostgreSQL/TimescaleDB database before starting the service.
+
+### Docker Compose local database
+
+The repository includes `compose.yaml` for a local TimescaleDB container. Start it from the repository root:
+
+```cmd
+copy .env.example .env
+docker compose up -d timescaledb
+```
+
+PowerShell equivalent:
+
+```powershell
+Copy-Item .env.example .env
+docker compose up -d timescaledb
+```
+
+The default local DSN is:
+
+```text
+postgresql://flexihome:flexihome@127.0.0.1:5432/flexihome
+```
+
+Run the persistence smoke test:
+
+```cmd
+set FLEXIHOME_TIMESCALE_DSN=postgresql://flexihome:flexihome@127.0.0.1:5432/flexihome
+set FLEXIHOME_TIMESCALE_SCHEMA=flexihome
+python scripts\timescale_store_smoke.py
+```
+
+Then start the API in the same terminal:
+
+```cmd
+python scripts\run_api.py --reload
+```
+
+Stop the local database when you are done:
+
+```cmd
+docker compose down
+```
 
 ### CMD
 

@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from threading import RLock
 from typing import Dict, Optional, Protocol
 
+from flexihome.api.serialization import json_safe
+
 
 STATUS_COUNTS = {"queued": 0, "running": 0, "completed": 0, "failed": 0}
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -147,7 +149,7 @@ class TimescaleOptimizationStore:
                         RETURNING optimization_id, status, request, result, error, created_at, updated_at
                         """
                     ).format(self._jobs_ref()),
-                    (optimization_id, "queued", self._Jsonb(request), now, now),
+                    (optimization_id, "queued", self._jsonb(request), now, now),
                 )
                 row = cur.fetchone()
                 self._record_event(cur, optimization_id, "queued", "created", {"request": request}, now)
@@ -270,7 +272,7 @@ class TimescaleOptimizationStore:
                     ).format(self._jobs_ref()),
                     (
                         status,
-                        self._Jsonb(result) if result is not None else None,
+                        self._jsonb(result) if result is not None else None,
                         error,
                         now,
                         optimization_id,
@@ -303,7 +305,7 @@ class TimescaleOptimizationStore:
                 VALUES (%s, %s, %s, %s, %s)
                 """
             ).format(self._events_ref()),
-            (optimization_id, status, event_type, self._Jsonb(payload), created_at),
+            (optimization_id, status, event_type, self._jsonb(payload), created_at),
         )
 
     def _initialize_schema(self) -> None:
@@ -337,7 +339,7 @@ class TimescaleOptimizationStore:
                             optimization_id TEXT NOT NULL,
                             status TEXT NOT NULL,
                             event_type TEXT NOT NULL,
-                            payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                            payload JSONB NOT NULL DEFAULT jsonb_build_object(),
                             created_at TIMESTAMPTZ NOT NULL
                         )
                         """
@@ -375,7 +377,7 @@ class TimescaleOptimizationStore:
         return self._qualified_ref(self.events_table)
 
     def _index_ref(self, index_name: str):
-        return self._qualified_ref(index_name)
+        return self._sql.Identifier(index_name)
 
     def _qualified_ref(self, name: str):
         return self._sql.SQL("{}.{}").format(
@@ -393,6 +395,9 @@ class TimescaleOptimizationStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    def _jsonb(self, payload: Dict):
+        return self._Jsonb(json_safe(payload))
 
     def _load_driver(self) -> None:
         try:

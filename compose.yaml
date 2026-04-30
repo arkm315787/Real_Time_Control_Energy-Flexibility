@@ -1,0 +1,26 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg17
+    container_name: flexihome-timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${TIMESCALE_POSTGRES_USER:-flexihome}
+      POSTGRES_PASSWORD: ${TIMESCALE_POSTGRES_PASSWORD:-flexihome}
+      POSTGRES_DB: ${TIMESCALE_POSTGRES_DB:-flexihome}
+      TIMESCALEDB_TELEMETRY: "off"
+    ports:
+      - "127.0.0.1:${TIMESCALE_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${TIMESCALE_POSTGRES_USER:-flexihome} -d ${TIMESCALE_POSTGRES_DB:-flexihome}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  timescaledb-data:

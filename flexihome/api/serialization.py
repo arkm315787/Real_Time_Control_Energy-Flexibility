@@ -56,6 +56,7 @@ def serialize_optimization_result(result: Dict[str, Any]) -> Dict[str, Any]:
     first_schedule = result.get("first_schedule", pd.DataFrame())
     return {
         "summary": json_safe(result.get("summary", {})),
+        "market_data_status": json_safe(result.get("market_data_status", {})),
         "compliance": json_safe(result.get("compliance", {})),
         "history": dataframe_to_records(history),
         "tracking_4s": dataframe_to_records(tracking),

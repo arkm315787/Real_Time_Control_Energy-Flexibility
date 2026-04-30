@@ -21,6 +21,8 @@ from scipy import signal
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from xgboost import XGBRegressor
 
+from .market_data import overlay_real_market_data
+
 FINGRID_RULES = {
     "FCR-N": {
         "min_bid_kw": 100.0,
@@ -297,6 +299,7 @@ def generate_synthetic_portfolio(
     weather = generate_weather(index, seed, cloudiness, climate_shift_c, solar_scale)
     prices = generate_market_prices(index, seed, scarcity)
     activation, preview = generate_activation_signals(index, seed, preview_days=min(days, 3))
+    prices, activation, preview, market_data_status = overlay_real_market_data(index, prices, activation, preview)
     tf = time_feature_frame(index)
 
     hours = hour_fraction(index)
@@ -424,6 +427,8 @@ def generate_synthetic_portfolio(
         "ev_energy_mwh": ev_energy_capacity_mwh,
         "hvac_mode": hvac_mode,
         "freq_minutes": freq_minutes,
+        "market_data_source": market_data_status["mode_used"],
+        "market_data_status": market_data_status,
     }
     return {"data": df, "preview_4s": preview, "summary": summary}
 

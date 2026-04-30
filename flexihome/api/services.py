@@ -112,6 +112,9 @@ def run_optimization_job(
             },
             preview_4s=bundle["preview_4s"],
         )
+        market_data_status = bundle.get("summary", {}).get("market_data_status", {})
+        result.setdefault("summary", {})["market_data_source"] = market_data_status.get("mode_used", "synthetic")
+        result["market_data_status"] = market_data_status
         store.complete(optimization_id, serialize_optimization_result(result))
     except Exception as exc:
         store.fail(optimization_id, str(exc))

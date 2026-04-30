@@ -185,11 +185,13 @@ pip install -r requirements-dev.txt
 
 ```cmd
 python -m py_compile app.py flexihome\core\engine.py flexihome\api\optimizer.py flexihome\api\services.py
+python scripts\market_data_smoke.py
 python scripts\api_smoke.py
 python scripts\timescale_store_smoke.py
 ```
 
 The API smoke test should print health, forecast metrics, `result status: completed`, and nonzero result row counts.
+The market-data smoke test runs without keys and reports `synthetic`; with keys configured it reports which ENTSO-E/Fingrid columns were loaded.
 The TimescaleDB smoke test skips itself unless `FLEXIHOME_TIMESCALE_DSN` is configured.
 
 ### 5. Run FastAPI
@@ -388,6 +390,51 @@ When configured, the API creates:
 
 If the DSN is configured but unavailable, the API falls back to the in-memory store and `/health` reports `status: degraded`. Set `FLEXIHOME_TIMESCALE_STRICT=1` if you want startup to fail instead. The default database connection timeout is 5 seconds; override it with `FLEXIHOME_TIMESCALE_CONNECT_TIMEOUT`.
 
+## Optional Real Market Data
+
+By default the dashboard and API still run with synthetic market data, so the project works offline. For more production-like forecasting experiments, configure real market data before starting Streamlit or FastAPI.
+
+The integration currently overlays:
+- ENTSO-E Finland day-ahead spot price as `spot_price_eur_per_mwh`
+- Fingrid FCR-N hourly market price as `fcrn_capacity_eur_per_mw_h`
+- Fingrid aFRR up/down capacity prices as `afrr_up_capacity_eur_per_mw_h` and `afrr_down_capacity_eur_per_mw_h`
+- Fingrid aFRR up/down energy prices as `afrr_up_energy_eur_per_mwh` and `afrr_down_energy_eur_per_mwh`
+- Fingrid aFRR activation-volume datasets normalized into `afrr_up_act_frac` and `afrr_down_act_frac`
+
+Create a local `.env` from the example if you have not already:
+
+```cmd
+copy .env.example .env
+```
+
+Then add your keys to `.env`, or set them in the terminal before running the app. Do not commit `.env`.
+
+CMD:
+
+```cmd
+set ENTSOE_API_KEY=<your-entsoe-security-token>
+set FINGRID_API_KEY=<your-fingrid-open-data-key>
+set FLEXIHOME_MARKET_DATA_MODE=auto
+```
+
+PowerShell:
+
+```powershell
+$env:ENTSOE_API_KEY = "<your-entsoe-security-token>"
+$env:FINGRID_API_KEY = "<your-fingrid-open-data-key>"
+$env:FLEXIHOME_MARKET_DATA_MODE = "auto"
+```
+
+Run the market-data smoke test:
+
+```cmd
+python scripts\market_data_smoke.py
+```
+
+`FLEXIHOME_MARKET_DATA_MODE=auto` is recommended for development: it uses real data that is available and keeps synthetic fallback for unavailable columns. Use `FLEXIHOME_MARKET_DATA_MODE=real` only when you want the simulator to fail if no external market data can be loaded.
+
+The default Fingrid dataset IDs are in `.env.example`. Override them only if Fingrid changes dataset numbering or if you want to experiment with a different reserve-market signal.
+
 ## Option C: Use a short virtual environment path
 
 This is useful on Windows if you want optional TensorFlow/LSTM dependencies and want to avoid long-path problems.
@@ -497,10 +544,10 @@ Use this tab to:
 The app is intentionally educational rather than production-grade market software.
 
 Important characteristics:
-- It uses synthetic data rather than external APIs.
+- It uses synthetic data by default, with optional ENTSO-E and Fingrid real-market overlays through environment variables.
 - The MPC is a receding-horizon supervisory controller.
 - The default dispatch logic is simplified for teaching clarity.
-- The `aFRR` signal preview is synthetic.
+- The high-resolution `aFRR` signal preview is synthetic; hourly/15-minute aFRR price and activation columns can come from Fingrid when configured.
 - The dashboard emphasizes explainability and interactive learning over strict operational deployment fidelity.
 
 ## Fingrid-Oriented Assumptions Embedded In The App

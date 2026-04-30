@@ -46,6 +46,9 @@ def main() -> None:
     print(f"Fingrid status: {status.get('fingrid')}")
     print(f"columns loaded: {', '.join(status.get('columns_loaded', [])) or 'none'}")
     print(f"observations loaded: {status.get('observations_loaded', {})}")
+    print(f"training observations: {status.get('training_observations', 0)}")
+    print(f"query window: {status.get('query_start_utc')} to {status.get('query_end_utc')}")
+    print(f"TimescaleDB status: {status.get('timescaledb')}; rows persisted: {status.get('rows_persisted', 0)}")
     if status.get("errors"):
         print("errors:")
         for error in status["errors"]:

@@ -392,7 +392,7 @@ If the DSN is configured but unavailable, the API falls back to the in-memory st
 
 ## Optional Real Market Data
 
-By default the dashboard and API still run with synthetic market data, so the project works offline. For more production-like forecasting experiments, configure real market data before starting Streamlit or FastAPI.
+By default the dashboard and API still run with synthetic market data, so the project works offline. In the Streamlit sidebar, use **Market Data Source** to switch between `Synthetic` and `Real market APIs`. The dashboard accepts ENTSO-E and Fingrid keys as password fields at runtime; these values are not written to tracked files.
 
 The integration currently overlays:
 - ENTSO-E Finland day-ahead spot price as `spot_price_eur_per_mwh`
@@ -432,6 +432,13 @@ python scripts\market_data_smoke.py
 ```
 
 `FLEXIHOME_MARKET_DATA_MODE=auto` is recommended for development: it uses real data that is available and keeps synthetic fallback for unavailable columns. Use `FLEXIHOME_MARKET_DATA_MODE=real` only when you want the simulator to fail if no external market data can be loaded.
+
+When TimescaleDB is configured and market-data persistence is enabled, fetched raw market observations are inserted into `flexihome.market_data_observations` by default. Override the table with `FLEXIHOME_MARKET_DATA_TABLE`. The dashboard also shows:
+- which source was used: synthetic, mixed, or real
+- ENTSO-E and Fingrid connection status
+- raw observations loaded per signal
+- requested API lookback window used for forecasting
+- TimescaleDB persistence status and inserted row count
 
 The default Fingrid dataset IDs are in `.env.example`. Override them only if Fingrid changes dataset numbering or if you want to experiment with a different reserve-market signal.
 

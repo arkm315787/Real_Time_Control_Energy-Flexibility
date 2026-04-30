@@ -54,6 +54,12 @@ class MarketDataStatus:
     columns_loaded: list[str] = field(default_factory=list)
     observations_loaded: Dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    query_start_utc: str | None = None
+    query_end_utc: str | None = None
+    training_observations: int = 0
+    training_days: float = 0.0
+    timescaledb: str = "not_configured"
+    rows_persisted: int = 0
     generated_at_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def as_dict(self) -> Dict[str, object]:
@@ -65,6 +71,12 @@ class MarketDataStatus:
             "columns_loaded": self.columns_loaded,
             "observations_loaded": self.observations_loaded,
             "errors": self.errors,
+            "query_start_utc": self.query_start_utc,
+            "query_end_utc": self.query_end_utc,
+            "training_observations": self.training_observations,
+            "training_days": self.training_days,
+            "timescaledb": self.timescaledb,
+            "rows_persisted": self.rows_persisted,
             "generated_at_utc": self.generated_at_utc,
         }
 
@@ -74,23 +86,31 @@ def overlay_real_market_data(
     prices: pd.DataFrame,
     activation: pd.DataFrame,
     preview_4s: pd.DataFrame,
+    mode: str | None = None,
+    entsoe_api_key: str | None = None,
+    fingrid_api_key: str | None = None,
+    lookback_days: int | None = None,
+    persist_to_timescale: bool | None = None,
     timeout_seconds: float = 12.0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, object]]:
     """Overlay configured real market data onto synthetic market series."""
 
     load_local_env()
-    mode = os.getenv("FLEXIHOME_MARKET_DATA_MODE", "auto").strip().lower()
-    if mode not in {"auto", "synthetic", "real"}:
-        mode = "auto"
-    status = MarketDataStatus(mode_requested=mode)
-    if mode == "synthetic":
+    selected_mode = (mode or os.getenv("FLEXIHOME_MARKET_DATA_MODE", "auto")).strip().lower()
+    if selected_mode not in {"auto", "synthetic", "real"}:
+        selected_mode = "auto"
+    status = MarketDataStatus(mode_requested=selected_mode)
+    if selected_mode == "synthetic":
         return prices, activation, preview_4s, status.as_dict()
 
-    start, end = _query_window(index)
+    start, end = _query_window(index, lookback_days)
+    status.query_start_utc = _iso_utc(start)
+    status.query_end_utc = _iso_utc(end)
     output_prices = prices.copy()
     output_activation = activation.copy()
+    raw_series: Dict[str, pd.Series] = {}
 
-    entsoe_key = os.getenv("ENTSOE_API_KEY") or os.getenv("ENTSOE_SECURITY_TOKEN")
+    entsoe_key = entsoe_api_key or os.getenv("ENTSOE_API_KEY") or os.getenv("ENTSOE_SECURITY_TOKEN")
     if entsoe_key:
         try:
             spot = fetch_entsoe_day_ahead_prices(start, end, entsoe_key, timeout_seconds)
@@ -105,15 +125,16 @@ def overlay_real_market_data(
                 )
                 status.entsoe = "connected"
                 _mark_loaded(status, "spot_price_eur_per_mwh", spot)
+                raw_series["entsoe:spot_price_eur_per_mwh"] = spot
             else:
                 status.entsoe = "empty"
         except Exception as exc:  # pragma: no cover - exercised by smoke script with live keys
             status.entsoe = "unavailable"
             status.errors.append(f"ENTSO-E: {exc}")
-    elif mode == "real":
+    elif selected_mode == "real":
         status.errors.append("ENTSOE_API_KEY is not configured.")
 
-    fingrid_key = os.getenv("FINGRID_API_KEY") or os.getenv("FINGRID_OPENDATA_API_KEY")
+    fingrid_key = fingrid_api_key or os.getenv("FINGRID_API_KEY") or os.getenv("FINGRID_OPENDATA_API_KEY")
     if fingrid_key:
         loaded_any = False
         for target_col, (_, dataset_id) in configured_fingrid_datasets().items():
@@ -131,15 +152,22 @@ def overlay_real_market_data(
                 elif target_col in PRICE_COLUMNS:
                     output_prices[target_col] = aligned.fillna(output_prices[target_col])
                 _mark_loaded(status, target_col, series)
+                raw_series[f"fingrid:{dataset_id}:{target_col}"] = series
                 loaded_any = True
             except Exception as exc:  # pragma: no cover - exercised by smoke script with live keys
                 status.errors.append(f"Fingrid dataset {dataset_id} -> {target_col}: {exc}")
         status.fingrid = "connected" if loaded_any else "empty"
-    elif mode == "real":
+    elif selected_mode == "real":
         status.errors.append("FINGRID_API_KEY is not configured.")
 
+    _mark_training_window(status, raw_series)
+    if persist_to_timescale is None:
+        persist_to_timescale = os.getenv("FLEXIHOME_MARKET_DATA_PERSIST", "1").lower() in {"1", "true", "yes"}
+    if persist_to_timescale and raw_series:
+        persist_market_data(raw_series, status)
+
     status.mode_used = _resolve_mode(status)
-    if mode == "real" and status.mode_used == "synthetic":
+    if selected_mode == "real" and status.mode_used == "synthetic":
         raise RuntimeError("Real market data mode was requested, but no external market data could be loaded.")
     return output_prices, output_activation, preview_4s, status.as_dict()
 
@@ -218,6 +246,76 @@ def fetch_fingrid_dataset(
     return parse_fingrid_json(response.json())
 
 
+def persist_market_data(raw_series: Dict[str, pd.Series], status: MarketDataStatus) -> None:
+    dsn = os.getenv("FLEXIHOME_TIMESCALE_DSN", "").strip()
+    if not dsn:
+        status.timescaledb = "not_configured"
+        return
+    schema = _validate_identifier(os.getenv("FLEXIHOME_TIMESCALE_SCHEMA", "flexihome").strip() or "flexihome")
+    table = _validate_identifier(os.getenv("FLEXIHOME_MARKET_DATA_TABLE", "market_data_observations").strip() or "market_data_observations")
+    try:
+        import psycopg
+        from psycopg import sql
+        from psycopg.rows import dict_row
+    except ImportError:
+        status.timescaledb = "driver_missing"
+        return
+
+    rows = []
+    fetched_at = datetime.now(timezone.utc)
+    for key, series in raw_series.items():
+        parts = key.split(":")
+        source = parts[0]
+        dataset_id = parts[1] if len(parts) == 3 else None
+        metric = parts[-1]
+        for ts, value in series.dropna().items():
+            rows.append((source, dataset_id, metric, _to_utc_aware(pd.Timestamp(ts)), float(value), fetched_at))
+    if not rows:
+        status.timescaledb = "empty"
+        return
+
+    with psycopg.connect(dsn, connect_timeout=_connect_timeout_seconds(), row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
+            cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb")
+            cur.execute(
+                sql.SQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS {}.{} (
+                        source TEXT NOT NULL,
+                        dataset_id TEXT,
+                        metric TEXT NOT NULL,
+                        observed_at TIMESTAMPTZ NOT NULL,
+                        value DOUBLE PRECISION NOT NULL,
+                        fetched_at TIMESTAMPTZ NOT NULL
+                    )
+                    """
+                ).format(sql.Identifier(schema), sql.Identifier(table))
+            )
+            cur.execute(
+                "SELECT create_hypertable(%s, 'observed_at', if_not_exists => TRUE, migrate_data => TRUE)",
+                (f"{schema}.{table}",),
+            )
+            cur.execute(
+                sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {}.{} (metric, observed_at DESC)").format(
+                    sql.Identifier(f"idx_{table}_metric_time"),
+                    sql.Identifier(schema),
+                    sql.Identifier(table),
+                )
+            )
+            cur.executemany(
+                sql.SQL(
+                    """
+                    INSERT INTO {}.{} (source, dataset_id, metric, observed_at, value, fetched_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """
+                ).format(sql.Identifier(schema), sql.Identifier(table)),
+                rows,
+            )
+    status.timescaledb = "connected"
+    status.rows_persisted = len(rows)
+
+
 def parse_entsoe_price_xml(xml_text: str) -> pd.Series:
     root = ET.fromstring(xml_text)
     points = []
@@ -258,7 +356,12 @@ def align_series_to_index(series: pd.Series, index: pd.DatetimeIndex) -> pd.Seri
     cleaned = series.dropna().sort_index()
     if cleaned.empty:
         return pd.Series(np.nan, index=index)
-    return cleaned.reindex(index, method="ffill")
+    target_start = _to_utc_naive(pd.Timestamp(index.min()))
+    target_end = _to_utc_naive(pd.Timestamp(index.max()))
+    if cleaned.index.max() >= target_start and cleaned.index.min() <= target_end:
+        return cleaned.reindex(index, method="ffill")
+    values = np.resize(cleaned.to_numpy(dtype=float), len(index))
+    return pd.Series(values, index=index, name=series.name)
 
 
 def normalize_activation(series: pd.Series) -> pd.Series:
@@ -270,7 +373,11 @@ def normalize_activation(series: pd.Series) -> pd.Series:
     return (series.abs() / max(max_abs, 1e-6)).clip(0.0, 1.0)
 
 
-def _query_window(index: pd.DatetimeIndex) -> Tuple[pd.Timestamp, pd.Timestamp]:
+def _query_window(index: pd.DatetimeIndex, lookback_days: int | None = None) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    if lookback_days and lookback_days > 0:
+        end = pd.Timestamp.now(tz="UTC").floor("h").tz_localize(None)
+        start = end - pd.Timedelta(days=int(lookback_days))
+        return start, end
     start = _to_utc_naive(pd.Timestamp(index.min()).floor("h"))
     end = _to_utc_naive(pd.Timestamp(index.max()).ceil("h") + pd.Timedelta(hours=1))
     return start, end
@@ -292,6 +399,18 @@ def _mark_loaded(status: MarketDataStatus, column: str, series: pd.Series) -> No
     status.observations_loaded[column] = int(series.dropna().shape[0])
 
 
+def _mark_training_window(status: MarketDataStatus, raw_series: Dict[str, pd.Series]) -> None:
+    if not raw_series:
+        return
+    counts = [int(series.dropna().shape[0]) for series in raw_series.values()]
+    starts = [series.dropna().index.min() for series in raw_series.values() if not series.dropna().empty]
+    ends = [series.dropna().index.max() for series in raw_series.values() if not series.dropna().empty]
+    status.training_observations = int(sum(counts))
+    if starts and ends:
+        span = pd.Timestamp(max(ends)) - pd.Timestamp(min(starts))
+        status.training_days = round(max(span.total_seconds(), 0.0) / 86400.0, 2)
+
+
 def _entsoe_time(value: pd.Timestamp) -> str:
     return _to_utc_naive(value).strftime("%Y%m%d%H%M")
 
@@ -305,6 +424,15 @@ def _to_utc_naive(value: pd.Timestamp) -> pd.Timestamp:
     if ts.tzinfo is not None:
         ts = ts.tz_convert("UTC").tz_localize(None)
     return ts
+
+
+def _to_utc_aware(value: pd.Timestamp) -> datetime:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts.to_pydatetime()
 
 
 def _resolution_minutes(value: str) -> int:
@@ -351,6 +479,19 @@ def _first(row: dict, *keys: str) -> Optional[object]:
         if key in row:
             return row[key]
     return None
+
+
+def _validate_identifier(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+        raise ValueError(f"Invalid database identifier: {value!r}")
+    return value
+
+
+def _connect_timeout_seconds() -> int:
+    try:
+        return max(1, int(os.getenv("FLEXIHOME_TIMESCALE_CONNECT_TIMEOUT", "5")))
+    except ValueError:
+        return 5
 
 
 def _series_from_points(points: Iterable[tuple[pd.Timestamp, float]], name: str) -> pd.Series:

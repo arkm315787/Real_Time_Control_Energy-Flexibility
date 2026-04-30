@@ -61,6 +61,12 @@ def generate_synthetic_portfolio(*args, **kwargs) -> Dict[str, object]:
     return generate_synthetic_portfolio_core(*args, **kwargs)
 
 
+def generate_portfolio_runtime(*args, use_cache: bool = True, **kwargs) -> Dict[str, object]:
+    if use_cache:
+        return generate_synthetic_portfolio(*args, **kwargs)
+    return generate_synthetic_portfolio_core(*args, **kwargs)
+
+
 RESOURCE_COLORS = {
     "BESS": "#7B61FF",
     "EV": "#6E44FF",
@@ -529,28 +535,77 @@ def main() -> None:
     comfort_band_c = st.sidebar.slider("Comfort band (±°C)", 0.5, 2.5, 1.0, 0.1)
     seed = st.sidebar.number_input("Random seed", value=42, step=1)
 
-    with st.spinner("Generating synthetic households, weather, and balancing market conditions..."):
-        bundle = generate_synthetic_portfolio(
-            start_date=str(start_date),
-            days=days,
-            n_homes=n_homes,
-            ev_pen=ev_pen,
-            bess_pen=bess_pen,
-            pv_pen=pv_pen,
-            hvac_pen=hvac_pen,
-            cloudiness=cloudiness,
-            climate_shift_c=climate_shift_c,
-            solar_scale=solar_scale,
-            seed=int(seed),
-            setpoint_c=setpoint_c,
-            comfort_band_c=comfort_band_c,
-            scarcity=scarcity,
-            freq_minutes=int(freq_minutes),
-            hvac_mode=hvac_mode,
-        )
+    st.sidebar.header("Market Data Source")
+    market_source = st.sidebar.radio(
+        "Training and market signals",
+        ["Synthetic", "Real market APIs"],
+        help="Synthetic keeps the dashboard offline. Real market APIs uses ENTSO-E and Fingrid data where available.",
+    )
+    use_real_market = market_source == "Real market APIs"
+    market_lookback_days = st.sidebar.slider("Real market lookback days", 1, 120, 30, 1, disabled=not use_real_market)
+    entsoe_key_input = st.sidebar.text_input("ENTSO-E security token", type="password", disabled=not use_real_market)
+    fingrid_key_input = st.sidebar.text_input("Fingrid Open Data API key", type="password", disabled=not use_real_market)
+    persist_market_data = st.sidebar.toggle("Persist fetched market data to TimescaleDB", value=True, disabled=not use_real_market)
+    real_market_ready = use_real_market and bool(entsoe_key_input or fingrid_key_input)
+    if use_real_market and not (entsoe_key_input or fingrid_key_input):
+        st.sidebar.warning("Enter at least one API key to enable real market ingestion.")
+
+    spinner_text = (
+        "Fetching real market data and generating the flexibility portfolio..."
+        if real_market_ready
+        else "Generating synthetic households, weather, and balancing market conditions..."
+    )
+    portfolio_args = {
+        "start_date": str(start_date),
+        "days": days,
+        "n_homes": n_homes,
+        "ev_pen": ev_pen,
+        "bess_pen": bess_pen,
+        "pv_pen": pv_pen,
+        "hvac_pen": hvac_pen,
+        "cloudiness": cloudiness,
+        "climate_shift_c": climate_shift_c,
+        "solar_scale": solar_scale,
+        "seed": int(seed),
+        "setpoint_c": setpoint_c,
+        "comfort_band_c": comfort_band_c,
+        "scarcity": scarcity,
+        "freq_minutes": int(freq_minutes),
+        "hvac_mode": hvac_mode,
+    }
+    try:
+        with st.spinner(spinner_text):
+            bundle = generate_portfolio_runtime(
+                **portfolio_args,
+                market_data_mode="real" if real_market_ready else "synthetic",
+                entsoe_api_key=entsoe_key_input.strip() or None,
+                fingrid_api_key=fingrid_key_input.strip() or None,
+                market_lookback_days=int(market_lookback_days) if real_market_ready else None,
+                persist_market_data=bool(persist_market_data) if real_market_ready else False,
+                use_cache=not real_market_ready,
+            )
+    except RuntimeError as exc:
+        st.error(f"Real market data could not be loaded: {exc}")
+        with st.spinner("Falling back to synthetic market data..."):
+            bundle = generate_portfolio_runtime(**portfolio_args, market_data_mode="synthetic", use_cache=True)
     df = bundle["data"]
     preview_4s = bundle["preview_4s"]
     summary = bundle["summary"]
+    market_data_status = summary.get("market_data_status", {})
+    market_columns = [
+        col
+        for col in [
+            "spot_price_eur_per_mwh",
+            "fcrn_capacity_eur_per_mw_h",
+            "afrr_up_capacity_eur_per_mw_h",
+            "afrr_down_capacity_eur_per_mw_h",
+            "afrr_up_energy_eur_per_mwh",
+            "afrr_down_energy_eur_per_mwh",
+            "afrr_up_act_frac",
+            "afrr_down_act_frac",
+        ]
+        if col in df.columns
+    ]
 
     tabs = st.tabs(
         [
@@ -593,6 +648,8 @@ def main() -> None:
             c2.metric("Homes needed for fast 1 MW", f"{summary['homes_for_1mw_fast']:,}")
             c1.metric("PV fleet size", f"{summary['pv_capacity_mw']:.2f} MW")
             c2.metric("Accessible storage energy", f"{summary['bess_energy_mwh'] + summary['ev_energy_mwh']:.2f} MWh")
+            c1.metric("Market data", str(market_data_status.get("mode_used", "synthetic")).title())
+            c2.metric("Raw market observations", f"{int(market_data_status.get('training_observations', 0) or 0):,}")
             st.markdown(
                 """
                 <div class="flexi-card">
@@ -600,7 +657,7 @@ def main() -> None:
                     <p class="small-note">
                         The optimizer and compliance view track minimum bid sizes, response speed, expected accuracy,
                         storage endurance, and the presence of an explicit baseline. Capacity and activation prices
-                        are synthetic but calibrated to typical-looking Finnish balancing market ranges.
+                        can be synthetic or loaded from ENTSO-E/Fingrid APIs from the sidebar.
                     </p>
                 </div>
                 """,
@@ -620,18 +677,65 @@ def main() -> None:
                 )
 
     with tabs[1]:
-        st.subheader("Synthetic Data Explorer")
-        st.caption(f"All data is generated locally at a {freq_minutes}-minute resolution. Adjust sidebar parameters to regenerate the portfolio.")
+        st.subheader("Data Explorer")
+        if real_market_ready:
+            st.caption(
+                f"Portfolio and weather remain scenario based. Market columns use the real API window "
+                f"{market_data_status.get('query_start_utc')} to {market_data_status.get('query_end_utc')}."
+            )
+        else:
+            st.caption(f"All data is generated locally at a {freq_minutes}-minute resolution. Adjust sidebar parameters to regenerate the portfolio.")
         export_col, explain_col = st.columns([1, 1.3])
         export_col.download_button(
-            "Download synthetic data as CSV",
+            "Download active training data as CSV",
             data=df.to_csv().encode("utf-8"),
-            file_name="flexihome_synthetic_data.csv",
+            file_name="flexihome_training_data.csv",
             mime="text/csv",
         )
         explain_col.info(
-            "The synthetic engine mixes daily demand shape, seasonal Helsinki-style weather, PV irradiance, EV parking uncertainty, BESS headroom, and thermal comfort dynamics."
+            f"Market mode: {market_data_status.get('mode_used', 'synthetic')}. "
+            f"ENTSO-E: {market_data_status.get('entsoe', 'not_configured')}. "
+            f"Fingrid: {market_data_status.get('fingrid', 'not_configured')}. "
+            f"TimescaleDB: {market_data_status.get('timescaledb', 'not_configured')}."
         )
+
+        if market_columns:
+            market_meta = pd.DataFrame(
+                [
+                    {
+                        "Signal": col,
+                        "Raw observations": market_data_status.get("observations_loaded", {}).get(col, 0),
+                        "Rows in model frame": int(df[col].notna().sum()),
+                    }
+                    for col in market_columns
+                ]
+            )
+            st.dataframe(styled_dataframe(market_meta), use_container_width=True, hide_index=True)
+
+            price_cols = [col for col in market_columns if col.endswith(("eur_per_mwh", "eur_per_mw_h"))]
+            if price_cols:
+                market_fig = go.Figure()
+                for col in price_cols:
+                    market_fig.add_trace(go.Scatter(x=df.index, y=df[col], name=col))
+                st.plotly_chart(
+                    apply_chart_style(market_fig, template, height=360, title="Market price signals used by forecasting and MPC"),
+                    use_container_width=True,
+                )
+
+            act_cols = [col for col in market_columns if col.endswith("_act_frac")]
+            if act_cols:
+                act_fig = go.Figure()
+                for col in act_cols:
+                    act_fig.add_trace(go.Scatter(x=df.index, y=df[col], name=col))
+                st.plotly_chart(
+                    apply_chart_style(act_fig, template, height=320, title="Normalized activation signals used by forecasting"),
+                    use_container_width=True,
+                )
+
+        if market_data_status.get("errors"):
+            with st.expander("Market data API messages", expanded=False):
+                for error in market_data_status["errors"]:
+                    st.warning(error)
 
         fig_ts = go.Figure()
         fig_ts.add_trace(go.Scatter(x=df.index, y=df["base_load_kw"] / 1000.0, name="Base load", line={"color": RESOURCE_COLORS["Base"]}))
@@ -781,13 +885,24 @@ def main() -> None:
                 spec, comparison = train_forecaster(df, target, predictors, lags, horizon_steps, int(seed))
             st.session_state["last_forecast_spec"] = spec
             st.session_state["last_forecast_comparison"] = comparison
+            st.session_state["last_forecast_market_status"] = market_data_status
+            st.session_state["last_forecast_row_count"] = int(len(df))
 
         if "last_forecast_spec" in st.session_state:
             spec: ForecastSpec = st.session_state["last_forecast_spec"]
             comparison = st.session_state["last_forecast_comparison"]
-            m1, m2 = st.columns(2)
+            forecast_market_status = st.session_state.get("last_forecast_market_status", {})
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("MAE", f"{spec.metrics['mae']:.2f}")
             m2.metric("RMSE", f"{spec.metrics['rmse']:.2f}")
+            m3.metric("Rows used", f"{st.session_state.get('last_forecast_row_count', len(df)):,}")
+            m4.metric("Market source", str(forecast_market_status.get("mode_used", "synthetic")).title())
+            st.caption(
+                f"Training frame uses {st.session_state.get('last_forecast_row_count', len(df)):,} rows at {freq_minutes}-minute resolution. "
+                f"Real market fetch window: {forecast_market_status.get('query_start_utc') or 'not used'} to "
+                f"{forecast_market_status.get('query_end_utc') or 'not used'}; raw market observations loaded: "
+                f"{int(forecast_market_status.get('training_observations', 0) or 0):,}."
+            )
 
             pred_fig = go.Figure()
             pred_fig.add_trace(go.Scatter(x=comparison.index, y=comparison["actual"], name="Actual", line={"color": RESOURCE_COLORS["Base"]}))

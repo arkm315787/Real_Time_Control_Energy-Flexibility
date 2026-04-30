@@ -290,6 +290,11 @@ def generate_synthetic_portfolio(
     scarcity: float,
     freq_minutes: int = 15,
     hvac_mode: str = HVAC_MODES[0],
+    market_data_mode: str | None = None,
+    entsoe_api_key: str | None = None,
+    fingrid_api_key: str | None = None,
+    market_lookback_days: int | None = None,
+    persist_market_data: bool | None = None,
 ) -> Dict[str, object]:
     dt_h = freq_minutes / 60.0
     steps = int(days * 24 * 60 / freq_minutes)
@@ -299,7 +304,17 @@ def generate_synthetic_portfolio(
     weather = generate_weather(index, seed, cloudiness, climate_shift_c, solar_scale)
     prices = generate_market_prices(index, seed, scarcity)
     activation, preview = generate_activation_signals(index, seed, preview_days=min(days, 3))
-    prices, activation, preview, market_data_status = overlay_real_market_data(index, prices, activation, preview)
+    prices, activation, preview, market_data_status = overlay_real_market_data(
+        index,
+        prices,
+        activation,
+        preview,
+        mode=market_data_mode,
+        entsoe_api_key=entsoe_api_key,
+        fingrid_api_key=fingrid_api_key,
+        lookback_days=market_lookback_days,
+        persist_to_timescale=persist_market_data,
+    )
     tf = time_feature_frame(index)
 
     hours = hour_fraction(index)

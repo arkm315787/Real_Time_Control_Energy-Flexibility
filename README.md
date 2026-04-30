@@ -440,6 +440,8 @@ When TimescaleDB is configured and market-data persistence is enabled, fetched r
 - requested API lookback window used for forecasting
 - TimescaleDB persistence status and inserted row count
 
+Fingrid API calls use the current endpoint `https://data.fingrid.fi/api` with the API key in the `x-api-key` header. The old `api.fingrid.fi/v1` endpoint is not used.
+
 The default Fingrid dataset IDs are in `.env.example`. Override them only if Fingrid changes dataset numbering or if you want to experiment with a different reserve-market signal.
 
 ## Option C: Use a short virtual environment path

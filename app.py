@@ -299,6 +299,36 @@ def styled_dataframe(frame: pd.DataFrame) -> pd.io.formats.style.Styler:
     )
 
 
+def numeric_signal_options(df: pd.DataFrame, preferred: List[str] | None = None) -> List[str]:
+    preferred = preferred or []
+    numeric_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+    ordered = [col for col in preferred if col in numeric_cols]
+    ordered.extend([col for col in numeric_cols if col not in ordered])
+    return ordered
+
+
+def signal_line_figure(df: pd.DataFrame, columns: List[str], title: str, y_title: str | None = None) -> go.Figure:
+    fig = go.Figure()
+    for col in columns:
+        if col in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df[col], name=col, mode="lines"))
+    if y_title:
+        fig.update_layout(yaxis_title=y_title)
+    fig.update_layout(title=title)
+    return fig
+
+
+def data_quality_figure(df: pd.DataFrame, columns: List[str], template: str) -> go.Figure:
+    rows = []
+    for col in columns:
+        if col in df.columns:
+            rows.append({"Signal": col, "Completeness %": float(df[col].notna().mean() * 100.0)})
+    frame = pd.DataFrame(rows) if rows else pd.DataFrame({"Signal": [], "Completeness %": []})
+    fig = px.bar(frame, x="Signal", y="Completeness %", color="Completeness %", range_y=[0, 100], template=template)
+    fig.update_layout(showlegend=False, xaxis_title=None, yaxis_title="Complete rows (%)")
+    return fig
+
+
 
 
 
@@ -610,7 +640,7 @@ def main() -> None:
     tabs = st.tabs(
         [
             "Home",
-            "Synthetic Data Explorer",
+            "Training Data Explorer",
             "Response Models",
             "Forecasting Lab",
             "MPC Optimizer & Market Participation",
@@ -621,6 +651,13 @@ def main() -> None:
 
     with tabs[0]:
         st.title("FlexiHome: Aggregated Residential Flexibility for Fingrid Balancing Markets")
+        h1, h2, h3, h4 = st.columns(4)
+        h1.metric("Data source", str(market_data_status.get("mode_used", "synthetic")).title())
+        h2.metric("Model rows", f"{len(df):,}")
+        h3.metric("Real observations", f"{int(market_data_status.get('training_observations', 0) or 0):,}")
+        h4.metric("Timescale rows", f"{int(market_data_status.get('rows_persisted', 0) or 0):,}")
+        if market_data_status.get("errors"):
+            st.warning("Some market API signals were unavailable. Open Training Data Explorer for the exact API messages and fallback status.")
         left, right = st.columns([1.2, 1.0], gap="large")
         with left:
             st.markdown(
@@ -700,6 +737,11 @@ def main() -> None:
         )
 
         if market_columns:
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("ENTSO-E", str(market_data_status.get("entsoe", "not_configured")).replace("_", " ").title())
+            k2.metric("Fingrid", str(market_data_status.get("fingrid", "not_configured")).replace("_", " ").title())
+            k3.metric("Lookback days", f"{market_data_status.get('training_days', 0) or 0}")
+            k4.metric("DB rows persisted", f"{int(market_data_status.get('rows_persisted', 0) or 0):,}")
             market_meta = pd.DataFrame(
                 [
                     {
@@ -711,26 +753,28 @@ def main() -> None:
                 ]
             )
             st.dataframe(styled_dataframe(market_meta), use_container_width=True, hide_index=True)
+            st.plotly_chart(
+                apply_chart_style(data_quality_figure(df, market_columns, template), template, height=300, title="Active-frame market data completeness"),
+                use_container_width=True,
+            )
 
             price_cols = [col for col in market_columns if col.endswith(("eur_per_mwh", "eur_per_mw_h"))]
             if price_cols:
-                market_fig = go.Figure()
-                for col in price_cols:
-                    market_fig.add_trace(go.Scatter(x=df.index, y=df[col], name=col))
+                market_fig = signal_line_figure(df, price_cols, "Market price signals used by forecasting and MPC", "EUR")
                 st.plotly_chart(
-                    apply_chart_style(market_fig, template, height=360, title="Market price signals used by forecasting and MPC"),
+                    apply_chart_style(market_fig, template, height=360),
                     use_container_width=True,
                 )
 
             act_cols = [col for col in market_columns if col.endswith("_act_frac")]
             if act_cols:
-                act_fig = go.Figure()
-                for col in act_cols:
-                    act_fig.add_trace(go.Scatter(x=df.index, y=df[col], name=col))
+                act_fig = signal_line_figure(df, act_cols, "Normalized activation signals used by forecasting", "Fraction")
                 st.plotly_chart(
-                    apply_chart_style(act_fig, template, height=320, title="Normalized activation signals used by forecasting"),
+                    apply_chart_style(act_fig, template, height=320),
                     use_container_width=True,
                 )
+        else:
+            st.info("No external market columns were loaded. The market and activation series below are synthetic scenario data.")
 
         if market_data_status.get("errors"):
             with st.expander("Market data API messages", expanded=False):
@@ -842,17 +886,21 @@ def main() -> None:
 
     with tabs[3]:
         st.subheader("Forecasting Lab")
-        target_options = [
+        preferred_targets = [
             "net_load_baseline_kw",
             "pv_available_kw",
+            "spot_price_eur_per_mwh",
             "fcrn_capacity_eur_per_mw_h",
             "afrr_up_capacity_eur_per_mw_h",
             "afrr_down_capacity_eur_per_mw_h",
+            "afrr_up_energy_eur_per_mwh",
+            "afrr_down_energy_eur_per_mwh",
             "fcr_signed_act",
             "afrr_up_act_frac",
             "afrr_down_act_frac",
         ]
-        predictor_pool = [
+        target_options = numeric_signal_options(df, preferred_targets)
+        preferred_predictors = [
             "temp_out_c",
             "irradiance_wm2",
             "base_load_kw",
@@ -869,18 +917,33 @@ def main() -> None:
             "afrr_down_act_frac",
             "fcr_signed_act",
         ]
+        predictor_pool = numeric_signal_options(df, preferred_predictors)
         col1, col2, col3, col4 = st.columns([1.2, 1.5, 0.8, 0.8])
         target = col1.selectbox("Target", target_options, index=0)
+        default_predictors = [
+            col
+            for col in ["temp_out_c", "irradiance_wm2", "base_load_kw", "pv_available_kw", "net_load_baseline_kw", "fcr_signed_act"]
+            if col in predictor_pool and col != target
+        ]
+        if target in market_columns:
+            default_predictors = [col for col in market_columns if col in predictor_pool and col != target][:5] + default_predictors[:2]
         predictors = col2.multiselect(
             "Predictors",
             predictor_pool,
-            default=["temp_out_c", "irradiance_wm2", "base_load_kw", "pv_available_kw", "net_load_baseline_kw", "fcr_signed_act"],
+            default=default_predictors,
         )
         lags = col3.slider("Lag depth", 1, 8, 4)
         max_horizon_steps = max(4, min(96, int((24 * 60) / max(freq_minutes, 1))))
         horizon_steps = col4.slider(f"Forecast horizon ({freq_minutes} min steps)", 1, max_horizon_steps, min(4, max_horizon_steps))
+        preview_fig = signal_line_figure(df, [target], f"Selected target history: {target}")
+        st.plotly_chart(apply_chart_style(preview_fig, template, height=260), use_container_width=True)
+        if real_market_ready and target in market_columns:
+            st.info(
+                f"This forecast target is fed by real market ingestion when available. "
+                f"Raw observations for this signal: {market_data_status.get('observations_loaded', {}).get(target, 0):,}."
+            )
 
-        if st.button("Train XGBoost model", type="primary"):
+        if st.button("Train selected XGBoost forecast", type="primary", key=f"train_forecast_{target}"):
             with st.spinner("Training the forecaster..."):
                 spec, comparison = train_forecaster(df, target, predictors, lags, horizon_steps, int(seed))
             st.session_state["last_forecast_spec"] = spec
@@ -892,6 +955,8 @@ def main() -> None:
             spec: ForecastSpec = st.session_state["last_forecast_spec"]
             comparison = st.session_state["last_forecast_comparison"]
             forecast_market_status = st.session_state.get("last_forecast_market_status", {})
+            if spec.target != target:
+                st.info(f"The displayed trained model is for `{spec.target}`. Click Train selected XGBoost forecast to retrain for `{target}`.")
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("MAE", f"{spec.metrics['mae']:.2f}")
             m2.metric("RMSE", f"{spec.metrics['rmse']:.2f}")
@@ -905,8 +970,9 @@ def main() -> None:
             )
 
             pred_fig = go.Figure()
-            pred_fig.add_trace(go.Scatter(x=comparison.index, y=comparison["actual"], name="Actual", line={"color": RESOURCE_COLORS["Base"]}))
-            pred_fig.add_trace(go.Scatter(x=comparison.index, y=comparison["prediction"], name="Prediction", line={"color": RESOURCE_COLORS["Net"], "dash": "dot"}))
+            pred_fig.add_trace(go.Scatter(x=comparison.index, y=comparison["actual"], name=f"Actual {spec.target}", line={"color": RESOURCE_COLORS["Base"]}))
+            pred_fig.add_trace(go.Scatter(x=comparison.index, y=comparison["prediction"], name=f"Predicted {spec.target}", line={"color": RESOURCE_COLORS["Net"], "dash": "dot"}))
+            pred_fig.update_layout(yaxis_title=spec.target)
             st.plotly_chart(apply_chart_style(pred_fig, template, height=380, title=f"Forecast performance: {spec.target}"), use_container_width=True)
 
             importance = pd.DataFrame({"feature": spec.model.feature_names_in_, "importance": spec.model.feature_importances_}).sort_values(
@@ -1003,6 +1069,16 @@ def main() -> None:
             m2.metric("Delivered up energy", f"{s['delivered_up_mwh']:.2f} MWh")
             m3.metric("Requirement score", f"{s['requirement_score_pct']:.0f}%")
             m4.metric("Comfort violations", f"{s['comfort_violations_h']:.1f} h")
+            mpc_status_cols = st.columns(4)
+            solver_mode = result_df["solver_status"].mode().iloc[0] if "solver_status" in result_df and not result_df["solver_status"].empty else "unknown"
+            mpc_status_cols[0].metric("Optimizer status", solver_mode)
+            mpc_status_cols[1].metric("MPC intervals", f"{len(result_df):,}")
+            mpc_status_cols[2].metric("Market input", str(market_data_status.get("mode_used", "synthetic")).title())
+            mpc_status_cols[3].metric("Mean net revenue", fmt_money(float(result_df["net_revenue_eur"].mean())))
+            st.info(
+                "MPC workflow: XGBoost forecasts each horizon, a PuLP/CBC MILP chooses reserve bids and resource dispatch, "
+                "then only the first interval is applied before the horizon rolls forward."
+            )
 
             left, right = st.columns([1.45, 1.0])
             with left:
@@ -1012,6 +1088,23 @@ def main() -> None:
                 dispatch_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["afrr_down_bid_kw"] / 1000.0, name="aFRR down bid", stackgroup="two"))
                 dispatch_fig.update_layout(yaxis_title="MW")
                 st.plotly_chart(apply_chart_style(dispatch_fig, template, height=400, title="MPC reserve schedule"), use_container_width=True)
+                if {"fcrn_capacity_eur_per_mw_h", "afrr_up_capacity_eur_per_mw_h", "afrr_down_capacity_eur_per_mw_h"}.issubset(result_df.columns):
+                    price_overlay = make_subplots(specs=[[{"secondary_y": True}]])
+                    price_overlay.add_trace(
+                        go.Scatter(x=result_df.index, y=result_df["net_revenue_eur"], name="Net revenue EUR", line={"color": RESOURCE_COLORS["Net"], "width": 3}),
+                        secondary_y=False,
+                    )
+                    price_overlay.add_trace(
+                        go.Scatter(x=result_df.index, y=result_df["fcrn_capacity_eur_per_mw_h"], name="FCR-N price", line={"dash": "dot"}),
+                        secondary_y=True,
+                    )
+                    price_overlay.add_trace(
+                        go.Scatter(x=result_df.index, y=result_df["afrr_up_capacity_eur_per_mw_h"], name="aFRR up price", line={"dash": "dash"}),
+                        secondary_y=True,
+                    )
+                    price_overlay.update_yaxes(title_text="EUR", secondary_y=False)
+                    price_overlay.update_yaxes(title_text="EUR/MW/h", secondary_y=True)
+                    st.plotly_chart(apply_chart_style(price_overlay, template, height=330, title="Revenue response to market prices"), use_container_width=True)
             with right:
                 compliance_cols = st.columns(2)
                 compliance_cols[0].plotly_chart(apply_chart_style(indicator_figure(float(result_df["fcr_bid_kw"].mean()), "Average FCR bid (kW)", 100.0), template, height=240), use_container_width=True)

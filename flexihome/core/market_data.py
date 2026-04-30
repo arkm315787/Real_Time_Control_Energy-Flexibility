@@ -22,7 +22,6 @@ import requests
 ENTSOE_API_URL = "https://web-api.tp.entsoe.eu/api"
 FINLAND_BIDDING_ZONE_EIC = "10YFI-1--------U"
 FINGRID_CURRENT_API_URL = "https://data.fingrid.fi/api"
-FINGRID_LEGACY_API_URL = "https://api.fingrid.fi/v1"
 
 FINGRID_DATASETS = {
     "fcrn_capacity_eur_per_mw_h": ("FLEXIHOME_FINGRID_FCRN_PRICE_DATASET_ID", 317),
@@ -228,22 +227,36 @@ def fetch_fingrid_dataset(
 ) -> pd.Series:
     start_text = _iso_utc(start)
     end_text = _iso_utc(end)
-    headers = {"x-api-key": api_key, "version": "FlexiHome-market-data/0.1"}
+    headers = {"x-api-key": api_key, "User-Agent": "FlexiHome-market-data/0.1"}
 
     current_url = f"{FINGRID_CURRENT_API_URL}/datasets/{dataset_id}/data"
-    current_params = {"startTime": start_text, "endTime": end_text, "pageSize": 20000}
-    try:
-        response = requests.get(current_url, params=current_params, headers=headers, timeout=timeout_seconds)
-        if response.ok:
-            return parse_fingrid_json(response.json())
-    except requests.RequestException:
-        pass
-
-    legacy_url = f"{FINGRID_LEGACY_API_URL}/variable/{dataset_id}/events/json"
-    legacy_params = {"start_time": start_text, "end_time": end_text}
-    response = requests.get(legacy_url, params=legacy_params, headers=headers, timeout=timeout_seconds)
-    response.raise_for_status()
-    return parse_fingrid_json(response.json())
+    rows = []
+    page = 1
+    while page <= 20:
+        params = {
+            "startTime": start_text,
+            "endTime": end_text,
+            "format": "json",
+            "locale": "en",
+            "pageSize": 20000,
+            "page": page,
+            "sortBy": "startTime",
+            "sortOrder": "asc",
+        }
+        try:
+            response = requests.get(current_url, params=params, headers=headers, timeout=timeout_seconds)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"current Fingrid API request failed: {exc}") from exc
+        if not response.ok:
+            raise RuntimeError(f"current Fingrid API returned HTTP {response.status_code}: {_short_response(response.text)}")
+        page_rows = _extract_rows(response.json())
+        if not page_rows:
+            break
+        rows.extend(page_rows)
+        if len(page_rows) < int(params["pageSize"]):
+            break
+        page += 1
+    return parse_fingrid_json({"data": rows})
 
 
 def persist_market_data(raw_series: Dict[str, pd.Series], status: MarketDataStatus) -> None:
@@ -485,6 +498,11 @@ def _validate_identifier(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
         raise ValueError(f"Invalid database identifier: {value!r}")
     return value
+
+
+def _short_response(text: str) -> str:
+    normalized = " ".join(str(text).split())
+    return normalized[:240] if normalized else "empty response"
 
 
 def _connect_timeout_seconds() -> int:

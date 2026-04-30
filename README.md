@@ -122,7 +122,7 @@ The project now has two entry points: the Streamlit dashboard and a FastAPI serv
 - [flexihome/core](./flexihome/core)
   - Streamlit-free data generation, forecasting, response-model, and MPC logic
 - [flexihome/api](./flexihome/api)
-  - FastAPI schemas, endpoints, in-memory job store, and result serialization
+  - FastAPI schemas, endpoints, in-memory/TimescaleDB job stores, and result serialization
 - [requirements.txt](./requirements.txt)
   - base dependencies required to run the dashboard and API service
 - [requirements-lstm.txt](./requirements-lstm.txt)
@@ -181,9 +181,11 @@ pip install -r requirements-dev.txt
 ```cmd
 python -m py_compile app.py flexihome\core\engine.py flexihome\api\optimizer.py flexihome\api\services.py
 python scripts\api_smoke.py
+python scripts\timescale_store_smoke.py
 ```
 
-The smoke test should print health, forecast metrics, `result status: completed`, and nonzero result row counts.
+The API smoke test should print health, forecast metrics, `result status: completed`, and nonzero result row counts.
+The TimescaleDB smoke test skips itself unless `FLEXIHOME_TIMESCALE_DSN` is configured.
 
 ### 5. Run FastAPI
 
@@ -300,7 +302,44 @@ $job
 Invoke-RestMethod "http://localhost:8000$($job.results_url)"
 ```
 
-The first API implementation uses a process-local in-memory job store. That is enough to verify the decoupling and background execution locally; the store boundary is isolated so TimescaleDB can replace it later without changing the optimizer API contract.
+The API uses a process-local in-memory job store unless TimescaleDB is configured. The store boundary is shared, so the same endpoints work with either backend.
+
+## Optional TimescaleDB persistence
+
+By default, the API uses the in-memory job store and `/health` reports:
+
+```json
+{"job_store":"in_memory","timescaledb":"not_configured"}
+```
+
+To persist optimization jobs in TimescaleDB, point the API at a PostgreSQL/TimescaleDB database before starting the service.
+
+### CMD
+
+```cmd
+set FLEXIHOME_TIMESCALE_DSN=postgresql://USER:PASSWORD@HOST:5432/flexihome
+set FLEXIHOME_TIMESCALE_SCHEMA=flexihome
+python scripts\timescale_store_smoke.py
+python scripts\run_api.py --reload
+```
+
+### PowerShell
+
+```powershell
+$env:FLEXIHOME_TIMESCALE_DSN = "postgresql://USER:PASSWORD@HOST:5432/flexihome"
+$env:FLEXIHOME_TIMESCALE_SCHEMA = "flexihome"
+python scripts\timescale_store_smoke.py
+python scripts\run_api.py --reload
+```
+
+When configured, the API creates:
+
+- `flexihome.optimization_jobs`
+  - latest status, request JSON, result JSON, error, and timestamps
+- `flexihome.optimization_job_events`
+  - Timescale hypertable for queued/running/completed/failed lifecycle events
+
+If the DSN is configured but unavailable, the API falls back to the in-memory store and `/health` reports `status: degraded`. Set `FLEXIHOME_TIMESCALE_STRICT=1` if you want startup to fail instead. The default database connection timeout is 5 seconds; override it with `FLEXIHOME_TIMESCALE_CONNECT_TIMEOUT`.
 
 ## Option C: Use a short virtual environment path
 
@@ -321,6 +360,7 @@ python -m streamlit run app.py
 pip install -r requirements-dev.txt
 python -m py_compile app.py flexihome\core\engine.py flexihome\api\optimizer.py flexihome\api\services.py
 python scripts\api_smoke.py
+python scripts\timescale_store_smoke.py
 python scripts\run_api.py
 ```
 

@@ -22,7 +22,7 @@ from flexihome.api.services import (
     run_forecast,
     run_optimization_job,
 )
-from flexihome.api.store import InMemoryOptimizationStore
+from flexihome.api.store import build_optimization_store
 
 
 app = FastAPI(
@@ -30,7 +30,7 @@ app = FastAPI(
     version="1.0.0",
     description="Machine-readable API for FlexiHome forecasting and MPC optimization.",
 )
-STORE = InMemoryOptimizationStore()
+STORE = build_optimization_store()
 
 
 @app.get("/")
@@ -76,7 +76,7 @@ async def get_results(optimization_id: str) -> OptimizationResultResponse:
 
 @app.get("/optimizations", response_model=List[OptimizationResponse])
 async def list_optimizations() -> List[OptimizationResponse]:
-    """List recent in-memory optimization jobs."""
+    """List recent optimization jobs."""
 
     return [response_from_job(job) for job in STORE.list()]
 
@@ -96,11 +96,12 @@ async def forecast_next_horizon(request: ForecastRequest) -> ForecastResponse:
 async def health_check() -> dict:
     """Return service health for local and production readiness checks."""
 
+    store_health = STORE.health()
+    status = "degraded" if store_health.get("timescaledb") == "unavailable" else "healthy"
     return {
-        "status": "healthy",
+        "status": status,
         "fastapi": "ok",
-        "job_store": "in_memory",
-        "timescaledb": "not_configured",
+        **store_health,
         "airflow": "not_configured",
     }
 

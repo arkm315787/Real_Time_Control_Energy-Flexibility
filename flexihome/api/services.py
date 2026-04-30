@@ -13,7 +13,7 @@ from flexihome.api.schemas import (
     PortfolioConfig,
 )
 from flexihome.api.serialization import dataframe_to_records, json_safe, serialize_optimization_result
-from flexihome.api.store import InMemoryOptimizationStore, StoredJob
+from flexihome.api.store import OptimizationStore, StoredJob
 from flexihome.core.data import generate_synthetic_portfolio
 from flexihome.core.engine import (
     SUPPORTED_MPC_TARGETS,
@@ -88,7 +88,7 @@ def fleet_meta_from_bundle(bundle: Dict, config: PortfolioConfig) -> Dict[str, f
 
 
 def run_optimization_job(
-    store: InMemoryOptimizationStore,
+    store: OptimizationStore,
     optimization_id: str,
     request: OptimizationRequest,
 ) -> None:

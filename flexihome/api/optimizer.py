@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import List
 
+import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
@@ -97,13 +99,28 @@ async def health_check() -> dict:
     """Return service health for local and production readiness checks."""
 
     store_health = STORE.health()
-    status = "degraded" if store_health.get("timescaledb") == "unavailable" else "healthy"
+    airflow_health = _airflow_health()
+    degraded = store_health.get("timescaledb") == "unavailable" or airflow_health.get("airflow") == "unavailable"
+    status = "degraded" if degraded else "healthy"
     return {
         "status": status,
         "fastapi": "ok",
         **store_health,
-        "airflow": "not_configured",
+        **airflow_health,
     }
+
+
+def _airflow_health() -> dict:
+    url = os.getenv("FLEXIHOME_AIRFLOW_URL", "").strip().rstrip("/")
+    if not url:
+        return {"airflow": "not_configured"}
+    try:
+        response = requests.get(f"{url}/health", timeout=2)
+        if response.ok:
+            return {"airflow": "connected", "airflow_url": url}
+        return {"airflow": "unavailable", "airflow_url": url, "airflow_error": f"HTTP {response.status_code}"}
+    except requests.RequestException as exc:
+        return {"airflow": "unavailable", "airflow_url": url, "airflow_error": str(exc)[:240]}
 
 
 @app.get("/metrics", response_class=PlainTextResponse)

@@ -390,6 +390,65 @@ When configured, the API creates:
 
 If the DSN is configured but unavailable, the API falls back to the in-memory store and `/health` reports `status: degraded`. Set `FLEXIHOME_TIMESCALE_STRICT=1` if you want startup to fail instead. The default database connection timeout is 5 seconds; override it with `FLEXIHOME_TIMESCALE_CONNECT_TIMEOUT`.
 
+## Optional Airflow orchestration
+
+The repository includes local Apache Airflow services in `compose.yaml`:
+- `airflow-postgres` for Airflow metadata
+- `airflow-init` for database migration and local admin user creation
+- `airflow-webserver` for the Airflow dashboard
+- `airflow-scheduler` for DAG scheduling
+
+Start TimescaleDB and Airflow:
+
+```cmd
+docker compose up -d timescaledb airflow-postgres airflow-init airflow-webserver airflow-scheduler
+```
+
+Open the Airflow dashboard:
+
+- `http://127.0.0.1:8080`
+- default user: `admin`
+- default password: `admin`
+
+The DAG `flexihome_local_pipeline` runs the standalone local modules:
+- `scripts/run_forecasting.py`
+- `scripts/run_optimization.py`
+
+Trigger the DAG from the command line:
+
+```cmd
+docker compose exec airflow-scheduler airflow dags trigger flexihome_local_pipeline
+```
+
+The default DAG payload is intentionally small for local testing: `days=2`, `n_homes=80`, `horizon_hours=1`, `dispatch_hours=1`, `market_data_mode=synthetic`. For larger production-like runs, open the Airflow UI, trigger the DAG with config, and provide JSON such as:
+
+```json
+{
+  "days": 7,
+  "n_homes": 1500,
+  "horizon_hours": 24,
+  "dispatch_hours": 24,
+  "market_data_mode": "auto"
+}
+```
+
+Check DAGs:
+
+```cmd
+docker compose exec airflow-scheduler airflow dags list
+docker compose exec airflow-scheduler airflow tasks list flexihome_local_pipeline
+```
+
+The DAG writes artifacts into `runs/`, which the Streamlit dashboard can inspect from **Advanced / Export**. The FastAPI `/health` endpoint reports Airflow when `FLEXIHOME_AIRFLOW_URL` is set, for example:
+
+```cmd
+set FLEXIHOME_AIRFLOW_URL=http://127.0.0.1:8080
+python scripts\run_api.py --reload
+curl http://127.0.0.1:8000/health
+```
+
+This local Docker Compose setup follows Airflow's quick-start style and is suitable for local orchestration and development. For a production VPP deployment, move Airflow to a hardened deployment pattern such as Kubernetes/Helm, secrets management, and a proper image-build pipeline.
+
 ## Optional Real Market Data
 
 By default the dashboard and API still run with synthetic market data, so the project works offline. In the Streamlit sidebar, use **Market Data Source** to switch between `Synthetic` and `Real market APIs`. The dashboard accepts ENTSO-E and Fingrid keys as password fields at runtime; these values are not written to tracked files.

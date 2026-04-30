@@ -9,6 +9,8 @@ __pycache__/
 !.env.example
 *.log
 runs/
+airflow/logs/
+airflow/plugins/
 flexihome_*.csv
 flexihome_*.json
 flexihome_*.pdf

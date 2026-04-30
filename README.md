@@ -155,11 +155,14 @@ git fetch origin
 git switch codex-fastapi-api-layer
 git pull
 ```
-
+### To activate an already existing virtual environment in Command Prompt (cmd), follow these steps:
+Run this command from your project folder:
+cmd
+.venv\Scripts\activate
 ### 2. Create and activate a virtual environment
 
 ```cmd
-py -3 -m venv .venv
+python -m venv .venv
 .venv\Scripts\activate
 python -m pip install --upgrade pip
 ```

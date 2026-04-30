@@ -9,7 +9,7 @@ The application combines:
 - a receding-horizon MPC-style optimizer
 - interactive educational visualizations for response speed, compliance, revenue, and what-if analysis
 
-This branch contains the Streamlit dashboard implementation and its Python dependencies.
+This branch contains the Streamlit dashboard plus the FastAPI optimizer service and their Python dependencies.
 
 ## Dashboard Scope
 
@@ -142,12 +142,15 @@ If you do not have the repository yet:
 cd /d "%USERPROFILE%\Documents"
 git clone https://github.com/arkm315787/Real_Time_Control_Energy-Flexibility.git
 cd Real_Time_Control_Energy-Flexibility
+git switch codex-fastapi-api-layer
 ```
 
 If you already cloned it:
 
 ```cmd
 cd /d "C:\path\to\Real_Time_Control_Energy-Flexibility"
+git fetch origin
+git switch codex-fastapi-api-layer
 git pull
 ```
 
@@ -245,14 +248,12 @@ Ctrl + C
 
 ## Option A: Base dashboard only
 
-This older short path is still useful if you only want to run the dashboard quickly.
-
-This is the recommended path if you want the dashboard working quickly and do not need optional LSTM/TensorFlow extras.
+This short path is useful if you only want the dashboard working quickly and do not need optional LSTM/TensorFlow extras.
 
 ### Command Prompt
 
 ```cmd
-cd /d "C:\Users\Kasutaja\OneDrive - Tallinna Tehnikaülikool\Documents\Playground"
+cd /d "C:\Users\Kasutaja\OneDrive - Tallinna Tehnikaülikool\Documents\Playground\Real_Time_Control_Energy-Flexibility"
 py -3 -m venv .venv
 .venv\Scripts\activate
 python -m pip install --upgrade pip
@@ -308,7 +309,7 @@ This is useful on Windows if you want optional TensorFlow/LSTM dependencies and 
 ```cmd
 py -3 -m venv C:\fhv
 C:\fhv\Scripts\activate
-cd /d "C:\Users\Kasutaja\OneDrive - Tallinna Tehnikaülikool\Documents\Playground"
+cd /d "C:\Users\Kasutaja\OneDrive - Tallinna Tehnikaülikool\Documents\Playground\Real_Time_Control_Energy-Flexibility"
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 python -m streamlit run app.py
@@ -538,7 +539,7 @@ netsh interface ipv4 show excludedportrange protocol=tcp
 
 ## Branch Information
 
-The current `main` branch contains the Streamlit dashboard plus the first FastAPI optimizer service layer.
+The `main` branch contains the Streamlit dashboard. The `codex-fastapi-api-layer` branch adds the FastAPI optimizer service and refactors the shared optimizer logic into the `flexihome` package.
 
 ## License / Usage
 

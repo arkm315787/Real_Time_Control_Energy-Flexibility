@@ -41,6 +41,8 @@ class OptimizationRequest(BaseModel):
 
     market_mode: MarketMode = "Combined"
     resource_mode: ResourceMode = "Hybrid portfolio"
+    forecaster_plugin: str = Field("xgboost_default", min_length=1)
+    optimizer_plugin: str = Field("pulp_default", min_length=1)
     horizon_hours: int = Field(2, ge=1, le=72)
     dispatch_hours: int = Field(4, ge=1, le=168)
     portfolio_config: PortfolioConfig = Field(default_factory=PortfolioConfig)
@@ -79,6 +81,7 @@ class OptimizationResultResponse(BaseModel):
 class ForecastRequest(BaseModel):
     """Standalone forecasting request."""
 
+    forecaster_plugin: str = Field("xgboost_default", min_length=1)
     target: str = "net_load_baseline_kw"
     predictors: Optional[List[str]] = None
     lags: int = Field(4, ge=1, le=48)
@@ -89,6 +92,7 @@ class ForecastRequest(BaseModel):
 class ForecastResponse(BaseModel):
     """Standalone forecast response."""
 
+    forecaster_plugin: str
     target: str
     metrics: Dict[str, float]
     horizon_steps: int

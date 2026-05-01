@@ -32,9 +32,19 @@ def main() -> None:
     health.raise_for_status()
     print("health:", health.json())
 
+    plugins = client.get("/plugins")
+    plugins.raise_for_status()
+    plugin_payload = plugins.json()
+    print("plugins:", plugin_payload)
+    if "xgboost_default" not in plugin_payload["forecasters"]:
+        raise SystemExit("Expected xgboost_default forecaster plugin")
+    if "pulp_default" not in plugin_payload["optimizers"]:
+        raise SystemExit("Expected pulp_default optimizer plugin")
+
     forecast = client.post(
         "/forecast",
         json={
+            "forecaster_plugin": "xgboost_default",
             "target": "net_load_baseline_kw",
             "lags": 2,
             "horizon_steps": 1,
@@ -49,6 +59,8 @@ def main() -> None:
         json={
             "market_mode": "Combined",
             "resource_mode": "Hybrid portfolio",
+            "forecaster_plugin": "xgboost_default",
+            "optimizer_plugin": "pulp_default",
             "horizon_hours": 1,
             "dispatch_hours": 1,
             "portfolio_config": SMALL_PORTFOLIO,

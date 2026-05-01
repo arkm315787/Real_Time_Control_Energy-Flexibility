@@ -21,6 +21,10 @@ jobs:
         run: python -m py_compile app.py flexihome/core/engine.py flexihome/core/market_data.py flexihome/api/services.py
       - name: API smoke test
         run: python scripts/api_smoke.py
+      - name: Plugin architecture smoke test
+        run: python scripts/plugin_smoke.py
+      - name: Pipeline DAG smoke test
+        run: python scripts/pipeline_smoke.py
       - name: Forecast module smoke test
         run: python scripts/run_forecasting.py --days 2 --n-homes 80 --target fcrn_capacity_eur_per_mw_h --output-root runs
       - name: Optimization module smoke test

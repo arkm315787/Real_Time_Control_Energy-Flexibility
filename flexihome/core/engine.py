@@ -12,7 +12,7 @@ import math
 import pickle
 import textwrap
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -529,7 +529,7 @@ def iterative_forecast(
     df: pd.DataFrame,
     current_pos: int,
     horizon_steps: int,
-    models: Dict[str, ForecastSpec],
+    models: Dict[str, Any],
     targets: List[str],
     step_callback: Callable[[int, int], None] | None = None,
 ) -> pd.DataFrame:
@@ -544,12 +544,23 @@ def iterative_forecast(
         for target in targets:
             spec = models[target]
             row = build_single_feature_row(future_slice, base_pos, spec.predictors, spec.lags)
-            prediction = float(spec.model.predict(row)[0])
+            prediction = _predict_one_step(spec, row)
             future_slice.loc[future_slice.index[pred_pos], target] = prediction
             output.loc[future_slice.index[pred_pos], target] = prediction
         if step_callback:
             step_callback(step_ahead, horizon_steps)
     return output
+
+def _predict_one_step(spec: Any, row: pd.DataFrame) -> float:
+    predict_fn = getattr(spec, "predict", None)
+    if callable(predict_fn):
+        payload = predict_fn(row, horizon_steps=1)
+        predictions = payload[0] if isinstance(payload, tuple) else payload
+        if isinstance(predictions, pd.Series):
+            return float(predictions.iloc[0])
+        values = np.asarray(predictions).reshape(-1)
+        return float(values[0])
+    return float(spec.model.predict(row)[0])
 
 def response_model_profiles(
     tau_bess_s: float,
@@ -1140,9 +1151,33 @@ def simulate_tracking_interval(
     }
     return aggregated, tracking_df
 
+def _solve_mpc_with_plugin(
+    forecast: pd.DataFrame,
+    state: Dict[str, float],
+    market_mode: str,
+    resource_mode: str,
+    penalty_weights: Dict[str, float],
+    fleet_meta: Dict[str, float],
+    optimizer: Any | None,
+) -> Dict[str, object]:
+    if optimizer is None:
+        return solve_mpc_step(forecast, state, market_mode, resource_mode, penalty_weights, fleet_meta)
+
+    result = optimizer.solve(
+        forecast_horizon=forecast,
+        current_state=state,
+        fleet_metadata=fleet_meta,
+        market_mode=market_mode,
+        resource_mode=resource_mode,
+        penalty_weights=penalty_weights,
+    )
+    if hasattr(result, "to_legacy_dict"):
+        return result.to_legacy_dict()
+    return dict(result)
+
 def run_mpc_controller(
     df: pd.DataFrame,
-    models: Dict[str, ForecastSpec],
+    models: Dict[str, Any],
     fleet_meta: Dict[str, float],
     market_mode: str,
     resource_mode: str,
@@ -1151,6 +1186,7 @@ def run_mpc_controller(
     penalty_weights: Dict[str, float],
     preview_4s: pd.DataFrame | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    optimizer: Any | None = None,
 ) -> Dict[str, object]:
     sim_steps = min(int(dispatch_hours / df["dt_h"].iloc[0]), len(df) - 2)
     horizon_steps = min(int(horizon_hours / df["dt_h"].iloc[0]), len(df) - 2)
@@ -1221,7 +1257,15 @@ def run_mpc_controller(
                 "afrr_down_energy_eur_per_mwh",
             ]
         ].copy()
-        solution = solve_mpc_step(forecast, state, market_mode, resource_mode, penalty_weights, fleet_meta)
+        solution = _solve_mpc_with_plugin(
+            forecast=forecast,
+            state=state,
+            market_mode=market_mode,
+            resource_mode=resource_mode,
+            penalty_weights=penalty_weights,
+            fleet_meta=fleet_meta,
+            optimizer=optimizer,
+        )
         if solution["schedule"].empty:
             break
         schedule_snapshots.append(solution["schedule"])

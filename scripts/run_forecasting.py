@@ -11,8 +11,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from flexihome.core.data import generate_synthetic_portfolio
-from flexihome.core.engine import serialize_forecast_spec, train_forecaster
+from flexihome.core.base.registry import get_global_registry
+from flexihome.core.engine import serialize_forecast_spec
 from flexihome.pipeline.artifacts import new_run_dir, write_frame, write_json
+from flexihome.plugins import DEFAULT_FORECASTER_PLUGIN, register_default_plugins
 
 
 DEFAULT_PREDICTORS = [
@@ -38,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--freq-minutes", type=int, default=15)
     parser.add_argument("--market-data-mode", choices=["synthetic", "auto", "real"], default="synthetic")
     parser.add_argument("--market-lookback-days", type=int, default=30)
+    parser.add_argument("--forecaster-plugin", default=DEFAULT_FORECASTER_PLUGIN)
     parser.add_argument("--output-root", default="runs")
     return parser.parse_args()
 
@@ -66,7 +69,10 @@ def main() -> None:
     )
     df = bundle["data"]
     predictors = [item.strip() for item in args.predictors.split(",") if item.strip()]
-    spec, comparison = train_forecaster(df, args.target, predictors, args.lags, args.horizon_steps, args.seed)
+    registry = register_default_plugins(get_global_registry())
+    forecaster = registry.get_forecaster(args.forecaster_plugin, seed=args.seed)
+    comparison = forecaster.fit_from_frame(df, args.target, predictors, args.lags, args.horizon_steps)
+    spec = forecaster.to_forecast_spec()
 
     run_dir = new_run_dir(args.output_root, "forecast")
     write_frame(run_dir / "training_data.csv", df)
@@ -76,6 +82,7 @@ def main() -> None:
         run_dir / "forecast_summary.json",
         {
             "module": "forecasting",
+            "forecaster_plugin": args.forecaster_plugin,
             "target": spec.target,
             "predictors": spec.predictors,
             "lags": spec.lags,
@@ -95,4 +102,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

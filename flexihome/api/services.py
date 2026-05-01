@@ -14,14 +14,14 @@ from flexihome.api.schemas import (
 )
 from flexihome.api.serialization import dataframe_to_records, json_safe, serialize_optimization_result
 from flexihome.api.store import OptimizationStore, StoredJob
+from flexihome.core.base.registry import get_global_registry
 from flexihome.core.data import generate_synthetic_portfolio
 from flexihome.core.engine import (
     SUPPORTED_MPC_TARGETS,
     default_hvac_response_seconds,
-    train_forecaster,
 )
-from flexihome.core.forecasting import train_default_mpc_models
 from flexihome.core.mpc import run_mpc_controller
+from flexihome.plugins import DEFAULT_FORECASTER_PLUGIN, DEFAULT_OPTIMIZER_PLUGIN, register_default_plugins
 
 
 DEFAULT_PREDICTORS = [
@@ -37,6 +37,10 @@ DEFAULT_PREDICTORS = [
     "afrr_down_act_frac",
     "fcr_signed_act",
 ]
+
+
+def plugin_registry():
+    return register_default_plugins(get_global_registry())
 
 
 def new_optimization_id() -> str:
@@ -96,7 +100,11 @@ def run_optimization_job(
     try:
         bundle = generate_synthetic_portfolio(**portfolio_kwargs(request.portfolio_config))
         df = bundle["data"]
-        models = train_default_mpc_models(df, seed=int(request.portfolio_config.seed))
+        registry = plugin_registry()
+        forecaster_plugin = request.forecaster_plugin or DEFAULT_FORECASTER_PLUGIN
+        optimizer_plugin = request.optimizer_plugin or DEFAULT_OPTIMIZER_PLUGIN
+        models = train_mpc_forecasters(df, seed=int(request.portfolio_config.seed), forecaster_plugin=forecaster_plugin)
+        optimizer = registry.get_optimizer(optimizer_plugin)
         result = run_mpc_controller(
             df=df,
             models=models,
@@ -111,13 +119,36 @@ def run_optimization_job(
                 "departure": float(request.departure_weight),
             },
             preview_4s=bundle["preview_4s"],
+            optimizer=optimizer,
         )
         market_data_status = bundle.get("summary", {}).get("market_data_status", {})
         result.setdefault("summary", {})["market_data_source"] = market_data_status.get("mode_used", "synthetic")
+        result.setdefault("summary", {})["forecaster_plugin"] = forecaster_plugin
+        result.setdefault("summary", {})["optimizer_plugin"] = optimizer_plugin
         result["market_data_status"] = market_data_status
         store.complete(optimization_id, serialize_optimization_result(result))
     except Exception as exc:
         store.fail(optimization_id, str(exc))
+
+
+def train_mpc_forecasters(df, seed: int, forecaster_plugin: str) -> Dict:
+    registry = plugin_registry()
+    models: Dict = {}
+    for target in SUPPORTED_MPC_TARGETS:
+        forecaster = registry.get_forecaster(
+            forecaster_plugin,
+            name=f"{forecaster_plugin}_{target}",
+            seed=int(seed),
+        )
+        forecaster.fit_from_frame(
+            df=df,
+            target=target,
+            predictors=DEFAULT_PREDICTORS,
+            lags=4,
+            horizon_steps=1,
+        )
+        models[target] = forecaster
+    return models
 
 
 def run_forecast(request: ForecastRequest) -> Dict:
@@ -127,18 +158,25 @@ def run_forecast(request: ForecastRequest) -> Dict:
     bundle = generate_synthetic_portfolio(**portfolio_kwargs(request.portfolio_config))
     df = bundle["data"]
     predictors = request.predictors or DEFAULT_PREDICTORS
-    spec, comparison = train_forecaster(
+    registry = plugin_registry()
+    forecaster_plugin = request.forecaster_plugin or DEFAULT_FORECASTER_PLUGIN
+    forecaster = registry.get_forecaster(
+        forecaster_plugin,
+        name=f"{forecaster_plugin}_{request.target}",
+        seed=int(request.portfolio_config.seed),
+    )
+    comparison = forecaster.fit_from_frame(
         df=df,
         target=request.target,
         predictors=predictors,
         lags=int(request.lags),
         horizon_steps=int(request.horizon_steps),
-        seed=int(request.portfolio_config.seed),
     )
     return {
-        "target": spec.target,
-        "metrics": json_safe(spec.metrics),
-        "horizon_steps": spec.horizon_steps,
+        "forecaster_plugin": forecaster_plugin,
+        "target": forecaster.target,
+        "metrics": json_safe(forecaster.metrics),
+        "horizon_steps": forecaster.horizon_steps,
         "predictions": dataframe_to_records(comparison.tail(48)),
         "generated_at": datetime.now(timezone.utc),
     }

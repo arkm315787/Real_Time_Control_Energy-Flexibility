@@ -120,7 +120,13 @@ The project now has two entry points: the Streamlit dashboard and a FastAPI serv
 - [app.py](./app.py)
   - the main Streamlit application
 - [flexihome/core](./flexihome/core)
-  - Streamlit-free data generation, forecasting, response-model, and MPC logic
+  - Streamlit-free data generation, forecasting, response-model, MPC logic, and base plugin interfaces
+- [flexihome/core/base](./flexihome/core/base)
+  - abstract forecaster, optimizer, pipeline-stage, orchestrator, and plugin-registry contracts
+- [flexihome/pipeline](./flexihome/pipeline)
+  - explicit market-data, feature, forecasting, optimization, and serialization pipeline stages with contracts and manifests
+- [flexihome/plugins](./flexihome/plugins)
+  - bundled production plugins, currently `xgboost_default` for forecasting and `pulp_default` for optimization
 - [flexihome/api](./flexihome/api)
   - FastAPI schemas, endpoints, in-memory/TimescaleDB job stores, and result serialization
 - [compose.yaml](./compose.yaml)
@@ -129,6 +135,56 @@ The project now has two entry points: the Streamlit dashboard and a FastAPI serv
   - base dependencies required to run the dashboard and API service
 - [requirements-lstm.txt](./requirements-lstm.txt)
   - optional deep-learning dependencies for TensorFlow/LSTM-related extensions
+
+## Plugin Architecture
+
+FlexiHome now has a plugin layer for production step-by-step extension:
+
+- `BaseForecaster` supports `fit`, `predict`, `get_feature_importance`, common evaluation metrics, and a shared lagged-frame helper.
+- `BaseOptimizer` supports swappable MPC solvers through a common `solve(...)` contract.
+- `BasePipelineStage` and `PipelineOrchestrator` provide a modular path for ingestion, feature engineering, forecasting, optimization, and result publication.
+- `PluginRegistry` centralizes runtime discovery and instantiation.
+
+Bundled defaults are registered at startup:
+
+```python
+from flexihome.core.base.registry import get_global_registry
+from flexihome.plugins import register_default_plugins
+
+registry = register_default_plugins(get_global_registry())
+registry.list_forecasters()
+registry.list_optimizers()
+```
+
+The FastAPI service exposes the registered plugins at:
+
+- `GET /plugins`
+
+`POST /forecast` accepts `forecaster_plugin`, and `POST /optimize` accepts both `forecaster_plugin` and `optimizer_plugin`. Defaults are `xgboost_default` and `pulp_default`, so existing API calls continue to work.
+
+## Data Pipeline
+
+The production-oriented pipeline is explicit and contract-driven:
+
+```text
+market_data_ingestion -> feature_engineering -> forecasting -> optimization -> results_serialization
+```
+
+The implementation lives under `flexihome/pipeline/`:
+
+- `contracts.py` defines dataframe schemas, artifact contracts, run configuration, and manifest structure.
+- `orchestrator.py` builds the default DAG and publishes DAG/contract metadata into the run context.
+- `stages/market_data_ingestion.py` creates the portfolio dataframe and applies synthetic, mixed, or real market data.
+- `stages/feature_engineering.py` validates and publishes model feature columns.
+- `stages/forecasting_stage.py` trains registry-selected forecaster plugins for MPC targets.
+- `stages/optimization_stage.py` runs the registry-selected optimizer plugin.
+- `stages/results_serialization.py` writes CSV/JSON artifacts plus `manifest.json` with file hashes, dataframe hashes, schemas, and run config.
+
+Run the whole pipeline locally:
+
+```cmd
+python scripts\run_pipeline.py --days 1 --n-homes 80 --horizon-hours 1 --dispatch-hours 1 --output-root runs
+```
 
 ## How To Run
 
@@ -186,6 +242,8 @@ pip install -r requirements-dev.txt
 ```cmd
 python -m py_compile app.py flexihome\core\engine.py flexihome\api\optimizer.py flexihome\api\services.py
 python scripts\market_data_smoke.py
+python scripts\plugin_smoke.py
+python scripts\pipeline_smoke.py
 python scripts\api_smoke.py
 python scripts\timescale_store_smoke.py
 ```
@@ -524,16 +582,23 @@ flowchart LR
 Standalone forecasting:
 
 ```cmd
-python scripts\run_forecasting.py --target fcrn_capacity_eur_per_mw_h --market-data-mode synthetic --days 7 --output-root runs
+python scripts\run_forecasting.py --target fcrn_capacity_eur_per_mw_h --market-data-mode synthetic --forecaster-plugin xgboost_default --days 7 --output-root runs
 ```
 
 Standalone optimization:
 
 ```cmd
-python scripts\run_optimization.py --market-mode Combined --resource-mode "Hybrid portfolio" --horizon-hours 24 --dispatch-hours 24 --market-data-mode synthetic --output-root runs
+python scripts\run_optimization.py --market-mode Combined --resource-mode "Hybrid portfolio" --horizon-hours 24 --dispatch-hours 24 --market-data-mode synthetic --forecaster-plugin xgboost_default --optimizer-plugin pulp_default --output-root runs
+```
+
+Full contract pipeline:
+
+```cmd
+python scripts\run_pipeline.py --market-data-mode synthetic --forecaster-plugin xgboost_default --optimizer-plugin pulp_default --days 7 --n-homes 1500 --horizon-hours 24 --dispatch-hours 24 --output-root runs
 ```
 
 For real market data, set `ENTSOE_API_KEY` and/or `FINGRID_API_KEY`, then use `--market-data-mode auto` or `--market-data-mode real`. Each run writes CSV/JSON/model artifacts under `runs\forecast_*` or `runs\optimization_*`; `runs/` is intentionally gitignored.
+The full pipeline writes `runs\pipeline_*` with `manifest.json`, artifact hashes, dataframe schema snapshots, and data-version fingerprints.
 Open the dashboard's **Advanced / Export** tab to inspect those external run artifacts without retraining or resolving the optimization inside Streamlit.
 
 Recommended engineering ownership:
@@ -562,6 +627,8 @@ python -m streamlit run app.py
 ```cmd
 pip install -r requirements-dev.txt
 python -m py_compile app.py flexihome\core\engine.py flexihome\api\optimizer.py flexihome\api\services.py
+python scripts\plugin_smoke.py
+python scripts\pipeline_smoke.py
 python scripts\api_smoke.py
 python scripts\timescale_store_smoke.py
 python scripts\run_api.py

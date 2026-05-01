@@ -30,9 +30,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
+from flexihome.core.base.registry import get_global_registry
 from flexihome.core.engine import (
     FINGRID_RULES,
-    ForecastSpec,
     HVAC_MODES,
     SUPPORTED_MPC_TARGETS,
     bode_points,
@@ -45,9 +45,10 @@ from flexihome.core.engine import (
     run_mpc_controller,
     sensitivity_scan,
     serialize_forecast_spec,
-    train_default_mpc_models,
-    train_forecaster,
 )
+from flexihome.plugins import DEFAULT_FORECASTER_PLUGIN, DEFAULT_OPTIMIZER_PLUGIN, register_default_plugins
+
+PLUGIN_REGISTRY = register_default_plugins(get_global_registry())
 
 st.set_page_config(
     page_title="FlexiHome",
@@ -362,19 +363,46 @@ def data_quality_figure(df: pd.DataFrame, columns: List[str], template: str) -> 
 
 
 
-def ensure_default_models(df: pd.DataFrame, seed: int) -> Dict[str, ForecastSpec]:
+def train_plugin_mpc_models(df: pd.DataFrame, seed: int, forecaster_plugin: str) -> Dict[str, object]:
+    predictors = [
+        "temp_out_c",
+        "irradiance_wm2",
+        "base_load_kw",
+        "pv_available_kw",
+        "net_load_baseline_kw",
+        "fcrn_capacity_eur_per_mw_h",
+        "afrr_up_capacity_eur_per_mw_h",
+        "afrr_down_capacity_eur_per_mw_h",
+        "afrr_up_act_frac",
+        "afrr_down_act_frac",
+        "fcr_signed_act",
+    ]
+    models: Dict[str, object] = {}
+    for target in SUPPORTED_MPC_TARGETS:
+        forecaster = PLUGIN_REGISTRY.get_forecaster(
+            forecaster_plugin,
+            name=f"{forecaster_plugin}_{target}",
+            seed=seed,
+        )
+        forecaster.fit_from_frame(df, target, predictors, lags=4, horizon_steps=1)
+        models[target] = forecaster
+    return models
+
+
+def ensure_default_models(df: pd.DataFrame, seed: int, forecaster_plugin: str = DEFAULT_FORECASTER_PLUGIN) -> Dict[str, object]:
     signature = (
         len(df),
         str(df.index[0]),
         str(df.index[-1]),
         seed,
+        forecaster_plugin,
         int(round(float(df["dt_h"].iloc[0]) * 60.0)),
         float(df["base_load_kw"].mean()),
         float(df["pv_available_kw"].mean()),
         float(df["fast_sym_kw"].mean()),
     )
     if "default_mpc_models" not in st.session_state or st.session_state.get("default_mpc_signature") != signature:
-        st.session_state["default_mpc_models"] = train_default_mpc_models(df, seed)
+        st.session_state["default_mpc_models"] = train_plugin_mpc_models(df, seed, forecaster_plugin)
         st.session_state["default_mpc_signature"] = signature
     custom = st.session_state.get("custom_mpc_models", {})
     merged = dict(st.session_state["default_mpc_models"])
@@ -919,7 +947,9 @@ def main() -> None:
             "fcr_signed_act",
         ]
         predictor_pool = numeric_signal_options(df, preferred_predictors)
-        col1, col2, col3, col4 = st.columns([1.2, 1.5, 0.8, 0.8])
+        forecaster_plugins = PLUGIN_REGISTRY.list_forecasters()
+        plugin_options = list(forecaster_plugins)
+        col1, col2, col3, col4, col5 = st.columns([1.1, 1.3, 1.0, 0.7, 0.8])
         target = col1.selectbox("Target", target_options, index=0)
         default_predictors = [
             col
@@ -933,9 +963,15 @@ def main() -> None:
             predictor_pool,
             default=default_predictors,
         )
-        lags = col3.slider("Lag depth", 1, 8, 4)
+        selected_forecaster_plugin = col3.selectbox(
+            "Forecasting model",
+            plugin_options,
+            index=plugin_options.index(DEFAULT_FORECASTER_PLUGIN) if DEFAULT_FORECASTER_PLUGIN in plugin_options else 0,
+            format_func=lambda key: f"{key} ({forecaster_plugins[key]})",
+        )
+        lags = col4.slider("Lag depth", 1, 8, 4)
         max_horizon_steps = max(4, min(96, int((24 * 60) / max(freq_minutes, 1))))
-        horizon_steps = col4.slider(f"Forecast horizon ({freq_minutes} min steps)", 1, max_horizon_steps, min(4, max_horizon_steps))
+        horizon_steps = col5.slider(f"Forecast horizon ({freq_minutes} min steps)", 1, max_horizon_steps, min(4, max_horizon_steps))
         preview_fig = signal_line_figure(df, [target], f"Selected target history: {target}")
         st.plotly_chart(apply_chart_style(preview_fig, template, height=260), use_container_width=True)
         if real_market_ready and target in market_columns:
@@ -944,25 +980,36 @@ def main() -> None:
                 f"Raw observations for this signal: {market_data_status.get('observations_loaded', {}).get(target, 0):,}."
             )
 
-        if st.button("Train selected XGBoost forecast", type="primary", key=f"train_forecast_{target}"):
+        if st.button("Train forecast", type="primary", key=f"train_forecast_{target}"):
             with st.spinner("Training the forecaster..."):
-                spec, comparison = train_forecaster(df, target, predictors, lags, horizon_steps, int(seed))
+                forecaster = PLUGIN_REGISTRY.get_forecaster(selected_forecaster_plugin, seed=int(seed))
+                comparison = forecaster.fit_from_frame(df, target, predictors, lags, horizon_steps)
+                try:
+                    spec = forecaster.to_forecast_spec()
+                except ValueError:
+                    spec = forecaster
             st.session_state["last_forecast_spec"] = spec
+            st.session_state["last_forecaster_instance"] = forecaster
+            st.session_state["last_forecaster_plugin"] = selected_forecaster_plugin
             st.session_state["last_forecast_comparison"] = comparison
             st.session_state["last_forecast_market_status"] = market_data_status
             st.session_state["last_forecast_row_count"] = int(len(df))
 
         if "last_forecast_spec" in st.session_state:
-            spec: ForecastSpec = st.session_state["last_forecast_spec"]
+            spec = st.session_state["last_forecast_spec"]
+            forecaster = st.session_state.get("last_forecaster_instance")
             comparison = st.session_state["last_forecast_comparison"]
             forecast_market_status = st.session_state.get("last_forecast_market_status", {})
-            if spec.target != target:
-                st.info(f"The displayed trained model is for `{spec.target}`. Click Train selected XGBoost forecast to retrain for `{target}`.")
+            spec_target = getattr(spec, "target", target)
+            spec_metrics = getattr(spec, "metrics", {})
+            spec_horizon_steps = getattr(spec, "horizon_steps", horizon_steps)
+            if spec_target != target:
+                st.info(f"The displayed trained model is for `{spec_target}`. Click Train forecast to retrain for `{target}`.")
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("MAE", f"{spec.metrics['mae']:.2f}")
-            m2.metric("RMSE", f"{spec.metrics['rmse']:.2f}")
+            m1.metric("MAE", f"{spec_metrics['mae']:.2f}")
+            m2.metric("RMSE", f"{spec_metrics['rmse']:.2f}")
             m3.metric("Rows used", f"{st.session_state.get('last_forecast_row_count', len(df)):,}")
-            m4.metric("Market source", str(forecast_market_status.get("mode_used", "synthetic")).title())
+            m4.metric("Model", st.session_state.get("last_forecaster_plugin", DEFAULT_FORECASTER_PLUGIN))
             st.caption(
                 f"Training frame uses {st.session_state.get('last_forecast_row_count', len(df)):,} rows at {freq_minutes}-minute resolution. "
                 f"Real market fetch window: {forecast_market_status.get('query_start_utc') or 'not used'} to "
@@ -971,25 +1018,35 @@ def main() -> None:
             )
 
             pred_fig = go.Figure()
-            pred_fig.add_trace(go.Scatter(x=comparison.index, y=comparison["actual"], name=f"Actual {spec.target}", line={"color": RESOURCE_COLORS["Base"]}))
-            pred_fig.add_trace(go.Scatter(x=comparison.index, y=comparison["prediction"], name=f"Predicted {spec.target}", line={"color": RESOURCE_COLORS["Net"], "dash": "dot"}))
-            pred_fig.update_layout(yaxis_title=spec.target)
-            st.plotly_chart(apply_chart_style(pred_fig, template, height=380, title=f"Forecast performance: {spec.target}"), use_container_width=True)
+            pred_fig.add_trace(go.Scatter(x=comparison.index, y=comparison["actual"], name=f"Actual {spec_target}", line={"color": RESOURCE_COLORS["Base"]}))
+            pred_fig.add_trace(go.Scatter(x=comparison.index, y=comparison["prediction"], name=f"Predicted {spec_target}", line={"color": RESOURCE_COLORS["Net"], "dash": "dot"}))
+            pred_fig.update_layout(yaxis_title=spec_target)
+            st.plotly_chart(apply_chart_style(pred_fig, template, height=380, title=f"Forecast performance: {spec_target}"), use_container_width=True)
 
-            importance = pd.DataFrame({"feature": spec.model.feature_names_in_, "importance": spec.model.feature_importances_}).sort_values(
-                "importance", ascending=False
-            )
-            imp_fig = px.bar(importance.head(12), x="importance", y="feature", orientation="h", template=template, title="Top feature importances")
-            st.plotly_chart(apply_chart_style(imp_fig, template, height=380, title="Top feature importances"), use_container_width=True)
+            if forecaster is not None and hasattr(forecaster, "get_feature_importance"):
+                importance = forecaster.get_feature_importance()
+            elif hasattr(spec, "model") and hasattr(spec.model, "feature_importances_"):
+                importance = pd.DataFrame({"feature": spec.model.feature_names_in_, "importance": spec.model.feature_importances_}).sort_values(
+                    "importance", ascending=False
+                )
+            else:
+                importance = pd.DataFrame(columns=["feature", "importance"])
+            if not importance.empty:
+                imp_fig = px.bar(importance.head(12), x="importance", y="feature", orientation="h", template=template, title="Top feature importances")
+                st.plotly_chart(apply_chart_style(imp_fig, template, height=380, title="Top feature importances"), use_container_width=True)
 
-            model_bytes = serialize_forecast_spec(spec)
-            st.download_button("Download trained model", data=model_bytes, file_name=f"{spec.target}_xgboost.pkl", mime="application/octet-stream")
-            if spec.target in SUPPORTED_MPC_TARGETS and spec.horizon_steps == 1:
+            try:
+                serializable_spec = forecaster.to_forecast_spec() if forecaster is not None and hasattr(forecaster, "to_forecast_spec") else spec
+                model_bytes = serialize_forecast_spec(serializable_spec)
+                st.download_button("Download trained model", data=model_bytes, file_name=f"{spec_target}_forecast.pkl", mime="application/octet-stream")
+            except Exception:
+                st.caption("This forecaster does not expose a legacy serializable model payload.")
+            if spec_target in SUPPORTED_MPC_TARGETS and spec_horizon_steps == 1:
                 if st.button("Use this model inside the MPC loop"):
                     custom = st.session_state.get("custom_mpc_models", {})
-                    custom[spec.target] = spec
+                    custom[spec_target] = forecaster or spec
                     st.session_state["custom_mpc_models"] = custom
-                    st.success(f"{spec.target} is now promoted into the MPC forecasting registry.")
+                    st.success(f"{spec_target} is now promoted into the MPC forecasting registry.")
             else:
                 st.caption("To promote a model into the MPC loop, train a 1-step model for one of the MPC targets.")
 
@@ -1009,6 +1066,21 @@ def main() -> None:
         degradation_w = w1.slider("Degradation weight", 1.0, 60.0, 18.0, 1.0)
         comfort_w = w2.slider("Comfort violation weight", 10.0, 300.0, 120.0, 5.0)
         departure_w = w3.slider("EV departure shortfall weight", 10.0, 300.0, 160.0, 5.0)
+        forecaster_plugins = PLUGIN_REGISTRY.list_forecasters()
+        optimizer_plugins = PLUGIN_REGISTRY.list_optimizers()
+        p1, p2 = st.columns(2)
+        mpc_forecaster_plugin = p1.selectbox(
+            "MPC forecaster",
+            list(forecaster_plugins),
+            index=list(forecaster_plugins).index(DEFAULT_FORECASTER_PLUGIN) if DEFAULT_FORECASTER_PLUGIN in forecaster_plugins else 0,
+            format_func=lambda key: f"{key} ({forecaster_plugins[key]})",
+        )
+        optimizer_plugin = p2.selectbox(
+            "Optimizer",
+            list(optimizer_plugins),
+            index=list(optimizer_plugins).index(DEFAULT_OPTIMIZER_PLUGIN) if DEFAULT_OPTIMIZER_PLUGIN in optimizer_plugins else 0,
+            format_func=lambda key: f"{key} ({optimizer_plugins[key]})",
+        )
 
         st.caption(
             f"Current setup: about {int(horizon_hours / (freq_minutes / 60.0))} forecast/control steps per horizon and "
@@ -1021,7 +1093,8 @@ def main() -> None:
             with st.spinner("Training default MPC forecasters and running receding-horizon optimization..."):
                 mpc_tracker = make_progress_tracker(mpc_progress_bar, mpc_progress_text, "MPC dispatch")
                 mpc_tracker(1, 100, "Preparing default forecasting models")
-                models = ensure_default_models(df, int(seed))
+                models = ensure_default_models(df, int(seed), mpc_forecaster_plugin)
+                optimizer = PLUGIN_REGISTRY.get_optimizer(optimizer_plugin)
                 mpc_tracker(8, 100, "Forecasting models ready")
                 fleet_meta = {
                     "bess_energy_cap_mwh": float(df["bess_energy_cap_mwh"].iloc[0]),
@@ -1036,6 +1109,8 @@ def main() -> None:
                     "resource_mode": resource_mode,
                     "horizon_hours": horizon_hours,
                     "dispatch_hours": dispatch_hours,
+                    "forecaster_plugin": mpc_forecaster_plugin,
+                    "optimizer_plugin": optimizer_plugin,
                 }
                 st.session_state["mpc_result"] = run_mpc_controller(
                     df=df,
@@ -1047,6 +1122,7 @@ def main() -> None:
                     dispatch_hours=dispatch_hours,
                     penalty_weights={"degradation": degradation_w, "comfort": comfort_w, "departure": departure_w},
                     preview_4s=preview_4s,
+                    optimizer=optimizer,
                     progress_callback=lambda current, total, message: mpc_tracker(
                         8 + int(round((current / max(total, 1)) * 92)),
                         100,
@@ -1077,7 +1153,8 @@ def main() -> None:
             mpc_status_cols[2].metric("Market input", str(market_data_status.get("mode_used", "synthetic")).title())
             mpc_status_cols[3].metric("Mean net revenue", fmt_money(float(result_df["net_revenue_eur"].mean())))
             st.info(
-                "MPC workflow: XGBoost forecasts each horizon, a PuLP/CBC MILP chooses reserve bids and resource dispatch, "
+                f"MPC workflow: `{st.session_state.get('mpc_config', {}).get('forecaster_plugin', DEFAULT_FORECASTER_PLUGIN)}` forecasts each horizon, "
+                f"`{st.session_state.get('mpc_config', {}).get('optimizer_plugin', DEFAULT_OPTIMIZER_PLUGIN)}` chooses reserve bids and resource dispatch, "
                 "then only the first interval is applied before the horizon rolls forward."
             )
 
@@ -1252,7 +1329,11 @@ def main() -> None:
                     alt_df["afrr_up_energy_eur_per_mwh"] *= price_multiplier
                     alt_df["afrr_down_energy_eur_per_mwh"] *= price_multiplier
                     whatif_tracker(12, 100, "Refreshing forecasting models for the what-if case")
-                    models = ensure_default_models(alt_df, int(seed))
+                    mpc_config = st.session_state.get("mpc_config", {})
+                    whatif_forecaster_plugin = mpc_config.get("forecaster_plugin", DEFAULT_FORECASTER_PLUGIN)
+                    whatif_optimizer_plugin = mpc_config.get("optimizer_plugin", DEFAULT_OPTIMIZER_PLUGIN)
+                    models = ensure_default_models(alt_df, int(seed), whatif_forecaster_plugin)
+                    whatif_optimizer = PLUGIN_REGISTRY.get_optimizer(whatif_optimizer_plugin)
                     whatif_tracker(18, 100, "Forecasting models ready")
                     alt_result = run_mpc_controller(
                         alt_df,
@@ -1265,12 +1346,13 @@ def main() -> None:
                             "hvac_mode": hvac_mode,
                             "hvac_response_s": hvac_response_s,
                         },
-                        st.session_state["mpc_config"]["market_mode"],
-                        st.session_state["mpc_config"]["resource_mode"],
-                        st.session_state["mpc_config"]["horizon_hours"],
-                        st.session_state["mpc_config"]["dispatch_hours"],
+                        mpc_config["market_mode"],
+                        mpc_config["resource_mode"],
+                        mpc_config["horizon_hours"],
+                        mpc_config["dispatch_hours"],
                         {"degradation": degradation_w, "comfort": comfort_w, "departure": departure_w},
                         preview_4s=preview_4s,
+                        optimizer=whatif_optimizer,
                         progress_callback=lambda current, total, message: whatif_tracker(
                             18 + int(round((current / max(total, 1)) * 76)),
                             100,

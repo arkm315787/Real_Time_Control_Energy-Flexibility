@@ -11,9 +11,26 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from flexihome.api.serialization import serialize_optimization_result
+from flexihome.core.base.registry import get_global_registry
 from flexihome.core.data import generate_synthetic_portfolio
-from flexihome.core.engine import default_hvac_response_seconds, run_mpc_controller, train_default_mpc_models
+from flexihome.core.engine import SUPPORTED_MPC_TARGETS, default_hvac_response_seconds, run_mpc_controller
 from flexihome.pipeline.artifacts import new_run_dir, write_frame, write_json
+from flexihome.plugins import DEFAULT_FORECASTER_PLUGIN, DEFAULT_OPTIMIZER_PLUGIN, register_default_plugins
+
+
+DEFAULT_PREDICTORS = [
+    "temp_out_c",
+    "irradiance_wm2",
+    "base_load_kw",
+    "pv_available_kw",
+    "net_load_baseline_kw",
+    "fcrn_capacity_eur_per_mw_h",
+    "afrr_up_capacity_eur_per_mw_h",
+    "afrr_down_capacity_eur_per_mw_h",
+    "afrr_up_act_frac",
+    "afrr_down_act_frac",
+    "fcr_signed_act",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,8 +46,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--freq-minutes", type=int, default=15)
     parser.add_argument("--market-data-mode", choices=["synthetic", "auto", "real"], default="synthetic")
     parser.add_argument("--market-lookback-days", type=int, default=30)
+    parser.add_argument("--forecaster-plugin", default=DEFAULT_FORECASTER_PLUGIN)
+    parser.add_argument("--optimizer-plugin", default=DEFAULT_OPTIMIZER_PLUGIN)
     parser.add_argument("--output-root", default="runs")
     return parser.parse_args()
+
+
+def train_mpc_forecasters(df, seed: int, forecaster_plugin: str):
+    registry = register_default_plugins(get_global_registry())
+    models = {}
+    for target in SUPPORTED_MPC_TARGETS:
+        forecaster = registry.get_forecaster(
+            forecaster_plugin,
+            name=f"{forecaster_plugin}_{target}",
+            seed=seed,
+        )
+        forecaster.fit_from_frame(df, target, DEFAULT_PREDICTORS, lags=4, horizon_steps=1)
+        models[target] = forecaster
+    return models
 
 
 def main() -> None:
@@ -57,7 +90,9 @@ def main() -> None:
         market_lookback_days=args.market_lookback_days if args.market_data_mode != "synthetic" else None,
     )
     df = bundle["data"]
-    models = train_default_mpc_models(df, args.seed)
+    registry = register_default_plugins(get_global_registry())
+    models = train_mpc_forecasters(df, args.seed, args.forecaster_plugin)
+    optimizer = registry.get_optimizer(args.optimizer_plugin)
     result = run_mpc_controller(
         df=df,
         models=models,
@@ -75,6 +110,7 @@ def main() -> None:
         dispatch_hours=args.dispatch_hours,
         penalty_weights={"degradation": 18.0, "comfort": 120.0, "departure": 160.0},
         preview_4s=bundle["preview_4s"],
+        optimizer=optimizer,
     )
 
     run_dir = new_run_dir(args.output_root, "optimization")
@@ -87,6 +123,8 @@ def main() -> None:
         run_dir / "optimization_summary.json",
         {
             "module": "optimization",
+            "forecaster_plugin": args.forecaster_plugin,
+            "optimizer_plugin": args.optimizer_plugin,
             "market_mode": args.market_mode,
             "resource_mode": args.resource_mode,
             "horizon_hours": args.horizon_hours,
@@ -108,4 +146,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

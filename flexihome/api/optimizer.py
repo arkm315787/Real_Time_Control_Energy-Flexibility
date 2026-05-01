@@ -10,6 +10,7 @@ import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
+from flexihome.core.base.registry import get_global_registry
 from flexihome.api.schemas import (
     ForecastRequest,
     ForecastResponse,
@@ -25,8 +26,12 @@ from flexihome.api.services import (
     run_optimization_job,
 )
 from flexihome.api.store import build_optimization_store
+from flexihome.pipeline import register_pipeline_stages
+from flexihome.plugins import register_default_plugins
 
 
+register_default_plugins()
+register_pipeline_stages()
 app = FastAPI(
     title="FlexiHome Optimizer",
     version="1.0.0",
@@ -52,6 +57,8 @@ async def optimize_portfolio(
 ) -> OptimizationResponse:
     """Submit a portfolio optimization request and poll `/results/{id}`."""
 
+    _validate_plugin(request.forecaster_plugin, get_global_registry().list_forecasters(), "forecaster")
+    _validate_plugin(request.optimizer_plugin, get_global_registry().list_optimizers(), "optimizer")
     optimization_id = new_optimization_id()
     job = STORE.create(optimization_id, model_to_dict(request))
     background_tasks.add_task(run_optimization_job, STORE, optimization_id, request)
@@ -89,9 +96,21 @@ async def forecast_next_horizon(request: ForecastRequest) -> ForecastResponse:
 
     try:
         payload = await asyncio.to_thread(run_forecast, request)
-    except ValueError as exc:
+    except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return ForecastResponse(**payload)
+
+
+@app.get("/plugins")
+async def list_plugins() -> dict:
+    """List registered model and pipeline plugins."""
+
+    registry = get_global_registry()
+    return {
+        "forecasters": registry.list_forecasters(),
+        "optimizers": registry.list_optimizers(),
+        "pipeline_stages": registry.list_pipeline_stages(),
+    }
 
 
 @app.get("/health")
@@ -121,6 +140,12 @@ def _airflow_health() -> dict:
         return {"airflow": "unavailable", "airflow_url": url, "airflow_error": f"HTTP {response.status_code}"}
     except requests.RequestException as exc:
         return {"airflow": "unavailable", "airflow_url": url, "airflow_error": str(exc)[:240]}
+
+
+def _validate_plugin(name: str, available: dict, plugin_type: str) -> None:
+    if name not in available:
+        choices = ", ".join(sorted(available)) or "none"
+        raise HTTPException(status_code=400, detail=f"Unknown {plugin_type} plugin '{name}'. Available: {choices}")
 
 
 @app.get("/metrics", response_class=PlainTextResponse)

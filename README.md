@@ -244,6 +244,7 @@ python -m py_compile app.py flexihome\core\engine.py flexihome\api\optimizer.py 
 python scripts\market_data_smoke.py
 python scripts\plugin_smoke.py
 python scripts\pipeline_smoke.py
+python scripts\airflow_dag_smoke.py
 python scripts\api_smoke.py
 python scripts\timescale_store_smoke.py
 ```
@@ -448,18 +449,71 @@ When configured, the API creates:
 
 If the DSN is configured but unavailable, the API falls back to the in-memory store and `/health` reports `status: degraded`. Set `FLEXIHOME_TIMESCALE_STRICT=1` if you want startup to fail instead. The default database connection timeout is 5 seconds; override it with `FLEXIHOME_TIMESCALE_CONNECT_TIMEOUT`.
 
-## Optional Airflow orchestration
+## Production Airflow Orchestration
 
-The repository includes local Apache Airflow services in `compose.yaml`:
+Airflow is now the production orchestration layer for FlexiHome. The Streamlit app remains the operator/research dashboard, the FastAPI service remains the machine-readable request surface, and Airflow coordinates scheduled data ingestion, model training, optimization, and outgoing result publication.
+
+The repository includes these Airflow services in `compose.yaml`:
+
 - `airflow-postgres` for Airflow metadata
-- `airflow-init` for database migration and local admin user creation
-- `airflow-webserver` for the Airflow dashboard
+- `airflow-init` for Airflow DB migration and admin user creation
+- `airflow-webserver` for the Airflow UI
 - `airflow-scheduler` for DAG scheduling
 
-Start TimescaleDB and Airflow:
+### DAG Inventory
+
+Airflow DAG files live in `airflow/dags/`.
+
+| DAG | Schedule | Role | Main artifacts |
+| --- | --- | --- | --- |
+| `flexihome_market_data_pipeline` | `@hourly` | Incoming data pipeline: source checks, market-data aggregation, feature validation | `runs/market_data_*` |
+| `flexihome_forecasting_pipeline` | Manual/API trigger | Parameterized forecasting model training | `runs/forecast_*` |
+| `flexihome_optimization_pipeline` | Manual/API trigger | Parameterized MPC optimization | `runs/optimization_*` |
+| `flexihome_results_pipeline` | Manual/API trigger | Full contract pipeline and outgoing result manifest validation | `runs/pipeline_*` |
+| `flexihome_local_pipeline` | Manual/API trigger | Compact backward-compatible local forecast + optimization DAG | `runs/forecast_*`, `runs/optimization_*` |
+
+All production DAGs share:
+
+- `retries=2`
+- `retry_delay=5 minutes`
+- `sla=1 hour` through task default args
+- explicit `dagrun_timeout`
+- `max_active_runs` limits to prevent overlapping heavy optimization jobs
+- runtime parameters through `dag_run.conf`
+
+### Step 1: Configure Secrets And Runtime Mode
+
+Create a local `.env` if needed:
 
 ```cmd
-docker compose up -d timescaledb airflow-postgres airflow-init airflow-webserver airflow-scheduler
+copy .env.example .env
+```
+
+For synthetic offline operation, no API keys are required. For real market ingestion, add:
+
+```text
+ENTSOE_API_KEY=<your-entsoe-security-token>
+FINGRID_API_KEY=<your-fingrid-open-data-key>
+FLEXIHOME_MARKET_DATA_MODE=auto
+FLEXIHOME_FINGRID_MIN_INTERVAL_SECONDS=2.1
+FLEXIHOME_FINGRID_MAX_RETRIES=4
+```
+
+For persisted API/market observations, also set:
+
+```text
+FLEXIHOME_TIMESCALE_DSN=postgresql://flexihome:flexihome@timescaledb:5432/flexihome
+FLEXIHOME_TIMESCALE_SCHEMA=flexihome
+```
+
+Use Docker service hostnames inside Airflow containers. For example, use `timescaledb`, not `127.0.0.1`, from Airflow.
+
+### Step 2: Start Airflow
+
+Build and start TimescaleDB plus Airflow:
+
+```cmd
+docker compose up -d --build timescaledb airflow-postgres airflow-init airflow-webserver airflow-scheduler
 ```
 
 Open the Airflow dashboard:
@@ -468,36 +522,127 @@ Open the Airflow dashboard:
 - default user: `admin`
 - default password: `admin`
 
-The DAG `flexihome_local_pipeline` runs the standalone local modules:
-- `scripts/run_forecasting.py`
-- `scripts/run_optimization.py`
-
-Trigger the DAG from the command line:
+Check container health and DAG import status:
 
 ```cmd
-docker compose exec airflow-scheduler airflow dags trigger flexihome_local_pipeline
-```
-
-The default DAG payload is intentionally small for local testing: `days=2`, `n_homes=80`, `horizon_hours=1`, `dispatch_hours=1`, `market_data_mode=synthetic`. For larger production-like runs, open the Airflow UI, trigger the DAG with config, and provide JSON such as:
-
-```json
-{
-  "days": 7,
-  "n_homes": 1500,
-  "horizon_hours": 24,
-  "dispatch_hours": 24,
-  "market_data_mode": "auto"
-}
-```
-
-Check DAGs:
-
-```cmd
+docker compose ps
+docker compose logs airflow-scheduler --tail 100
 docker compose exec airflow-scheduler airflow dags list
-docker compose exec airflow-scheduler airflow tasks list flexihome_local_pipeline
 ```
 
-The DAG writes artifacts into `runs/`, which the Streamlit dashboard can inspect from **Advanced / Export**. The FastAPI `/health` endpoint reports Airflow when `FLEXIHOME_AIRFLOW_URL` is set, for example:
+### Step 3: Run The Incoming Market-Data Pipeline
+
+This DAG is scheduled hourly and can also be triggered manually:
+
+```cmd
+docker compose exec airflow-scheduler airflow dags trigger flexihome_market_data_pipeline --conf "{\"market_data_mode\":\"auto\",\"market_lookback_days\":30,\"days\":2,\"n_homes\":80,\"freq_minutes\":15}"
+```
+
+Task flow:
+
+```text
+fetch_entso_e_configuration -> fetch_fingrid_configuration -> aggregate_market_frame -> validate_market_artifacts
+```
+
+The aggregation task writes `runs/market_data_*` with:
+
+- `market_data_frame.csv`
+- `market_data_summary.json`
+- `manifest.json`
+
+The manifest includes source status, schema, artifact hashes, and a dataframe fingerprint.
+
+### Step 4: Run A Parameterized Forecasting Pipeline
+
+Trigger a forecast model run:
+
+```cmd
+docker compose exec airflow-scheduler airflow dags trigger flexihome_forecasting_pipeline --conf "{\"target\":\"fcrn_capacity_eur_per_mw_h\",\"forecaster_plugin\":\"xgboost_default\",\"lags\":4,\"horizon_steps\":1,\"days\":7,\"n_homes\":1500,\"market_data_mode\":\"synthetic\"}"
+```
+
+Important parameters:
+
+- `target`: forecast target column
+- `forecaster_plugin`: registered forecasting plugin, such as `xgboost_default`
+- `lags`: lag depth
+- `horizon_steps`: forecast horizon
+- `market_data_mode`: `synthetic`, `auto`, or `real`
+
+Artifacts are written to `runs/forecast_*`:
+
+- `training_data.csv`
+- `forecast_comparison.csv`
+- `forecast_summary.json`
+- `model.pkl`
+
+### Step 5: Run A Parameterized Optimization Pipeline
+
+Trigger an MPC optimization run:
+
+```cmd
+docker compose exec airflow-scheduler airflow dags trigger flexihome_optimization_pipeline --conf "{\"market_mode\":\"Combined\",\"resource_mode\":\"Hybrid portfolio\",\"forecaster_plugin\":\"xgboost_default\",\"optimizer_plugin\":\"pulp_default\",\"horizon_hours\":24,\"dispatch_hours\":24,\"days\":7,\"n_homes\":1500,\"market_data_mode\":\"synthetic\"}"
+```
+
+Important parameters:
+
+- `market_mode`: `Combined`, `FCR-N`, or `aFRR`
+- `resource_mode`: `Hybrid portfolio` or `Fast only`
+- `forecaster_plugin`: registered forecaster used inside the MPC loop
+- `optimizer_plugin`: registered optimizer, such as `pulp_default`
+- `horizon_hours`: MPC planning horizon
+- `dispatch_hours`: closed-loop simulation horizon
+
+Artifacts are written to `runs/optimization_*`:
+
+- `training_data.csv`
+- `history.csv`
+- `tracking_4s.csv`
+- `first_schedule.csv`
+- `optimization_summary.json`
+
+### Step 6: Run The Outgoing Results Pipeline
+
+The results DAG runs the full contract pipeline and validates that a publishable manifest exists:
+
+```cmd
+docker compose exec airflow-scheduler airflow dags trigger flexihome_results_pipeline --conf "{\"market_data_mode\":\"synthetic\",\"forecaster_plugin\":\"xgboost_default\",\"optimizer_plugin\":\"pulp_default\",\"market_mode\":\"Combined\",\"resource_mode\":\"Hybrid portfolio\",\"horizon_hours\":24,\"dispatch_hours\":24,\"days\":7,\"n_homes\":1500}"
+```
+
+Artifacts are written to `runs/pipeline_*`:
+
+- `training_data.csv`
+- `forecast_metrics.json`
+- `forecast_comparison_<target>.csv`
+- `optimization_summary.json`
+- `history.csv`
+- `tracking_4s.csv`
+- `first_schedule.csv`
+- `manifest.json`
+
+The `manifest.json` is the production handoff document. It contains DAG metadata, stage contracts, run configuration, artifact paths, file hashes, dataframe schema snapshots, and data-version fingerprints.
+
+### Step 7: Inspect And Operate DAGs
+
+List tasks:
+
+```cmd
+docker compose exec airflow-scheduler airflow tasks list flexihome_market_data_pipeline
+docker compose exec airflow-scheduler airflow tasks list flexihome_forecasting_pipeline
+docker compose exec airflow-scheduler airflow tasks list flexihome_optimization_pipeline
+docker compose exec airflow-scheduler airflow tasks list flexihome_results_pipeline
+```
+
+Watch task logs from the UI or CLI:
+
+```cmd
+docker compose exec airflow-scheduler airflow dags state flexihome_results_pipeline RUN_ID
+```
+
+Replace `RUN_ID` with the run id shown in the Airflow UI.
+
+### Step 8: Connect FastAPI Health To Airflow
+
+The FastAPI `/health` endpoint reports Airflow status when configured:
 
 ```cmd
 set FLEXIHOME_AIRFLOW_URL=http://127.0.0.1:8080
@@ -505,7 +650,23 @@ python scripts\run_api.py --reload
 curl http://127.0.0.1:8000/health
 ```
 
-This local Docker Compose setup follows Airflow's quick-start style and is suitable for local orchestration and development. For a production VPP deployment, move Airflow to a hardened deployment pattern such as Kubernetes/Helm, secrets management, and a proper image-build pipeline.
+In Docker-to-Docker production-style deployment, point API containers at the Airflow webserver hostname instead of `127.0.0.1`.
+
+### Step 9: Validate DAG Definitions Locally
+
+The development environment does not need Airflow installed to statically validate DAG coverage:
+
+```cmd
+python scripts\airflow_dag_smoke.py
+python scripts\run_market_data_ingestion.py --market-data-mode synthetic --days 1 --n-homes 80 --output-root runs
+python scripts\validate_pipeline_manifest.py --root runs --prefix market_data --require-artifact market_data_frame
+```
+
+These checks confirm that DAG files exist, retry/SLA configuration is present, plugin parameters are exposed, and market-data manifests are valid.
+
+### Production Hardening Notes
+
+This Docker Compose Airflow setup is a local production-style orchestrator, not a hardened cloud deployment. For an operational VPP deployment, move Airflow to Kubernetes/Helm or managed Airflow, store credentials in a secrets manager, configure remote logs, add alerting on SLA misses and task failures, and use immutable application images rather than mounting the whole project directory.
 
 ## Optional Real Market Data
 
@@ -629,6 +790,7 @@ pip install -r requirements-dev.txt
 python -m py_compile app.py flexihome\core\engine.py flexihome\api\optimizer.py flexihome\api\services.py
 python scripts\plugin_smoke.py
 python scripts\pipeline_smoke.py
+python scripts\airflow_dag_smoke.py
 python scripts\api_smoke.py
 python scripts\timescale_store_smoke.py
 python scripts\run_api.py

@@ -25,6 +25,8 @@ jobs:
         run: python scripts/plugin_smoke.py
       - name: Pipeline DAG smoke test
         run: python scripts/pipeline_smoke.py
+      - name: Airflow DAG smoke test
+        run: python scripts/airflow_dag_smoke.py
       - name: Forecast module smoke test
         run: python scripts/run_forecasting.py --days 2 --n-homes 80 --target fcrn_capacity_eur_per_mw_h --output-root runs
       - name: Optimization module smoke test

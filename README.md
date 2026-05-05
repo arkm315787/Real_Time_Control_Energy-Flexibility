@@ -64,9 +64,9 @@ The lower layer is implemented as MPC, not a reactive tracking controller. If th
 | Extend API defaults | Implemented | Request defaults use `inner_controller_mode="mpc"`, 4-second step, 20-second horizon, usage-aware rotation, and simulated centralized gateway mode. |
 | Extend API/result artifacts | Implemented | Results include household/appliance contributions, upper device schedule, inner MPC trace, gateway commands, and usage/fatigue summary. |
 | Export contribution CSVs | Implemented | CLI and pipeline serialization write the new MPC and contribution artifacts. |
-| Dashboard Apply Scenario form | Implemented | Scenario controls are inside an Apply form and stale MPC results are marked when inputs change. |
+| Dashboard Apply Scenario form | Implemented | Scenario controls are inside an Apply form, the last applied portfolio bundle is reused across reruns, and stale MPC results are marked when inputs change. |
 | Dashboard MPC visualizations | Implemented | Upper selection, appliance mix, fatigue, lower reserve tracking, allocation, diagnostics, and gateway command tables are available. |
-| CI smoke coverage | Mostly implemented | CI runs API, plugin, pipeline, Airflow, forecasting, optimization, and centralized MPC smoke tests. A dedicated browser/UI regression test for the Apply Scenario form is still missing. |
+| CI smoke coverage | Implemented | CI runs API, plugin, pipeline, Airflow, forecasting, optimization, centralized MPC, and dashboard scenario-apply smoke tests. |
 
 ## Key Modules
 
@@ -135,7 +135,7 @@ The dashboard is designed as an operational development tool, not a marketing pa
 - Simulation and Impact Visualizations: optimized load, reserve tracking, lower MPC allocation, diagnostics, and gateway commands
 - Advanced / Export: JSON, CSV, PDF, and local run artifact inspection
 
-Scenario controls are applied through an `Apply Scenario` form. Changing sliders does not immediately regenerate the portfolio; the dashboard keeps showing the last applied scenario and marks MPC results stale when inputs change.
+Scenario controls are applied through an `Apply Scenario` form. Changing sliders does not immediately regenerate the portfolio; the dashboard keeps showing the last applied scenario, reuses the last applied portfolio bundle across normal reruns, and marks MPC results stale when inputs change.
 
 ## API Defaults
 
@@ -222,6 +222,7 @@ Core local checks:
 ```cmd
 python -m py_compile app.py flexihome/core/engine.py flexihome/core/centralized_controller.py flexihome/api/services.py
 python scripts\centralized_mpc_smoke.py
+python scripts\dashboard_scenario_smoke.py
 python scripts\api_smoke.py
 python scripts\plugin_smoke.py
 python scripts\pipeline_smoke.py
@@ -234,6 +235,7 @@ GitHub CI also runs:
 - API smoke test
 - plugin smoke test
 - centralized 4-second MPC smoke test
+- dashboard scenario apply smoke test
 - pipeline smoke test
 - Airflow DAG smoke test
 - forecasting module smoke test
@@ -302,7 +304,7 @@ Important work that remains before this can become an operational VPP platform:
 - market prequalification evidence and compliance reporting
 - cybersecurity model, device authorization, audit logs, and command safety checks
 - persistent time-series telemetry and command history
-- browser/UI regression tests for the Streamlit dashboard
+- fuller browser/UI regression tests for the Streamlit dashboard
 - solver scalability benchmarking for larger portfolios
 - deployment packaging, observability, and operator runbooks
 

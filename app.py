@@ -96,6 +96,39 @@ def default_scenario_inputs() -> Dict[str, object]:
     }
 
 
+def scenario_portfolio_signature(scenario: Dict[str, object]) -> tuple:
+    """Return the applied-scenario fields that require portfolio regeneration."""
+
+    return (
+        str(scenario["start_date"]),
+        int(scenario["days"]),
+        int(scenario["freq_minutes"]),
+        int(scenario["n_homes"]),
+        round(float(scenario["ev_pen"]), 6),
+        round(float(scenario["bess_pen"]), 6),
+        round(float(scenario["pv_pen"]), 6),
+        round(float(scenario["hvac_pen"]), 6),
+        str(scenario["hvac_mode"]),
+        round(float(scenario["hvac_response_s"]), 6),
+        round(float(scenario["cloudiness"]), 6),
+        round(float(scenario["climate_shift_c"]), 6),
+        round(float(scenario["solar_scale"]), 6),
+        round(float(scenario["scarcity"]), 6),
+        round(float(scenario["setpoint_c"]), 6),
+        round(float(scenario["comfort_band_c"]), 6),
+        int(scenario["seed"]),
+        str(scenario["market_source"]),
+        int(scenario["market_lookback_days"]),
+        str(scenario.get("entsoe_key", "")),
+        str(scenario.get("fingrid_key", "")),
+        bool(scenario["persist_market_data"]),
+    )
+
+
+def portfolio_bundle_is_current(session_state: Dict[str, object], signature: tuple) -> bool:
+    return bool(session_state.get("portfolio_bundle")) and session_state.get("portfolio_signature") == signature
+
+
 RESOURCE_COLORS = {
     "BESS": "#7B61FF",
     "EV": "#6E44FF",
@@ -703,11 +736,6 @@ def main() -> None:
     if use_real_market and not (entsoe_key_input or fingrid_key_input):
         st.sidebar.warning("Enter at least one API key and click Apply Scenario to enable real market ingestion.")
 
-    spinner_text = (
-        "Fetching real market data and generating the flexibility portfolio..."
-        if real_market_ready
-        else "Generating synthetic households, weather, and balancing market conditions..."
-    )
     portfolio_args = {
         "start_date": str(start_date),
         "days": days,
@@ -726,21 +754,32 @@ def main() -> None:
         "freq_minutes": int(freq_minutes),
         "hvac_mode": hvac_mode,
     }
-    try:
-        with st.spinner(spinner_text):
-            bundle = generate_portfolio_runtime(
-                **portfolio_args,
-                market_data_mode="real" if real_market_ready else "synthetic",
-                entsoe_api_key=entsoe_key_input.strip() or None,
-                fingrid_api_key=fingrid_key_input.strip() or None,
-                market_lookback_days=int(market_lookback_days) if real_market_ready else None,
-                persist_market_data=bool(persist_market_data) if real_market_ready else False,
-                use_cache=not real_market_ready,
-            )
-    except RuntimeError as exc:
-        st.error(f"Real market data could not be loaded: {exc}")
-        with st.spinner("Falling back to synthetic market data..."):
-            bundle = generate_portfolio_runtime(**portfolio_args, market_data_mode="synthetic", use_cache=True)
+    portfolio_signature = scenario_portfolio_signature(scenario)
+    if portfolio_bundle_is_current(st.session_state, portfolio_signature):
+        bundle = st.session_state["portfolio_bundle"]
+    else:
+        spinner_text = (
+            "Fetching real market data and generating the flexibility portfolio..."
+            if real_market_ready
+            else "Generating synthetic households, weather, and balancing market conditions..."
+        )
+        try:
+            with st.spinner(spinner_text):
+                bundle = generate_portfolio_runtime(
+                    **portfolio_args,
+                    market_data_mode="real" if real_market_ready else "synthetic",
+                    entsoe_api_key=entsoe_key_input.strip() or None,
+                    fingrid_api_key=fingrid_key_input.strip() or None,
+                    market_lookback_days=int(market_lookback_days) if real_market_ready else None,
+                    persist_market_data=bool(persist_market_data) if real_market_ready else False,
+                    use_cache=not real_market_ready,
+                )
+        except RuntimeError as exc:
+            st.error(f"Real market data could not be loaded: {exc}")
+            with st.spinner("Falling back to synthetic market data..."):
+                bundle = generate_portfolio_runtime(**portfolio_args, market_data_mode="synthetic", use_cache=True)
+        st.session_state["portfolio_bundle"] = bundle
+        st.session_state["portfolio_signature"] = portfolio_signature
     df = bundle["data"]
     preview_4s = bundle["preview_4s"]
     device_roster = bundle.get("device_roster", pd.DataFrame())

@@ -25,6 +25,8 @@ jobs:
         run: python scripts/plugin_smoke.py
       - name: Centralized 4-second MPC smoke test
         run: python scripts/centralized_mpc_smoke.py
+      - name: Dashboard scenario apply smoke test
+        run: python scripts/dashboard_scenario_smoke.py
       - name: Pipeline DAG smoke test
         run: python scripts/pipeline_smoke.py
       - name: Airflow DAG smoke test

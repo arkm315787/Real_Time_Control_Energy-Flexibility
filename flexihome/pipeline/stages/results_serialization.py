@@ -74,7 +74,17 @@ class ResultsSerializationStage(BasePipelineStage):
         )
         artifact_records.append(artifact_record("optimization_summary", summary_path, "json"))
 
-        for name in ("history", "tracking_4s", "first_schedule"):
+        for name in (
+            "history",
+            "tracking_4s",
+            "first_schedule",
+            "household_contributions",
+            "appliance_contributions",
+            "upper_device_schedule",
+            "inner_mpc_trace",
+            "gateway_commands",
+            "usage_fatigue_summary",
+        ):
             frame = result.get(name)
             if isinstance(frame, pd.DataFrame):
                 path = run_dir / f"{name}.csv"

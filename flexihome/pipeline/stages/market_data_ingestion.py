@@ -16,6 +16,7 @@ class MarketDataIngestionStage(BasePipelineStage):
         output_artifacts=(
             ArtifactContract("portfolio_bundle", "Raw generated portfolio bundle."),
             ArtifactContract("preview_4s", "Four-second activation preview frame."),
+            ArtifactContract("device_roster", "Traceable household/appliance roster for centralized dispatch."),
             ArtifactContract("portfolio_summary", "Portfolio and market-data summary metadata."),
             ArtifactContract("market_data_status", "Market-data source and ingestion diagnostics."),
         ),
@@ -32,6 +33,7 @@ class MarketDataIngestionStage(BasePipelineStage):
         context.data = data
         context.with_artifact("portfolio_bundle", bundle)
         context.with_artifact("preview_4s", bundle.get("preview_4s"))
+        context.with_artifact("device_roster", bundle.get("device_roster"))
         context.with_artifact("portfolio_summary", bundle.get("summary", {}))
         context.with_artifact("market_data_status", bundle.get("summary", {}).get("market_data_status", {}))
         context.with_metadata(self.name, {"rows": len(data), "market_data_mode": bundle.get("summary", {}).get("market_data_source")})

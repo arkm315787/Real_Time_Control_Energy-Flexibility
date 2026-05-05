@@ -21,6 +21,7 @@ class OptimizationStage(BasePipelineStage):
             ArtifactContract("forecast_models", "Fitted forecast models keyed by MPC target."),
             ArtifactContract("portfolio_summary", "Portfolio summary generated during ingestion."),
             ArtifactContract("preview_4s", "Four-second reserve activation preview."),
+            ArtifactContract("device_roster", "Traceable household/appliance roster for centralized dispatch."),
         ),
         output_artifacts=(
             ArtifactContract("optimization_result", "Full MPC result including history and tracking frames."),
@@ -57,6 +58,12 @@ class OptimizationStage(BasePipelineStage):
             penalty_weights=self.config.penalty_weights(),
             preview_4s=context.artifacts.get("preview_4s"),
             optimizer=optimizer,
+            device_roster=context.artifacts.get("device_roster"),
+            inner_controller_mode=self.config.inner_controller_mode,
+            inner_dt_seconds=int(self.config.inner_dt_seconds),
+            inner_mpc_horizon_seconds=int(self.config.inner_mpc_horizon_seconds),
+            rotation_strategy=self.config.rotation_strategy,
+            gateway_mode=self.config.gateway_mode,
         )
         result.setdefault("summary", {})["forecaster_plugin"] = self.config.forecaster_plugin
         result.setdefault("summary", {})["optimizer_plugin"] = self.config.optimizer_plugin

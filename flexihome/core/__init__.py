@@ -22,13 +22,20 @@ from .base import (
     PluginRegistry,
     get_global_registry,
 )
+from .centralized_controller import (
+    CentralizedVPPController,
+    InnerControllerConfig,
+    generate_household_device_roster,
+)
 
 __all__ = [
     "BaseForecaster",
     "BaseOptimizer",
     "BasePipelineStage",
+    "CentralizedVPPController",
     "FINGRID_RULES",
     "HVAC_MODES",
+    "InnerControllerConfig",
     "SUPPORTED_MPC_TARGETS",
     "ForecastSpec",
     "ForecastMetrics",
@@ -38,6 +45,7 @@ __all__ = [
     "PluginRegistry",
     "default_hvac_response_seconds",
     "generate_synthetic_portfolio",
+    "generate_household_device_roster",
     "get_global_registry",
     "run_mpc_controller",
     "train_default_mpc_models",

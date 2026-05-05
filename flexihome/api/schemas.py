@@ -43,6 +43,11 @@ class OptimizationRequest(BaseModel):
     resource_mode: ResourceMode = "Hybrid portfolio"
     forecaster_plugin: str = Field("xgboost_default", min_length=1)
     optimizer_plugin: str = Field("pulp_default", min_length=1)
+    inner_controller_mode: Literal["mpc"] = "mpc"
+    inner_dt_seconds: int = Field(4, ge=1, le=60)
+    inner_mpc_horizon_seconds: int = Field(20, ge=4, le=300)
+    rotation_strategy: Literal["usage_aware"] = "usage_aware"
+    gateway_mode: Literal["simulated_centralized"] = "simulated_centralized"
     horizon_hours: int = Field(2, ge=1, le=72)
     dispatch_hours: int = Field(4, ge=1, le=168)
     portfolio_config: PortfolioConfig = Field(default_factory=PortfolioConfig)

@@ -155,6 +155,11 @@ class PipelineRunConfig:
     persist_market_data: bool = False
     forecaster_plugin: str = "xgboost_default"
     optimizer_plugin: str = "pulp_default"
+    inner_controller_mode: str = "mpc"
+    inner_dt_seconds: int = 4
+    inner_mpc_horizon_seconds: int = 20
+    rotation_strategy: str = "usage_aware"
+    gateway_mode: str = "simulated_centralized"
     market_mode: str = "Combined"
     resource_mode: str = "Hybrid portfolio"
     horizon_hours: int = 1

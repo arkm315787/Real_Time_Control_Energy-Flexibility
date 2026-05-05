@@ -21,6 +21,12 @@ from scipy import signal
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from xgboost import XGBRegressor
 
+from .centralized_controller import (
+    CentralizedVPPController,
+    InnerControllerConfig,
+    generate_household_device_roster,
+    representative_roster_from_frame,
+)
 from .market_data import overlay_real_market_data
 
 FINGRID_RULES = {
@@ -391,6 +397,16 @@ def generate_synthetic_portfolio(
 
     n_hvac = int(round(n_homes * hvac_pen))
     hvac = simulate_hvac_baseline(temp_out, n_hvac, setpoint_c, comfort_band_c, freq_minutes)
+    hvac_response_s = default_hvac_response_seconds(hvac_mode)
+    device_roster = generate_household_device_roster(
+        n_homes=n_homes,
+        ev_pen=ev_pen,
+        bess_pen=bess_pen,
+        pv_pen=pv_pen,
+        hvac_pen=hvac_pen,
+        seed=seed,
+        hvac_response_s=hvac_response_s,
+    )
 
     df = pd.DataFrame(index=index)
     df = pd.concat([df, weather, prices, activation, tf], axis=1)
@@ -441,11 +457,13 @@ def generate_synthetic_portfolio(
         "bess_energy_mwh": bess_energy_cap_mwh,
         "ev_energy_mwh": ev_energy_capacity_mwh,
         "hvac_mode": hvac_mode,
+        "device_count": int(len(device_roster)),
+        "gateway_count": int(device_roster["gateway_id"].nunique()) if not device_roster.empty else 0,
         "freq_minutes": freq_minutes,
         "market_data_source": market_data_status["mode_used"],
         "market_data_status": market_data_status,
     }
-    return {"data": df, "preview_4s": preview, "summary": summary}
+    return {"data": df, "preview_4s": preview, "summary": summary, "device_roster": device_roster}
 
 def build_feature_dataset(
     df: pd.DataFrame,
@@ -1187,6 +1205,12 @@ def run_mpc_controller(
     preview_4s: pd.DataFrame | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
     optimizer: Any | None = None,
+    device_roster: pd.DataFrame | None = None,
+    inner_controller_mode: str = "mpc",
+    inner_dt_seconds: int = 4,
+    inner_mpc_horizon_seconds: int = 20,
+    rotation_strategy: str = "usage_aware",
+    gateway_mode: str = "simulated_centralized",
 ) -> Dict[str, object]:
     sim_steps = min(int(dispatch_hours / df["dt_h"].iloc[0]), len(df) - 2)
     horizon_steps = min(int(horizon_hours / df["dt_h"].iloc[0]), len(df) - 2)
@@ -1201,7 +1225,21 @@ def run_mpc_controller(
     history: List[Dict[str, float]] = []
     schedule_snapshots: List[pd.DataFrame] = []
     tracking_history: List[pd.DataFrame] = []
+    upper_device_schedules: List[pd.DataFrame] = []
+    gateway_command_summaries: List[pd.DataFrame] = []
     total_work = max(sim_steps * (horizon_steps + 2), 1)
+    controller_config = InnerControllerConfig(
+        mode=inner_controller_mode,
+        dt_seconds=int(inner_dt_seconds),
+        horizon_seconds=int(inner_mpc_horizon_seconds),
+        rotation_strategy=rotation_strategy,
+        gateway_mode=gateway_mode,
+    )
+    centralized_controller = CentralizedVPPController(
+        device_roster=device_roster if device_roster is not None else representative_roster_from_frame(df, fleet_meta),
+        fleet_meta=fleet_meta,
+        config=controller_config,
+    )
 
     for t in range(sim_steps):
         base_slice = df.iloc[t + 1 : t + 1 + horizon_steps].copy()
@@ -1277,17 +1315,24 @@ def run_mpc_controller(
             progress_callback(
                 base_progress + horizon_steps + 2,
                 total_work,
-                f"Tracking 4-second controller for MPC interval {t + 1}/{sim_steps}",
+                f"Solving centralized 4-second MPC for interval {t + 1}/{sim_steps}",
             )
-        interval_summary, interval_tracking = simulate_tracking_interval(
+        interval_summary, interval_tracking, upper_schedule, command_summary = centralized_controller.execute_interval(
             row=row,
             fine_signals=fine_signals,
             plan=plan,
-            state=state,
-            fleet_meta=fleet_meta,
+            interval_index=t,
             market_mode=market_mode,
+            resource_mode=resource_mode,
         )
         tracking_history.append(interval_tracking)
+        if not upper_schedule.empty:
+            upper_device_schedules.append(upper_schedule)
+        if not command_summary.empty:
+            gateway_command_summaries.append(command_summary)
+        state["bess_soc_mwh"] = interval_summary["bess_soc_mwh"]
+        state["ev_soc_delta_mwh"] = interval_summary["ev_soc_mwh"] - float(row["ev_soc_ref_mwh"])
+        state["temp_delta_c"] = interval_summary["indoor_temp_c"] - float(row["indoor_temp_c_ref"])
 
         actual_bess_up = interval_summary["bess_up_kw"]
         actual_bess_down = interval_summary["bess_down_kw"]
@@ -1335,6 +1380,8 @@ def run_mpc_controller(
                 "optimized_net_load_kw": interval_summary["optimized_net_load_kw"],
                 "frequency_hz": interval_summary["frequency_hz"],
                 "solver_status": str(solution.get("status", "unknown")),
+                "inner_solver_status": str(interval_summary.get("inner_solver_status", "unknown")),
+                "inner_controller_mode": inner_controller_mode,
                 "fcr_bid_kw": fcr_bid_kw,
                 "afrr_up_bid_kw": afrr_up_bid_kw,
                 "afrr_down_bid_kw": afrr_down_bid_kw,
@@ -1367,12 +1414,25 @@ def run_mpc_controller(
                 "fcr_accuracy_ratio": delivered_up / requested_up if requested_up > 1 else np.nan,
                 "down_accuracy_ratio": delivered_down / requested_down if requested_down > 1 else np.nan,
                 "inner_tracking_samples": interval_summary["tracking_samples"],
+                "tracking_error_kw": interval_summary.get("tracking_error_kw", 0.0),
+                "shortfall_kw": interval_summary.get("shortfall_kw", 0.0),
             }
         )
 
     result_df = pd.DataFrame(history).set_index("timestamp")
     if result_df.empty:
-        return {"history": result_df, "summary": {}, "compliance": {}, "first_schedule": pd.DataFrame()}
+        return {
+            "history": result_df,
+            "summary": {},
+            "compliance": {},
+            "first_schedule": pd.DataFrame(),
+            "tracking_4s": pd.DataFrame(),
+            "upper_device_schedule": pd.DataFrame(),
+            "gateway_commands": pd.DataFrame(),
+            "household_contributions": pd.DataFrame(),
+            "appliance_contributions": pd.DataFrame(),
+            "usage_fatigue_summary": pd.DataFrame(),
+        }
     if progress_callback:
         progress_callback(total_work, total_work, "Simulation finished")
 
@@ -1471,13 +1531,28 @@ def run_mpc_controller(
             "Fast (BESS + EV)": float(resource_revenue["BESS"] + resource_revenue["EV"]),
             "Slow (HVAC + PV)": float(resource_revenue["HVAC"] + resource_revenue["PV"]),
         },
+        "inner_controller_mode": inner_controller_mode,
+        "inner_dt_seconds": int(inner_dt_seconds),
+        "inner_mpc_horizon_seconds": int(inner_mpc_horizon_seconds),
+        "rotation_strategy": rotation_strategy,
+        "gateway_mode": gateway_mode,
+        "mean_tracking_error_kw": float(result_df["tracking_error_kw"].mean()) if "tracking_error_kw" in result_df else 0.0,
+        "mean_shortfall_kw": float(result_df["shortfall_kw"].mean()) if "shortfall_kw" in result_df else 0.0,
     }
+    gateway_commands = pd.concat(gateway_command_summaries, ignore_index=True) if gateway_command_summaries else pd.DataFrame()
+    household_contrib, appliance_contrib, usage_fatigue = centralized_controller.contribution_frames(gateway_commands)
     return {
         "history": result_df,
         "tracking_4s": pd.concat(tracking_history) if tracking_history else pd.DataFrame(),
+        "inner_mpc_trace": pd.concat(tracking_history) if tracking_history else pd.DataFrame(),
         "summary": summary,
         "compliance": compliance,
         "first_schedule": schedule_snapshots[0] if schedule_snapshots else pd.DataFrame(),
+        "upper_device_schedule": pd.concat(upper_device_schedules, ignore_index=True) if upper_device_schedules else pd.DataFrame(),
+        "gateway_commands": gateway_commands,
+        "household_contributions": household_contrib,
+        "appliance_contributions": appliance_contrib,
+        "usage_fatigue_summary": usage_fatigue,
     }
 
 def make_pdf_summary(summary: Dict[str, float], compliance: Dict[str, float], config: Dict[str, object]) -> bytes:

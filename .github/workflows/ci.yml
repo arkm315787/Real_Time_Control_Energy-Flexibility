@@ -18,11 +18,13 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
       - name: Compile core modules
-        run: python -m py_compile app.py flexihome/core/engine.py flexihome/core/market_data.py flexihome/api/services.py
+        run: python -m py_compile app.py flexihome/core/engine.py flexihome/core/centralized_controller.py flexihome/core/market_data.py flexihome/api/services.py
       - name: API smoke test
         run: python scripts/api_smoke.py
       - name: Plugin architecture smoke test
         run: python scripts/plugin_smoke.py
+      - name: Centralized 4-second MPC smoke test
+        run: python scripts/centralized_mpc_smoke.py
       - name: Pipeline DAG smoke test
         run: python scripts/pipeline_smoke.py
       - name: Airflow DAG smoke test

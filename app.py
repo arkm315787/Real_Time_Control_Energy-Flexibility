@@ -69,6 +69,33 @@ def generate_portfolio_runtime(*args, use_cache: bool = True, **kwargs) -> Dict[
     return generate_synthetic_portfolio_core(*args, **kwargs)
 
 
+def default_scenario_inputs() -> Dict[str, object]:
+    return {
+        "start_date": pd.Timestamp("2026-01-15").date(),
+        "days": 7,
+        "freq_minutes": 15,
+        "n_homes": 1500,
+        "ev_pen": 0.30,
+        "bess_pen": 0.22,
+        "pv_pen": 0.45,
+        "hvac_pen": 0.82,
+        "hvac_mode": HVAC_MODES[1],
+        "hvac_response_s": default_hvac_response_seconds(HVAC_MODES[1]),
+        "cloudiness": 0.55,
+        "climate_shift_c": 0.0,
+        "solar_scale": 1.0,
+        "scarcity": 1.0,
+        "setpoint_c": 21.0,
+        "comfort_band_c": 1.0,
+        "seed": 42,
+        "market_source": "Synthetic",
+        "market_lookback_days": 30,
+        "entsoe_key": "",
+        "fingrid_key": "",
+        "persist_market_data": True,
+    }
+
+
 RESOURCE_COLORS = {
     "BESS": "#7B61FF",
     "EV": "#6E44FF",
@@ -566,48 +593,115 @@ def main() -> None:
     inject_css(theme_mode)
     template = PLOTLY_TEMPLATE[theme_mode]
 
-    st.sidebar.header("Portfolio Setup")
-    start_date = st.sidebar.date_input("Simulation start", value=pd.Timestamp("2026-01-15"))
-    days = st.sidebar.slider("Simulation length (days)", 1, 365, 7)
-    freq_minutes = st.sidebar.slider("Simulation timestep (minutes)", 1, 15, 15, 1)
-    n_homes = st.sidebar.slider("Aggregated homes", 500, 5000, 1500, step=100)
-    ev_pen = st.sidebar.slider("EV penetration", 0.0, 1.0, 0.30, 0.05)
-    bess_pen = st.sidebar.slider("BESS penetration", 0.0, 1.0, 0.22, 0.05)
-    pv_pen = st.sidebar.slider("PV penetration", 0.0, 1.0, 0.45, 0.05)
-    hvac_pen = st.sidebar.slider("Smart HVAC penetration", 0.0, 1.0, 0.82, 0.05)
-    hvac_mode = st.sidebar.selectbox("HVAC technology", HVAC_MODES, index=1)
-    hvac_response_default = default_hvac_response_seconds(hvac_mode)
-    hvac_response_s = st.sidebar.slider(
-        "Inverter HVAC electrical response (s)" if hvac_mode == HVAC_MODES[1] else "HVAC electrical response (s)",
-        2.0,
-        180.0,
-        float(hvac_response_default),
-        1.0,
-    )
+    if "scenario_inputs" not in st.session_state:
+        st.session_state["scenario_inputs"] = default_scenario_inputs()
+    scenario_defaults = dict(st.session_state["scenario_inputs"])
 
-    st.sidebar.header("Synthetic Finland Context")
-    cloudiness = st.sidebar.slider("Cloudiness / variability", 0.1, 1.0, 0.55, 0.05)
-    climate_shift_c = st.sidebar.slider("Temperature anomaly (°C)", -8.0, 8.0, 0.0, 0.5)
-    solar_scale = st.sidebar.slider("Solar resource multiplier", 0.5, 1.5, 1.0, 0.05)
-    scarcity = st.sidebar.slider("Market scarcity / price stress", 0.6, 1.8, 1.0, 0.05)
-    setpoint_c = st.sidebar.slider("HVAC setpoint (°C)", 19.0, 23.0, 21.0, 0.5)
-    comfort_band_c = st.sidebar.slider("Comfort band (±°C)", 0.5, 2.5, 1.0, 0.1)
-    seed = st.sidebar.number_input("Random seed", value=42, step=1)
+    with st.sidebar.form("scenario_form"):
+        st.header("Scenario Setup")
+        start_date_input = st.date_input("Simulation start", value=pd.Timestamp(scenario_defaults["start_date"]))
+        days_input = st.slider("Simulation length (days)", 1, 365, int(scenario_defaults["days"]))
+        freq_minutes_input = st.slider("Simulation timestep (minutes)", 1, 15, int(scenario_defaults["freq_minutes"]), 1)
+        n_homes_input = st.slider("Aggregated homes", 500, 5000, int(scenario_defaults["n_homes"]), step=100)
+        ev_pen_input = st.slider("EV penetration", 0.0, 1.0, float(scenario_defaults["ev_pen"]), 0.05)
+        bess_pen_input = st.slider("BESS penetration", 0.0, 1.0, float(scenario_defaults["bess_pen"]), 0.05)
+        pv_pen_input = st.slider("PV penetration", 0.0, 1.0, float(scenario_defaults["pv_pen"]), 0.05)
+        hvac_pen_input = st.slider("Smart HVAC penetration", 0.0, 1.0, float(scenario_defaults["hvac_pen"]), 0.05)
+        hvac_mode_input = st.selectbox(
+            "HVAC technology",
+            HVAC_MODES,
+            index=HVAC_MODES.index(str(scenario_defaults["hvac_mode"])) if str(scenario_defaults["hvac_mode"]) in HVAC_MODES else 1,
+        )
+        hvac_response_default = default_hvac_response_seconds(hvac_mode_input)
+        hvac_response_s_input = st.slider(
+            "Inverter HVAC electrical response (s)" if hvac_mode_input == HVAC_MODES[1] else "HVAC electrical response (s)",
+            2.0,
+            180.0,
+            float(scenario_defaults.get("hvac_response_s", hvac_response_default)),
+            1.0,
+        )
 
-    st.sidebar.header("Market Data Source")
-    market_source = st.sidebar.radio(
+        st.header("Synthetic Finland Context")
+        cloudiness_input = st.slider("Cloudiness / variability", 0.1, 1.0, float(scenario_defaults["cloudiness"]), 0.05)
+        climate_shift_c_input = st.slider("Temperature anomaly (deg C)", -8.0, 8.0, float(scenario_defaults["climate_shift_c"]), 0.5)
+        solar_scale_input = st.slider("Solar resource multiplier", 0.5, 1.5, float(scenario_defaults["solar_scale"]), 0.05)
+        scarcity_input = st.slider("Market scarcity / price stress", 0.6, 1.8, float(scenario_defaults["scarcity"]), 0.05)
+        setpoint_c_input = st.slider("HVAC setpoint (deg C)", 19.0, 23.0, float(scenario_defaults["setpoint_c"]), 0.5)
+        comfort_band_c_input = st.slider("Comfort band (+/- deg C)", 0.5, 2.5, float(scenario_defaults["comfort_band_c"]), 0.1)
+        seed_input = st.number_input("Random seed", value=int(scenario_defaults["seed"]), step=1)
+
+        st.header("Market Data Source")
+        market_source_input = st.radio(
         "Training and market signals",
         ["Synthetic", "Real market APIs"],
+        index=0 if scenario_defaults["market_source"] == "Synthetic" else 1,
         help="Synthetic keeps the dashboard offline. Real market APIs uses ENTSO-E and Fingrid data where available.",
     )
+        use_real_market_input = market_source_input == "Real market APIs"
+        market_lookback_days_input = st.slider("Real market lookback days", 1, 120, int(scenario_defaults["market_lookback_days"]), 1, disabled=not use_real_market_input)
+        entsoe_key_input_form = st.text_input("ENTSO-E security token", value=str(scenario_defaults.get("entsoe_key", "")), type="password", disabled=not use_real_market_input)
+        fingrid_key_input_form = st.text_input("Fingrid Open Data API key", value=str(scenario_defaults.get("fingrid_key", "")), type="password", disabled=not use_real_market_input)
+        persist_market_data_input = st.toggle("Persist fetched market data to TimescaleDB", value=bool(scenario_defaults["persist_market_data"]), disabled=not use_real_market_input)
+        apply_scenario = st.form_submit_button("Apply Scenario", type="primary")
+
+    if apply_scenario:
+        next_scenario = {
+            "start_date": start_date_input,
+            "days": int(days_input),
+            "freq_minutes": int(freq_minutes_input),
+            "n_homes": int(n_homes_input),
+            "ev_pen": float(ev_pen_input),
+            "bess_pen": float(bess_pen_input),
+            "pv_pen": float(pv_pen_input),
+            "hvac_pen": float(hvac_pen_input),
+            "hvac_mode": hvac_mode_input,
+            "hvac_response_s": float(hvac_response_s_input),
+            "cloudiness": float(cloudiness_input),
+            "climate_shift_c": float(climate_shift_c_input),
+            "solar_scale": float(solar_scale_input),
+            "scarcity": float(scarcity_input),
+            "setpoint_c": float(setpoint_c_input),
+            "comfort_band_c": float(comfort_band_c_input),
+            "seed": int(seed_input),
+            "market_source": market_source_input,
+            "market_lookback_days": int(market_lookback_days_input),
+            "entsoe_key": entsoe_key_input_form,
+            "fingrid_key": fingrid_key_input_form,
+            "persist_market_data": bool(persist_market_data_input),
+        }
+        if next_scenario != st.session_state["scenario_inputs"]:
+            st.session_state["scenario_inputs"] = next_scenario
+            st.session_state["mpc_result_stale"] = True
+            st.session_state.pop("default_mpc_models", None)
+            st.session_state.pop("default_mpc_signature", None)
+
+    scenario = st.session_state["scenario_inputs"]
+    start_date = scenario["start_date"]
+    days = int(scenario["days"])
+    freq_minutes = int(scenario["freq_minutes"])
+    n_homes = int(scenario["n_homes"])
+    ev_pen = float(scenario["ev_pen"])
+    bess_pen = float(scenario["bess_pen"])
+    pv_pen = float(scenario["pv_pen"])
+    hvac_pen = float(scenario["hvac_pen"])
+    hvac_mode = str(scenario["hvac_mode"])
+    hvac_response_s = float(scenario["hvac_response_s"])
+    cloudiness = float(scenario["cloudiness"])
+    climate_shift_c = float(scenario["climate_shift_c"])
+    solar_scale = float(scenario["solar_scale"])
+    scarcity = float(scenario["scarcity"])
+    setpoint_c = float(scenario["setpoint_c"])
+    comfort_band_c = float(scenario["comfort_band_c"])
+    seed = int(scenario["seed"])
+    market_source = str(scenario["market_source"])
+    market_lookback_days = int(scenario["market_lookback_days"])
+    entsoe_key_input = str(scenario.get("entsoe_key", ""))
+    fingrid_key_input = str(scenario.get("fingrid_key", ""))
+    persist_market_data = bool(scenario["persist_market_data"])
     use_real_market = market_source == "Real market APIs"
-    market_lookback_days = st.sidebar.slider("Real market lookback days", 1, 120, 30, 1, disabled=not use_real_market)
-    entsoe_key_input = st.sidebar.text_input("ENTSO-E security token", type="password", disabled=not use_real_market)
-    fingrid_key_input = st.sidebar.text_input("Fingrid Open Data API key", type="password", disabled=not use_real_market)
-    persist_market_data = st.sidebar.toggle("Persist fetched market data to TimescaleDB", value=True, disabled=not use_real_market)
     real_market_ready = use_real_market and bool(entsoe_key_input or fingrid_key_input)
     if use_real_market and not (entsoe_key_input or fingrid_key_input):
-        st.sidebar.warning("Enter at least one API key to enable real market ingestion.")
+        st.sidebar.warning("Enter at least one API key and click Apply Scenario to enable real market ingestion.")
 
     spinner_text = (
         "Fetching real market data and generating the flexibility portfolio..."
@@ -649,6 +743,7 @@ def main() -> None:
             bundle = generate_portfolio_runtime(**portfolio_args, market_data_mode="synthetic", use_cache=True)
     df = bundle["data"]
     preview_4s = bundle["preview_4s"]
+    device_roster = bundle.get("device_roster", pd.DataFrame())
     summary = bundle["summary"]
     market_data_status = summary.get("market_data_status", {})
     market_columns = [
@@ -716,6 +811,8 @@ def main() -> None:
             c2.metric("Accessible storage energy", f"{summary['bess_energy_mwh'] + summary['ev_energy_mwh']:.2f} MWh")
             c1.metric("Market data", str(market_data_status.get("mode_used", "synthetic")).title())
             c2.metric("Raw market observations", f"{int(market_data_status.get('training_observations', 0) or 0):,}")
+            c1.metric("Traceable devices", f"{int(summary.get('device_count', len(device_roster))):,}")
+            c2.metric("Simulated gateways", f"{int(summary.get('gateway_count', 0)):,}")
             st.markdown(
                 """
                 <div class="flexi-card">
@@ -1054,7 +1151,7 @@ def main() -> None:
         st.subheader("MPC Optimizer & Market Participation")
         st.caption(
             f"The outer MPC, synthetic portfolio, and forecasting loop run at a {freq_minutes}-minute interval. "
-            "Inside each MPC interval, a 4-second tracking controller updates BESS, EV, and HVAC dispatch against the reserve signals."
+            "Inside each interval, a centralized 4-second MPC allocates selected household appliances through simulated gateway telemetry."
         )
         opt1, opt2, opt3, opt4 = st.columns(4)
         market_mode = opt1.selectbox("Market product", ["Combined", "FCR-N", "aFRR"], help="Combined allows the MPC to split the portfolio across both products.")
@@ -1111,6 +1208,11 @@ def main() -> None:
                     "dispatch_hours": dispatch_hours,
                     "forecaster_plugin": mpc_forecaster_plugin,
                     "optimizer_plugin": optimizer_plugin,
+                    "inner_controller_mode": "mpc",
+                    "inner_dt_seconds": 4,
+                    "inner_mpc_horizon_seconds": 20,
+                    "rotation_strategy": "usage_aware",
+                    "gateway_mode": "simulated_centralized",
                 }
                 st.session_state["mpc_result"] = run_mpc_controller(
                     df=df,
@@ -1123,18 +1225,39 @@ def main() -> None:
                     penalty_weights={"degradation": degradation_w, "comfort": comfort_w, "departure": departure_w},
                     preview_4s=preview_4s,
                     optimizer=optimizer,
+                    device_roster=device_roster,
+                    inner_controller_mode="mpc",
+                    inner_dt_seconds=4,
+                    inner_mpc_horizon_seconds=20,
+                    rotation_strategy="usage_aware",
+                    gateway_mode="simulated_centralized",
                     progress_callback=lambda current, total, message: mpc_tracker(
                         8 + int(round((current / max(total, 1)) * 92)),
                         100,
                         message,
                     ),
                 )
+                st.session_state["mpc_result_stale"] = False
                 mpc_tracker(100, 100, "MPC dispatch finished")
         result = st.session_state.get(
             "mpc_result",
-            {"history": pd.DataFrame(), "tracking_4s": pd.DataFrame(), "summary": {}, "compliance": {}, "first_schedule": pd.DataFrame()},
+            {
+                "history": pd.DataFrame(),
+                "tracking_4s": pd.DataFrame(),
+                "summary": {},
+                "compliance": {},
+                "first_schedule": pd.DataFrame(),
+                "household_contributions": pd.DataFrame(),
+                "appliance_contributions": pd.DataFrame(),
+                "upper_device_schedule": pd.DataFrame(),
+                "gateway_commands": pd.DataFrame(),
+                "usage_fatigue_summary": pd.DataFrame(),
+            },
         )
         result_df = result["history"]
+
+        if st.session_state.get("mpc_result_stale") and not result_df.empty:
+            st.warning("Scenario inputs changed. The charts below still show the previous MPC run until you run dispatch again.")
 
         if result_df.empty:
             st.info("Configure the scenario and click Run MPC dispatch. The optimizer will not run automatically.")
@@ -1148,14 +1271,15 @@ def main() -> None:
             m4.metric("Comfort violations", f"{s['comfort_violations_h']:.1f} h")
             mpc_status_cols = st.columns(4)
             solver_mode = result_df["solver_status"].mode().iloc[0] if "solver_status" in result_df and not result_df["solver_status"].empty else "unknown"
-            mpc_status_cols[0].metric("Optimizer status", solver_mode)
+            inner_mode = result_df["inner_solver_status"].mode().iloc[0] if "inner_solver_status" in result_df and not result_df["inner_solver_status"].empty else "unknown"
+            mpc_status_cols[0].metric("Upper MPC status", solver_mode)
             mpc_status_cols[1].metric("MPC intervals", f"{len(result_df):,}")
-            mpc_status_cols[2].metric("Market input", str(market_data_status.get("mode_used", "synthetic")).title())
-            mpc_status_cols[3].metric("Mean net revenue", fmt_money(float(result_df["net_revenue_eur"].mean())))
+            mpc_status_cols[2].metric("4-sec MPC status", inner_mode)
+            mpc_status_cols[3].metric("Mean shortfall", f"{float(result_df.get('shortfall_kw', pd.Series([0.0])).mean()):.1f} kW")
             st.info(
                 f"MPC workflow: `{st.session_state.get('mpc_config', {}).get('forecaster_plugin', DEFAULT_FORECASTER_PLUGIN)}` forecasts each horizon, "
                 f"`{st.session_state.get('mpc_config', {}).get('optimizer_plugin', DEFAULT_OPTIMIZER_PLUGIN)}` chooses reserve bids and resource dispatch, "
-                "then only the first interval is applied before the horizon rolls forward."
+                "household appliances are selected with usage-aware rotation, and a centralized 20-second/4-second MPC applies gateway-level commands."
             )
 
             left, right = st.columns([1.45, 1.0])
@@ -1219,6 +1343,103 @@ def main() -> None:
             rule_df = pd.DataFrame(rule_items, columns=["Rule", "Pass"]).assign(Status=lambda x: np.where(x["Pass"], "Pass", "Needs attention"))
             st.dataframe(styled_dataframe(rule_df), use_container_width=True, hide_index=True)
 
+            household_contrib = result.get("household_contributions", pd.DataFrame())
+            appliance_contrib = result.get("appliance_contributions", pd.DataFrame())
+            upper_device_schedule = result.get("upper_device_schedule", pd.DataFrame())
+            usage_fatigue = result.get("usage_fatigue_summary", pd.DataFrame())
+            if not household_contrib.empty and not appliance_contrib.empty:
+                st.markdown("### Usage-aware household selection")
+                select_left, select_right = st.columns([1.15, 1.0])
+                top_households = household_contrib.head(12).copy()
+                select_left.plotly_chart(
+                    apply_chart_style(
+                        px.bar(
+                            top_households,
+                            x="household_id",
+                            y="total_energy_kwh",
+                            color="active_seconds",
+                            labels={
+                                "household_id": "Household",
+                                "total_energy_kwh": "Energy contribution (kWh)",
+                                "active_seconds": "Active seconds",
+                            },
+                            template=template,
+                        ),
+                        template,
+                        height=340,
+                        title="Top participating households",
+                    ),
+                    use_container_width=True,
+                )
+                device_mix = (
+                    appliance_contrib.groupby("device_type", as_index=False)["total_energy_kwh"]
+                    .sum()
+                    .sort_values("total_energy_kwh", ascending=False)
+                )
+                select_right.plotly_chart(
+                    apply_chart_style(
+                        px.bar(
+                            device_mix,
+                            x="device_type",
+                            y="total_energy_kwh",
+                            color="device_type",
+                            labels={"device_type": "Appliance", "total_energy_kwh": "Energy contribution (kWh)"},
+                            template=template,
+                        ),
+                        template,
+                        height=340,
+                        title="Selected appliance mix",
+                    ),
+                    use_container_width=True,
+                )
+                table_cols = [
+                    "household_id",
+                    "device_id",
+                    "device_type",
+                    "gateway_id",
+                    "total_energy_kwh",
+                    "active_seconds",
+                    "activation_count",
+                    "max_abs_command_kw",
+                ]
+                st.dataframe(
+                    styled_dataframe(appliance_contrib[[col for col in table_cols if col in appliance_contrib.columns]].head(30).round(3)),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=300,
+                )
+            if not upper_device_schedule.empty and "outer_interval" in upper_device_schedule:
+                schedule_mix = (
+                    upper_device_schedule.groupby(["outer_interval", "device_type"], as_index=False)["device_id"]
+                    .nunique()
+                    .rename(columns={"device_id": "selected_devices"})
+                )
+                st.plotly_chart(
+                    apply_chart_style(
+                        px.bar(
+                            schedule_mix,
+                            x="outer_interval",
+                            y="selected_devices",
+                            color="device_type",
+                            labels={"outer_interval": "Outer MPC interval", "selected_devices": "Selected devices"},
+                            template=template,
+                        ),
+                        template,
+                        height=320,
+                        title="Upper MPC selected devices over time",
+                    ),
+                    use_container_width=True,
+                )
+            if not usage_fatigue.empty:
+                fatigue_cols = ["household_id", "device_id", "device_type", "usage_hours", "cooldown_seconds", "throughput_kwh", "fatigue_score"]
+                st.caption("Usage and fatigue counters drive the rotation strategy so the same appliance is not selected for the full dispatch horizon.")
+                st.dataframe(
+                    styled_dataframe(usage_fatigue[[col for col in fatigue_cols if col in usage_fatigue.columns]].head(20).round(3)),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=260,
+                )
+
     with tabs[5]:
         st.subheader("Simulation & Impact Visualizations")
         result = st.session_state.get("mpc_result")
@@ -1273,8 +1494,8 @@ def main() -> None:
             heat_cols[1].plotly_chart(apply_chart_style(availability_heatmap(bid_success, "success", "Bid success heatmap", "Greens"), template, height=320), use_container_width=True)
 
             if not tracking_df.empty:
-                st.markdown("### 4-second inner-loop tracking")
-                st.caption("This view shows the fast inner controller tracking the reserve request inside the slower outer MPC interval.")
+                st.markdown("### Centralized 4-second MPC")
+                st.caption("This view shows the centralized lower-layer MPC following the reserve request through simulated gateway commands.")
                 tracking_window = tracking_df.iloc[: min(len(tracking_df), max(450, int(3600 / 4)))]
                 tracking_fig = go.Figure()
                 tracking_fig.add_trace(
@@ -1303,7 +1524,50 @@ def main() -> None:
                     go.Scatter(x=tracking_window.index, y=tracking_window["hvac_up_kw"] / 1000.0, name="HVAC up", line={"color": RESOURCE_COLORS["HVAC"]})
                 )
                 tracking_fig.update_layout(yaxis_title="MW")
-                st.plotly_chart(apply_chart_style(tracking_fig, template, height=380, title="Inner-loop tracking response (first interval window)"), use_container_width=True)
+                st.plotly_chart(apply_chart_style(tracking_fig, template, height=380, title="Lower MPC reserve tracking"), use_container_width=True)
+
+                lower_left, lower_right = st.columns([1.15, 1.0])
+                allocation_fig = go.Figure()
+                allocation_fig.add_trace(go.Scatter(x=tracking_window.index, y=tracking_window["bess_up_kw"] / 1000.0, name="BESS up", stackgroup="up", line={"color": RESOURCE_COLORS["BESS"]}))
+                allocation_fig.add_trace(go.Scatter(x=tracking_window.index, y=tracking_window["ev_up_kw"] / 1000.0, name="EV up", stackgroup="up", line={"color": RESOURCE_COLORS["EV"]}))
+                allocation_fig.add_trace(go.Scatter(x=tracking_window.index, y=tracking_window["hvac_up_kw"] / 1000.0, name="HVAC up", stackgroup="up", line={"color": RESOURCE_COLORS["HVAC"]}))
+                allocation_fig.add_trace(go.Scatter(x=tracking_window.index, y=-tracking_window["bess_down_kw"] / 1000.0, name="BESS down", stackgroup="down", line={"color": RESOURCE_COLORS["BESS"], "dash": "dot"}))
+                allocation_fig.add_trace(go.Scatter(x=tracking_window.index, y=-tracking_window["ev_down_kw"] / 1000.0, name="EV down", stackgroup="down", line={"color": RESOURCE_COLORS["EV"], "dash": "dot"}))
+                allocation_fig.add_trace(go.Scatter(x=tracking_window.index, y=-tracking_window["pv_down_kw"] / 1000.0, name="PV down", stackgroup="down", line={"color": RESOURCE_COLORS["PV"]}))
+                allocation_fig.update_layout(yaxis_title="MW")
+                lower_left.plotly_chart(apply_chart_style(allocation_fig, template, height=340, title="Lower MPC appliance allocation"), use_container_width=True)
+
+                diagnostic_cols = [col for col in ["tracking_error_kw", "shortfall_kw"] if col in tracking_window.columns]
+                if diagnostic_cols:
+                    diagnostic_fig = signal_line_figure(tracking_window, diagnostic_cols, "Lower MPC tracking diagnostics", "kW")
+                    lower_right.plotly_chart(apply_chart_style(diagnostic_fig, template, height=340), use_container_width=True)
+
+                gateway_commands = result.get("gateway_commands", pd.DataFrame())
+                if not gateway_commands.empty:
+                    device_filter = st.multiselect(
+                        "Gateway command appliance filter",
+                        sorted(gateway_commands["device_type"].dropna().unique()),
+                        default=sorted(gateway_commands["device_type"].dropna().unique()),
+                    )
+                    command_view = gateway_commands[gateway_commands["device_type"].isin(device_filter)] if device_filter else gateway_commands
+                    command_cols = [
+                        "outer_interval",
+                        "household_id",
+                        "device_id",
+                        "device_type",
+                        "gateway_id",
+                        "up_energy_kwh",
+                        "down_energy_kwh",
+                        "active_seconds",
+                        "activation_count",
+                        "max_abs_command_kw",
+                    ]
+                    st.dataframe(
+                        styled_dataframe(command_view[[col for col in command_cols if col in command_view.columns]].head(40).round(3)),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=310,
+                    )
 
             st.markdown("### What-if scenario playground")
             wf1, wf2, wf3 = st.columns(3)
@@ -1353,6 +1617,12 @@ def main() -> None:
                         {"degradation": degradation_w, "comfort": comfort_w, "departure": departure_w},
                         preview_4s=preview_4s,
                         optimizer=whatif_optimizer,
+                        device_roster=device_roster,
+                        inner_controller_mode=mpc_config.get("inner_controller_mode", "mpc"),
+                        inner_dt_seconds=int(mpc_config.get("inner_dt_seconds", 4)),
+                        inner_mpc_horizon_seconds=int(mpc_config.get("inner_mpc_horizon_seconds", 20)),
+                        rotation_strategy=mpc_config.get("rotation_strategy", "usage_aware"),
+                        gateway_mode=mpc_config.get("gateway_mode", "simulated_centralized"),
                         progress_callback=lambda current, total, message: whatif_tracker(
                             18 + int(round((current / max(total, 1)) * 76)),
                             100,
@@ -1375,13 +1645,16 @@ def main() -> None:
     with tabs[6]:
         st.subheader("Advanced / Export")
         config = st.session_state.get("mpc_config", {"market_mode": "Combined", "resource_mode": "Hybrid portfolio", "horizon_hours": 24, "dispatch_hours": 24})
-        result = st.session_state.get("mpc_result", {"history": pd.DataFrame(), "tracking_4s": pd.DataFrame(), "summary": {}, "compliance": {}})
+        result = st.session_state.get(
+            "mpc_result",
+            {"history": pd.DataFrame(), "tracking_4s": pd.DataFrame(), "summary": {}, "compliance": {}, "gateway_commands": pd.DataFrame()},
+        )
         tracking_export = result.get("tracking_4s", pd.DataFrame())
 
         export_left, export_right = st.columns([1, 1])
         export_left.download_button("Download simulation bundle (JSON)", data=json.dumps(summary, indent=2).encode("utf-8"), file_name="flexihome_summary.json", mime="application/json")
         export_right.download_button(
-            "Download 4-second tracking results (CSV)",
+            "Download centralized 4-second MPC trace (CSV)",
             data=(tracking_export if not tracking_export.empty else preview_4s).to_csv().encode("utf-8"),
             file_name="flexihome_4s_tracking.csv",
             mime="text/csv",

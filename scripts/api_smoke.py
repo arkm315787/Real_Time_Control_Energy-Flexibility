@@ -83,6 +83,19 @@ def main() -> None:
         raise SystemExit(f"Expected completed optimization, got {result_payload['status']}")
     if row_counts["history"] < 1:
         raise SystemExit("Expected optimization history rows")
+    for key in (
+        "tracking_4s",
+        "household_contributions",
+        "appliance_contributions",
+        "upper_device_schedule",
+        "inner_mpc_trace",
+        "gateway_commands",
+        "usage_fatigue_summary",
+    ):
+        if row_counts.get(key, 0) < 1:
+            raise SystemExit(f"Expected non-empty {key} rows")
+    if summary.get("inner_controller_mode") != "mpc":
+        raise SystemExit("Expected centralized lower controller mode to be mpc")
 
 
 if __name__ == "__main__":

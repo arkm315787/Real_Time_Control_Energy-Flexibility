@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--market-lookback-days", type=int, default=30)
     parser.add_argument("--forecaster-plugin", default=DEFAULT_FORECASTER_PLUGIN)
     parser.add_argument("--optimizer-plugin", default=DEFAULT_OPTIMIZER_PLUGIN)
+    parser.add_argument("--inner-controller-mode", choices=["mpc"], default="mpc")
+    parser.add_argument("--inner-dt-seconds", type=int, default=4)
+    parser.add_argument("--inner-mpc-horizon-seconds", type=int, default=20)
+    parser.add_argument("--rotation-strategy", choices=["usage_aware"], default="usage_aware")
+    parser.add_argument("--gateway-mode", choices=["simulated_centralized"], default="simulated_centralized")
     parser.add_argument("--output-root", default="runs")
     return parser.parse_args()
 
@@ -111,13 +116,29 @@ def main() -> None:
         penalty_weights={"degradation": 18.0, "comfort": 120.0, "departure": 160.0},
         preview_4s=bundle["preview_4s"],
         optimizer=optimizer,
+        device_roster=bundle.get("device_roster"),
+        inner_controller_mode=args.inner_controller_mode,
+        inner_dt_seconds=args.inner_dt_seconds,
+        inner_mpc_horizon_seconds=args.inner_mpc_horizon_seconds,
+        rotation_strategy=args.rotation_strategy,
+        gateway_mode=args.gateway_mode,
     )
 
     run_dir = new_run_dir(args.output_root, "optimization")
     write_frame(run_dir / "training_data.csv", df)
+    write_frame(run_dir / "device_roster.csv", bundle.get("device_roster"))
     write_frame(run_dir / "history.csv", result.get("history"))
     write_frame(run_dir / "tracking_4s.csv", result.get("tracking_4s"))
     write_frame(run_dir / "first_schedule.csv", result.get("first_schedule"))
+    for name in (
+        "household_contributions",
+        "appliance_contributions",
+        "upper_device_schedule",
+        "inner_mpc_trace",
+        "gateway_commands",
+        "usage_fatigue_summary",
+    ):
+        write_frame(run_dir / f"{name}.csv", result.get(name))
     serialized = serialize_optimization_result(result)
     write_json(
         run_dir / "optimization_summary.json",
@@ -125,6 +146,11 @@ def main() -> None:
             "module": "optimization",
             "forecaster_plugin": args.forecaster_plugin,
             "optimizer_plugin": args.optimizer_plugin,
+            "inner_controller_mode": args.inner_controller_mode,
+            "inner_dt_seconds": args.inner_dt_seconds,
+            "inner_mpc_horizon_seconds": args.inner_mpc_horizon_seconds,
+            "rotation_strategy": args.rotation_strategy,
+            "gateway_mode": args.gateway_mode,
             "market_mode": args.market_mode,
             "resource_mode": args.resource_mode,
             "horizon_hours": args.horizon_hours,
@@ -135,9 +161,16 @@ def main() -> None:
             "market_data_status": bundle["summary"].get("market_data_status", {}),
             "artifacts": {
                 "training_data": "training_data.csv",
+                "device_roster": "device_roster.csv",
                 "history": "history.csv",
                 "tracking_4s": "tracking_4s.csv",
                 "first_schedule": "first_schedule.csv",
+                "household_contributions": "household_contributions.csv",
+                "appliance_contributions": "appliance_contributions.csv",
+                "upper_device_schedule": "upper_device_schedule.csv",
+                "inner_mpc_trace": "inner_mpc_trace.csv",
+                "gateway_commands": "gateway_commands.csv",
+                "usage_fatigue_summary": "usage_fatigue_summary.csv",
             },
         },
     )

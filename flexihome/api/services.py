@@ -120,6 +120,12 @@ def run_optimization_job(
             },
             preview_4s=bundle["preview_4s"],
             optimizer=optimizer,
+            device_roster=bundle.get("device_roster"),
+            inner_controller_mode=request.inner_controller_mode,
+            inner_dt_seconds=int(request.inner_dt_seconds),
+            inner_mpc_horizon_seconds=int(request.inner_mpc_horizon_seconds),
+            rotation_strategy=request.rotation_strategy,
+            gateway_mode=request.gateway_mode,
         )
         market_data_status = bundle.get("summary", {}).get("market_data_status", {})
         result.setdefault("summary", {})["market_data_source"] = market_data_status.get("mode_used", "synthetic")

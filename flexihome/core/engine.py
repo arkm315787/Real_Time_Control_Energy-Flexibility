@@ -47,6 +47,20 @@ FINGRID_RULES = {
     },
 }
 
+RESOURCE_RESPONSE_SECONDS = {
+    "BESS": 2.0,
+    "EV": 4.0,
+    "HVAC": 20.0,
+    "PV": 5.0,
+}
+
+RESOURCE_FORECAST_UNCERTAINTY = {
+    "BESS": 0.08,
+    "EV": 0.18,
+    "HVAC": 0.24,
+    "PV": 0.20,
+}
+
 SUPPORTED_MPC_TARGETS = [
     "net_load_baseline_kw",
     "pv_available_kw",
@@ -296,6 +310,7 @@ def generate_synthetic_portfolio(
     scarcity: float,
     freq_minutes: int = 15,
     hvac_mode: str = HVAC_MODES[0],
+    hvac_response_s: float | None = None,
     market_data_mode: str | None = None,
     entsoe_api_key: str | None = None,
     fingrid_api_key: str | None = None,
@@ -397,7 +412,7 @@ def generate_synthetic_portfolio(
 
     n_hvac = int(round(n_homes * hvac_pen))
     hvac = simulate_hvac_baseline(temp_out, n_hvac, setpoint_c, comfort_band_c, freq_minutes)
-    hvac_response_s = default_hvac_response_seconds(hvac_mode)
+    hvac_response_s = float(hvac_response_s) if hvac_response_s is not None else default_hvac_response_seconds(hvac_mode)
     device_roster = generate_household_device_roster(
         n_homes=n_homes,
         ev_pen=ev_pen,
@@ -749,6 +764,62 @@ def heuristic_mpc_step(
     )
     return {"status": "HeuristicFallback", "controls": schedule.iloc[0].to_dict(), "schedule": schedule}
 
+
+def _risk_factor(resource: str, risk_quantile: float, reserve_buffer_pct: float) -> float:
+    quantile = float(np.clip(risk_quantile, 0.50, 0.95))
+    buffer = float(np.clip(reserve_buffer_pct, 0.0, 0.40))
+    stress = (quantile - 0.50) / 0.45
+    uncertainty = RESOURCE_FORECAST_UNCERTAINTY.get(resource, 0.18)
+    return float(np.clip((1.0 - uncertainty * stress) * (1.0 - buffer), 0.45, 1.0))
+
+
+def _risk_factors(risk_quantile: float, reserve_buffer_pct: float) -> Dict[str, float]:
+    return {resource: _risk_factor(resource, risk_quantile, reserve_buffer_pct) for resource in ["BESS", "EV", "HVAC", "PV"]}
+
+
+def _risk_cost_terms(
+    values: Dict[str, float],
+    row: pd.Series,
+    dt_h: float,
+    risk_factors: Dict[str, float],
+    penalty_weights: Dict[str, float],
+) -> Dict[str, float]:
+    non_delivery_penalty = float(penalty_weights.get("non_delivery", 650.0))
+    activation_uncertainty_weight = float(penalty_weights.get("activation_uncertainty", 90.0))
+    asset_fatigue_weight = float(penalty_weights.get("asset_fatigue", 30.0))
+    q = float(np.clip(penalty_weights.get("risk_quantile", 0.80), 0.50, 0.95))
+
+    fcr_signal_risk = float(np.clip(row.get("fcr_up_act_frac", 0.0) + row.get("fcr_down_act_frac", 0.0), 0.0, 1.0))
+    afrr_up_risk = float(np.clip(row.get("afrr_up_act_frac", 0.0), 0.0, 1.0))
+    afrr_down_risk = float(np.clip(row.get("afrr_down_act_frac", 0.0), 0.0, 1.0))
+    activation_variance = fcr_signal_risk * (1.0 - fcr_signal_risk) + afrr_up_risk * (1.0 - afrr_up_risk) + afrr_down_risk * (1.0 - afrr_down_risk)
+    delivery_exposure = float(np.clip(max(fcr_signal_risk, afrr_up_risk, afrr_down_risk, 0.05), 0.05, 1.0))
+
+    resource_bid = {
+        "BESS": values.get("bess_fcr_kw", 0.0) + values.get("bess_afrr_up_kw", 0.0) + values.get("bess_afrr_down_kw", 0.0),
+        "EV": values.get("ev_fcr_kw", 0.0) + values.get("ev_afrr_up_kw", 0.0) + values.get("ev_afrr_down_kw", 0.0),
+        "HVAC": values.get("hvac_fcr_kw", 0.0) + values.get("hvac_afrr_up_kw", 0.0) + values.get("hvac_afrr_down_kw", 0.0),
+        "PV": values.get("pv_afrr_down_kw", 0.0),
+    }
+    total_bid_kw = sum(resource_bid.values())
+    non_delivery_risk = dt_h / 1000.0 * non_delivery_penalty * delivery_exposure * sum(
+        max(1.0 - risk_factors.get(resource, 1.0), 0.0) * bid for resource, bid in resource_bid.items()
+    )
+    activation_uncertainty = dt_h / 1000.0 * activation_uncertainty_weight * activation_variance * total_bid_kw
+    asset_fatigue = dt_h / 1000.0 * asset_fatigue_weight * delivery_exposure * (
+        1.0 * resource_bid["BESS"] + 0.65 * resource_bid["EV"] + 0.45 * resource_bid["HVAC"] + 0.20 * resource_bid["PV"]
+    )
+    reserve_buffer_kw = max((q - 0.50) / 0.45, 0.0) * sum(
+        RESOURCE_FORECAST_UNCERTAINTY.get(resource, 0.18) * bid for resource, bid in resource_bid.items()
+    )
+    return {
+        "non_delivery_risk_cost_eur": non_delivery_risk,
+        "activation_uncertainty_cost_eur": activation_uncertainty,
+        "asset_fatigue_cost_eur": asset_fatigue,
+        "reserve_buffer_kw": reserve_buffer_kw,
+    }
+
+
 def solve_mpc_step(
     forecast_df: pd.DataFrame,
     state: Dict[str, float],
@@ -763,10 +834,25 @@ def solve_mpc_step(
     eta_d = 0.95
     temp_alpha = 0.90
     temp_beta = 0.16 * dt_h
+    risk_quantile = float(np.clip(penalty_weights.get("risk_quantile", 0.80), 0.50, 0.95))
+    reserve_buffer_pct = float(np.clip(penalty_weights.get("reserve_buffer_pct", 0.08), 0.0, 0.40))
+    risk_factors = _risk_factors(risk_quantile, reserve_buffer_pct)
 
     only_fast = resource_mode == "Fast only"
     enable_hvac = 0.0 if only_fast else 1.0
     enable_pv = 0.0 if only_fast else 1.0
+    hvac_response_s = float(fleet_meta.get("hvac_response_s", RESOURCE_RESPONSE_SECONDS["HVAC"]))
+    fcr_eligible = {
+        "BESS": 1.0 if RESOURCE_RESPONSE_SECONDS["BESS"] <= FINGRID_RULES["FCR-N"]["response_seconds"] else 0.0,
+        "EV": 1.0 if RESOURCE_RESPONSE_SECONDS["EV"] <= FINGRID_RULES["FCR-N"]["response_seconds"] else 0.0,
+        "HVAC": 1.0 if hvac_response_s <= FINGRID_RULES["FCR-N"]["response_seconds"] else 0.0,
+    }
+    afrr_eligible = {
+        "BESS": 1.0 if RESOURCE_RESPONSE_SECONDS["BESS"] <= FINGRID_RULES["aFRR"]["full_activation_seconds"] else 0.0,
+        "EV": 1.0 if RESOURCE_RESPONSE_SECONDS["EV"] <= FINGRID_RULES["aFRR"]["full_activation_seconds"] else 0.0,
+        "HVAC": 1.0 if hvac_response_s <= FINGRID_RULES["aFRR"]["full_activation_seconds"] else 0.0,
+        "PV": 1.0 if RESOURCE_RESPONSE_SECONDS["PV"] <= FINGRID_RULES["aFRR"]["full_activation_seconds"] else 0.0,
+    }
 
     problem = LpProblem("FlexiHome_MPC", LpMaximize)
     idxs = list(range(horizon))
@@ -801,15 +887,27 @@ def solve_mpc_step(
         row = forecast_df.iloc[k]
         fcr_on = 1.0 if market_mode in {"FCR-N", "Combined"} else 0.0
         afrr_on = 1.0 if market_mode in {"aFRR", "Combined"} else 0.0
+        bess_up_cap = float(row["bess_up_kw"]) * risk_factors["BESS"]
+        bess_down_cap = float(row["bess_down_kw"]) * risk_factors["BESS"]
+        ev_up_cap = float(row["ev_up_kw"]) * risk_factors["EV"]
+        ev_down_cap = float(row["ev_down_kw"]) * risk_factors["EV"]
+        hvac_up_cap = enable_hvac * afrr_eligible["HVAC"] * float(row["hvac_up_kw"]) * risk_factors["HVAC"]
+        hvac_down_cap = enable_hvac * afrr_eligible["HVAC"] * float(row["hvac_down_kw"]) * risk_factors["HVAC"]
+        hvac_fcr_cap = enable_hvac * fcr_eligible["HVAC"] * float(row.get("hvac_fast_kw", 0.0)) * risk_factors["HVAC"]
+        pv_down_cap = enable_pv * afrr_eligible["PV"] * float(row["pv_down_kw"]) * risk_factors["PV"]
 
-        problem += bess_fcr[k] + bess_up[k] <= row["bess_up_kw"]
-        problem += bess_fcr[k] + bess_down[k] <= row["bess_down_kw"]
-        problem += ev_fcr[k] + ev_up[k] <= row["ev_up_kw"]
-        problem += ev_fcr[k] + ev_down[k] <= row["ev_down_kw"]
-        problem += hvac_fcr[k] + hvac_up[k] <= enable_hvac * row["hvac_up_kw"]
-        problem += hvac_fcr[k] + hvac_down[k] <= enable_hvac * row["hvac_down_kw"]
-        problem += hvac_fcr[k] <= enable_hvac * row.get("hvac_fast_kw", 0.0)
-        problem += pv_down[k] <= enable_pv * row["pv_down_kw"]
+        problem += bess_fcr[k] <= min(bess_up_cap, bess_down_cap) * fcr_eligible["BESS"]
+        problem += ev_fcr[k] <= min(ev_up_cap, ev_down_cap) * fcr_eligible["EV"]
+        problem += hvac_fcr[k] <= hvac_fcr_cap
+        problem += bess_fcr[k] + bess_up[k] <= bess_up_cap
+        problem += bess_fcr[k] + bess_down[k] <= bess_down_cap
+        problem += ev_fcr[k] + ev_up[k] <= ev_up_cap
+        problem += ev_fcr[k] + ev_down[k] <= ev_down_cap
+        problem += hvac_fcr[k] + hvac_up[k] <= hvac_up_cap
+        problem += hvac_fcr[k] + hvac_down[k] <= hvac_down_cap
+        problem += pv_down[k] <= pv_down_cap
+        problem += bess_fcr[k] + bess_up[k] <= (soc_b[k] - 0.10 * bess_cap) * 1000.0 * eta_d / max(dt_h, 1e-6)
+        problem += bess_fcr[k] + bess_down[k] <= (0.95 * bess_cap - soc_b[k]) * 1000.0 / (max(dt_h, 1e-6) * eta_c)
 
         if fcr_on < 0.5:
             problem += bess_fcr[k] == 0
@@ -839,6 +937,9 @@ def solve_mpc_step(
         ev_ref = row["ev_soc_ref_mwh"]
         ev_min = row["ev_soc_min_mwh"]
         ev_max = row["ev_soc_max_mwh"]
+        ev_actual = ev_ref + ev_delta[k]
+        problem += ev_fcr[k] + ev_up[k] <= (ev_actual - ev_min) * 1000.0 * eta_d / max(dt_h, 1e-6)
+        problem += ev_fcr[k] + ev_down[k] <= (ev_max - ev_actual) * 1000.0 / (max(dt_h, 1e-6) * eta_c)
         problem += ev_delta[k + 1] == ev_delta[k] + dt_h / 1000.0 * (
             eta_c * (afrr_down_frac * ev_down[k] + fcr_down_frac * ev_fcr[k])
             - (afrr_up_frac * ev_up[k] + fcr_up_frac * ev_fcr[k]) / eta_d
@@ -849,6 +950,9 @@ def solve_mpc_step(
         temp_ref = row["indoor_temp_c_ref"]
         temp_lo = fleet_meta["setpoint_c"] - fleet_meta["comfort_band_c"]
         temp_hi = fleet_meta["setpoint_c"] + fleet_meta["comfort_band_c"]
+        comfort_band = max(float(fleet_meta["comfort_band_c"]), 0.2)
+        problem += hvac_fcr[k] + hvac_up[k] <= enable_hvac * max(float(row["hvac_up_kw"]), 0.0) * (temp_ref + temp_delta[k] - temp_lo + temp_low_slack[k]) / comfort_band
+        problem += hvac_fcr[k] + hvac_down[k] <= enable_hvac * max(float(row["hvac_down_kw"]), 0.0) * (temp_hi - temp_ref - temp_delta[k] + temp_high_slack[k]) / comfort_band
         problem += temp_delta[k + 1] == temp_alpha * temp_delta[k] + temp_beta * (
             (
                 (afrr_down_frac * hvac_down[k] + fcr_down_frac * hvac_fcr[k])
@@ -877,7 +981,33 @@ def solve_mpc_step(
             + 0.4 * (afrr_up_frac * ev_up[k] + afrr_down_frac * ev_down[k] + (fcr_up_frac + fcr_down_frac) * ev_fcr[k])
         )
         discomfort = penalty_weights["comfort"] * (temp_low_slack[k] + temp_high_slack[k]) + penalty_weights["departure"] * ev_slack[k]
-        objective_terms.append(cap_revenue + energy_revenue - degradation - discomfort)
+        risk_terms = _risk_cost_terms(
+            {
+                "bess_fcr_kw": bess_fcr[k],
+                "ev_fcr_kw": ev_fcr[k],
+                "hvac_fcr_kw": hvac_fcr[k],
+                "bess_afrr_up_kw": bess_up[k],
+                "bess_afrr_down_kw": bess_down[k],
+                "ev_afrr_up_kw": ev_up[k],
+                "ev_afrr_down_kw": ev_down[k],
+                "hvac_afrr_up_kw": hvac_up[k],
+                "hvac_afrr_down_kw": hvac_down[k],
+                "pv_afrr_down_kw": pv_down[k],
+            },
+            row,
+            dt_h,
+            risk_factors,
+            penalty_weights,
+        )
+        objective_terms.append(
+            cap_revenue
+            + energy_revenue
+            - degradation
+            - discomfort
+            - risk_terms["non_delivery_risk_cost_eur"]
+            - risk_terms["activation_uncertainty_cost_eur"]
+            - risk_terms["asset_fatigue_cost_eur"]
+        )
 
     problem += lpSum(objective_terms)
     try:
@@ -890,23 +1020,61 @@ def solve_mpc_step(
 
     rows = []
     for k in idxs:
-        rows.append(
+        row = forecast_df.iloc[k]
+        values = {
+            "bess_fcr_kw": float(bess_fcr[k].value() or 0.0),
+            "ev_fcr_kw": float(ev_fcr[k].value() or 0.0),
+            "hvac_fcr_kw": float(hvac_fcr[k].value() or 0.0),
+            "bess_afrr_up_kw": float(bess_up[k].value() or 0.0),
+            "bess_afrr_down_kw": float(bess_down[k].value() or 0.0),
+            "ev_afrr_up_kw": float(ev_up[k].value() or 0.0),
+            "ev_afrr_down_kw": float(ev_down[k].value() or 0.0),
+            "hvac_afrr_up_kw": float(hvac_up[k].value() or 0.0),
+            "hvac_afrr_down_kw": float(hvac_down[k].value() or 0.0),
+            "pv_afrr_down_kw": float(pv_down[k].value() or 0.0),
+        }
+        fcr_bid_val = values["bess_fcr_kw"] + values["ev_fcr_kw"] + values["hvac_fcr_kw"]
+        afrr_up_bid_val = values["bess_afrr_up_kw"] + values["ev_afrr_up_kw"] + values["hvac_afrr_up_kw"]
+        afrr_down_bid_val = values["bess_afrr_down_kw"] + values["ev_afrr_down_kw"] + values["hvac_afrr_down_kw"] + values["pv_afrr_down_kw"]
+        cap_revenue = dt_h / 1000.0 * (
+            row["fcrn_capacity_eur_per_mw_h"] * fcr_bid_val
+            + row["afrr_up_capacity_eur_per_mw_h"] * afrr_up_bid_val
+            + row["afrr_down_capacity_eur_per_mw_h"] * afrr_down_bid_val
+        )
+        energy_revenue = dt_h / 1000.0 * (
+            row["afrr_up_energy_eur_per_mwh"] * row["afrr_up_act_frac"] * afrr_up_bid_val
+            + row["afrr_down_energy_eur_per_mwh"] * row["afrr_down_act_frac"] * afrr_down_bid_val
+        )
+        degradation = penalty_weights["degradation"] * dt_h / 1000.0 * (
+            (row["afrr_up_act_frac"] * values["bess_afrr_up_kw"] + row["afrr_down_act_frac"] * values["bess_afrr_down_kw"] + (row["fcr_up_act_frac"] + row["fcr_down_act_frac"]) * values["bess_fcr_kw"])
+            + 0.4 * (row["afrr_up_act_frac"] * values["ev_afrr_up_kw"] + row["afrr_down_act_frac"] * values["ev_afrr_down_kw"] + (row["fcr_up_act_frac"] + row["fcr_down_act_frac"]) * values["ev_fcr_kw"])
+        )
+        risk_costs = _risk_cost_terms(values, row, dt_h, risk_factors, penalty_weights)
+        risk_adjusted_profit = (
+            cap_revenue
+            + energy_revenue
+            - degradation
+            - float(risk_costs["non_delivery_risk_cost_eur"])
+            - float(risk_costs["activation_uncertainty_cost_eur"])
+            - float(risk_costs["asset_fatigue_cost_eur"])
+        )
+        values.update(
             {
-                "bess_fcr_kw": float(bess_fcr[k].value() or 0.0),
-                "ev_fcr_kw": float(ev_fcr[k].value() or 0.0),
-                "hvac_fcr_kw": float(hvac_fcr[k].value() or 0.0),
-                "bess_afrr_up_kw": float(bess_up[k].value() or 0.0),
-                "bess_afrr_down_kw": float(bess_down[k].value() or 0.0),
-                "ev_afrr_up_kw": float(ev_up[k].value() or 0.0),
-                "ev_afrr_down_kw": float(ev_down[k].value() or 0.0),
-                "hvac_afrr_up_kw": float(hvac_up[k].value() or 0.0),
-                "hvac_afrr_down_kw": float(hvac_down[k].value() or 0.0),
-                "pv_afrr_down_kw": float(pv_down[k].value() or 0.0),
                 "bess_soc_mwh_plan": float(soc_b[k + 1].value() or 0.0),
                 "ev_delta_mwh_plan": float(ev_delta[k + 1].value() or 0.0),
                 "temp_delta_c_plan": float(temp_delta[k + 1].value() or 0.0),
+                "gross_revenue_eur": float(cap_revenue + energy_revenue),
+                "expected_degradation_eur": float(degradation),
+                "non_delivery_risk_cost_eur": float(risk_costs["non_delivery_risk_cost_eur"]),
+                "activation_uncertainty_cost_eur": float(risk_costs["activation_uncertainty_cost_eur"]),
+                "asset_fatigue_cost_eur": float(risk_costs["asset_fatigue_cost_eur"]),
+                "risk_adjusted_profit_eur": float(risk_adjusted_profit),
+                "risk_quantile": float(risk_quantile),
+                "reserve_buffer_pct": float(reserve_buffer_pct),
+                "reserve_buffer_kw": float(risk_costs["reserve_buffer_kw"]),
             }
         )
+        rows.append(values)
     schedule = pd.DataFrame(rows, index=forecast_df.index)
     schedule["fcr_bid_kw"] = schedule["bess_fcr_kw"] + schedule["ev_fcr_kw"] + schedule["hvac_fcr_kw"]
     schedule["afrr_up_bid_kw"] = schedule["bess_afrr_up_kw"] + schedule["ev_afrr_up_kw"] + schedule["hvac_afrr_up_kw"]
@@ -955,6 +1123,97 @@ def _available_up_down(
         "hvac_down_av": hvac_down_av,
         "hvac_fast_av": hvac_fast_av,
         "pv_down_av": row["pv_down_kw"],
+    }
+
+
+def _market_gate_decision(plan: Dict[str, float], market_mode: str) -> Dict[str, object]:
+    fcr_bid = float(plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0) + plan.get("hvac_fcr_kw", 0.0))
+    afrr_up = float(plan.get("bess_afrr_up_kw", 0.0) + plan.get("ev_afrr_up_kw", 0.0) + plan.get("hvac_afrr_up_kw", 0.0))
+    afrr_down = float(
+        plan.get("bess_afrr_down_kw", 0.0)
+        + plan.get("ev_afrr_down_kw", 0.0)
+        + plan.get("hvac_afrr_down_kw", 0.0)
+        + plan.get("pv_afrr_down_kw", 0.0)
+    )
+    afrr_bid = max(afrr_up, afrr_down)
+    risk_profit = float(plan.get("risk_adjusted_profit_eur", 0.0))
+    fcr_ok = fcr_bid >= FINGRID_RULES["FCR-N"]["min_bid_kw"] if market_mode in {"FCR-N", "Combined"} else True
+    afrr_ok = afrr_bid >= FINGRID_RULES["aFRR"]["min_bid_kw"] if market_mode in {"aFRR", "Combined"} else True
+    profitable = risk_profit >= 0.0
+    if fcr_ok and afrr_ok and profitable and (fcr_bid + afrr_bid > 1.0):
+        status = "Participate"
+        reason = "Risk-adjusted bid clears product size and expected profit gates."
+    elif not profitable:
+        status = "Wait"
+        reason = "Expected revenue is lower than risk, fatigue, and delivery-cost allowance."
+    elif not fcr_ok or not afrr_ok:
+        status = "Wait"
+        reason = "Reliable bid is below the selected market minimum size."
+    else:
+        status = "Wait"
+        reason = "No reliable flexibility bid is available for this slot."
+    return {
+        "market_gate_status": status,
+        "market_gate_reason": reason,
+        "risk_adjusted_profit_eur": risk_profit,
+        "reserve_buffer_kw": float(plan.get("reserve_buffer_kw", 0.0)),
+    }
+
+
+def _upper_only_interval_summary(
+    row: pd.Series,
+    plan: Dict[str, float],
+    state: Dict[str, float],
+    fleet_meta: Dict[str, float],
+    market_mode: str,
+) -> Dict[str, float]:
+    dt_h = float(row["dt_h"])
+    eta_c = 0.95
+    eta_d = 0.95
+    fcr_up_frac = float(row["fcr_up_act_frac"]) if market_mode in {"FCR-N", "Combined"} else 0.0
+    fcr_down_frac = float(row["fcr_down_act_frac"]) if market_mode in {"FCR-N", "Combined"} else 0.0
+    afrr_up_frac = float(row["afrr_up_act_frac"]) if market_mode in {"aFRR", "Combined"} else 0.0
+    afrr_down_frac = float(row["afrr_down_act_frac"]) if market_mode in {"aFRR", "Combined"} else 0.0
+
+    bess_up = fcr_up_frac * float(plan.get("bess_fcr_kw", 0.0)) + afrr_up_frac * float(plan.get("bess_afrr_up_kw", 0.0))
+    bess_down = fcr_down_frac * float(plan.get("bess_fcr_kw", 0.0)) + afrr_down_frac * float(plan.get("bess_afrr_down_kw", 0.0))
+    ev_up = fcr_up_frac * float(plan.get("ev_fcr_kw", 0.0)) + afrr_up_frac * float(plan.get("ev_afrr_up_kw", 0.0))
+    ev_down = fcr_down_frac * float(plan.get("ev_fcr_kw", 0.0)) + afrr_down_frac * float(plan.get("ev_afrr_down_kw", 0.0))
+    hvac_up = fcr_up_frac * float(plan.get("hvac_fcr_kw", 0.0)) + afrr_up_frac * float(plan.get("hvac_afrr_up_kw", 0.0))
+    hvac_down = fcr_down_frac * float(plan.get("hvac_fcr_kw", 0.0)) + afrr_down_frac * float(plan.get("hvac_afrr_down_kw", 0.0))
+    pv_down = afrr_down_frac * float(plan.get("pv_afrr_down_kw", 0.0))
+    requested_up = bess_up + ev_up + hvac_up
+    requested_down = bess_down + ev_down + hvac_down + pv_down
+
+    bess_cap = max(float(fleet_meta["bess_energy_cap_mwh"]), 1e-6)
+    state["bess_soc_mwh"] = float(np.clip(state["bess_soc_mwh"] + dt_h / 1000.0 * (eta_c * bess_down - bess_up / eta_d), 0.10 * bess_cap, 0.95 * bess_cap))
+    state["ev_soc_delta_mwh"] += dt_h / 1000.0 * (eta_c * ev_down - ev_up / eta_d)
+    state["temp_delta_c"] = 0.90 * state["temp_delta_c"] + 0.16 * dt_h * ((hvac_down - hvac_up) / max(fleet_meta["n_hvac"], 1))
+
+    return {
+        "frequency_hz": float(row.get("frequency_hz", 50.0)),
+        "requested_up_kw": float(requested_up),
+        "requested_down_kw": float(requested_down),
+        "delivered_up_kw": float(requested_up),
+        "delivered_down_kw": float(requested_down),
+        "bess_up_kw": float(bess_up),
+        "bess_down_kw": float(bess_down),
+        "ev_up_kw": float(ev_up),
+        "ev_down_kw": float(ev_down),
+        "hvac_fcr_up_kw": float(fcr_up_frac * float(plan.get("hvac_fcr_kw", 0.0))),
+        "hvac_fcr_down_kw": float(fcr_down_frac * float(plan.get("hvac_fcr_kw", 0.0))),
+        "hvac_up_kw": float(hvac_up),
+        "hvac_down_kw": float(hvac_down),
+        "pv_down_kw": float(pv_down),
+        "bess_soc_mwh": float(state["bess_soc_mwh"]),
+        "ev_soc_mwh": float(row["ev_soc_ref_mwh"] + state["ev_soc_delta_mwh"]),
+        "indoor_temp_c": float(row["indoor_temp_c_ref"] + state["temp_delta_c"]),
+        "optimized_net_load_kw": float(row["net_load_baseline_kw"] - requested_up + requested_down),
+        "baseline_net_load_kw": float(row["net_load_baseline_kw"]),
+        "tracking_samples": 0,
+        "tracking_error_kw": 0.0,
+        "shortfall_kw": 0.0,
+        "inner_solver_status": "NotStarted",
     }
 
 def build_inner_tracking_window(
@@ -1199,8 +1458,8 @@ def run_mpc_controller(
     fleet_meta: Dict[str, float],
     market_mode: str,
     resource_mode: str,
-    horizon_hours: int,
-    dispatch_hours: int,
+    horizon_hours: float,
+    dispatch_hours: float,
     penalty_weights: Dict[str, float],
     preview_4s: pd.DataFrame | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
@@ -1211,9 +1470,10 @@ def run_mpc_controller(
     inner_mpc_horizon_seconds: int = 20,
     rotation_strategy: str = "usage_aware",
     gateway_mode: str = "simulated_centralized",
+    execute_lower_mpc: bool = True,
 ) -> Dict[str, object]:
-    sim_steps = min(int(dispatch_hours / df["dt_h"].iloc[0]), len(df) - 2)
-    horizon_steps = min(int(horizon_hours / df["dt_h"].iloc[0]), len(df) - 2)
+    sim_steps = min(max(int(round(float(dispatch_hours) / float(df["dt_h"].iloc[0]))), 1), len(df) - 2)
+    horizon_steps = min(max(int(round(float(horizon_hours) / float(df["dt_h"].iloc[0]))), 1), len(df) - 2)
     state = {
         "bess_soc_mwh": float(df["bess_soc_ref_mwh"].iloc[0]),
         "ev_soc_delta_mwh": 0.0,
@@ -1227,7 +1487,8 @@ def run_mpc_controller(
     tracking_history: List[pd.DataFrame] = []
     upper_device_schedules: List[pd.DataFrame] = []
     gateway_command_summaries: List[pd.DataFrame] = []
-    total_work = max(sim_steps * (horizon_steps + 2), 1)
+    work_per_interval = horizon_steps + (2 if execute_lower_mpc else 1)
+    total_work = max(sim_steps * work_per_interval, 1)
     controller_config = InnerControllerConfig(
         mode=inner_controller_mode,
         dt_seconds=int(inner_dt_seconds),
@@ -1243,7 +1504,7 @@ def run_mpc_controller(
 
     for t in range(sim_steps):
         base_slice = df.iloc[t + 1 : t + 1 + horizon_steps].copy()
-        base_progress = t * (horizon_steps + 2)
+        base_progress = t * work_per_interval
 
         def _forecast_step_callback(step_idx: int, step_total: int) -> None:
             if progress_callback:
@@ -1310,26 +1571,44 @@ def run_mpc_controller(
         plan = solution["controls"]
         row = df.iloc[t]
         dt_h = row["dt_h"]
-        fine_signals = build_inner_tracking_window(df, preview_4s, t)
-        if progress_callback:
-            progress_callback(
-                base_progress + horizon_steps + 2,
-                total_work,
-                f"Solving centralized 4-second MPC for interval {t + 1}/{sim_steps}",
+        if execute_lower_mpc:
+            fine_signals = build_inner_tracking_window(df, preview_4s, t, dt_seconds=int(inner_dt_seconds))
+            if progress_callback:
+                progress_callback(
+                    base_progress + horizon_steps + 2,
+                    total_work,
+                    f"Solving centralized 4-second MPC for interval {t + 1}/{sim_steps}",
+                )
+            interval_summary, interval_tracking, upper_schedule, command_summary = centralized_controller.execute_interval(
+                row=row,
+                fine_signals=fine_signals,
+                plan=plan,
+                interval_index=t,
+                market_mode=market_mode,
+                resource_mode=resource_mode,
             )
-        interval_summary, interval_tracking, upper_schedule, command_summary = centralized_controller.execute_interval(
-            row=row,
-            fine_signals=fine_signals,
-            plan=plan,
-            interval_index=t,
-            market_mode=market_mode,
-            resource_mode=resource_mode,
-        )
-        tracking_history.append(interval_tracking)
+            tracking_history.append(interval_tracking)
+            if not command_summary.empty:
+                gateway_command_summaries.append(command_summary)
+        else:
+            if progress_callback:
+                progress_callback(
+                    base_progress + horizon_steps + 1,
+                    total_work,
+                    f"Evaluating market gate for interval {t + 1}/{sim_steps}",
+                )
+            interval_summary = _upper_only_interval_summary(
+                row=row,
+                plan=plan,
+                state=state,
+                fleet_meta=fleet_meta,
+                market_mode=market_mode,
+            )
+            interval_tracking = pd.DataFrame()
+            upper_schedule = centralized_controller.select_upper_schedule(row, plan, t, resource_mode)
+            command_summary = pd.DataFrame()
         if not upper_schedule.empty:
             upper_device_schedules.append(upper_schedule)
-        if not command_summary.empty:
-            gateway_command_summaries.append(command_summary)
         state["bess_soc_mwh"] = interval_summary["bess_soc_mwh"]
         state["ev_soc_delta_mwh"] = interval_summary["ev_soc_mwh"] - float(row["ev_soc_ref_mwh"])
         state["temp_delta_c"] = interval_summary["indoor_temp_c"] - float(row["indoor_temp_c_ref"])
@@ -1372,6 +1651,7 @@ def run_mpc_controller(
             0.0,
             abs(row["indoor_temp_c_ref"] + state["temp_delta_c"] - fleet_meta["setpoint_c"]) - fleet_meta["comfort_band_c"],
         )
+        gate = _market_gate_decision(plan, market_mode)
 
         history.append(
             {
@@ -1385,6 +1665,16 @@ def run_mpc_controller(
                 "fcr_bid_kw": fcr_bid_kw,
                 "afrr_up_bid_kw": afrr_up_bid_kw,
                 "afrr_down_bid_kw": afrr_down_bid_kw,
+                "bess_fcr_kw": float(plan.get("bess_fcr_kw", 0.0)),
+                "ev_fcr_kw": float(plan.get("ev_fcr_kw", 0.0)),
+                "hvac_fcr_kw": float(plan.get("hvac_fcr_kw", 0.0)),
+                "bess_afrr_up_kw": float(plan.get("bess_afrr_up_kw", 0.0)),
+                "bess_afrr_down_kw": float(plan.get("bess_afrr_down_kw", 0.0)),
+                "ev_afrr_up_kw": float(plan.get("ev_afrr_up_kw", 0.0)),
+                "ev_afrr_down_kw": float(plan.get("ev_afrr_down_kw", 0.0)),
+                "hvac_afrr_up_kw": float(plan.get("hvac_afrr_up_kw", 0.0)),
+                "hvac_afrr_down_kw": float(plan.get("hvac_afrr_down_kw", 0.0)),
+                "pv_afrr_down_kw": float(plan.get("pv_afrr_down_kw", 0.0)),
                 "fcrn_capacity_eur_per_mw_h": float(row["fcrn_capacity_eur_per_mw_h"]),
                 "afrr_up_capacity_eur_per_mw_h": float(row["afrr_up_capacity_eur_per_mw_h"]),
                 "afrr_down_capacity_eur_per_mw_h": float(row["afrr_down_capacity_eur_per_mw_h"]),
@@ -1407,7 +1697,16 @@ def run_mpc_controller(
                 "activation_revenue_eur": activation_revenue,
                 "degradation_cost_eur": degradation_cost,
                 "comfort_penalty_eur": comfort_penalty,
-                "net_revenue_eur": capacity_revenue + activation_revenue - degradation_cost - comfort_penalty,
+                "non_delivery_risk_cost_eur": float(plan.get("non_delivery_risk_cost_eur", 0.0)),
+                "activation_uncertainty_cost_eur": float(plan.get("activation_uncertainty_cost_eur", 0.0)),
+                "asset_fatigue_cost_eur": float(plan.get("asset_fatigue_cost_eur", 0.0)),
+                "reserve_buffer_kw": float(plan.get("reserve_buffer_kw", 0.0)),
+                "risk_quantile": float(plan.get("risk_quantile", penalty_weights.get("risk_quantile", 0.80))),
+                "reserve_buffer_pct": float(plan.get("reserve_buffer_pct", penalty_weights.get("reserve_buffer_pct", 0.08))),
+                "risk_adjusted_profit_eur": gate["risk_adjusted_profit_eur"],
+                "market_gate_status": gate["market_gate_status"],
+                "market_gate_reason": gate["market_gate_reason"],
+                "net_revenue_eur": capacity_revenue + activation_revenue - degradation_cost - comfort_penalty - float(plan.get("non_delivery_risk_cost_eur", 0.0)) - float(plan.get("activation_uncertainty_cost_eur", 0.0)) - float(plan.get("asset_fatigue_cost_eur", 0.0)),
                 "bess_soc_mwh": interval_summary["bess_soc_mwh"],
                 "ev_soc_mwh": interval_summary["ev_soc_mwh"],
                 "indoor_temp_c": interval_summary["indoor_temp_c"],
@@ -1427,6 +1726,7 @@ def run_mpc_controller(
             "compliance": {},
             "first_schedule": pd.DataFrame(),
             "tracking_4s": pd.DataFrame(),
+            "inner_mpc_trace": pd.DataFrame(),
             "upper_device_schedule": pd.DataFrame(),
             "gateway_commands": pd.DataFrame(),
             "household_contributions": pd.DataFrame(),
@@ -1514,6 +1814,8 @@ def run_mpc_controller(
     }
     passed = sum(bool(v) for k, v in compliance.items() if k.endswith("_ok"))
     total_checks = len([k for k in compliance if k.endswith("_ok")])
+    eligible_rows = result_df[result_df.get("market_gate_status", pd.Series(index=result_df.index, dtype=object)) == "Participate"]
+    next_participation_start = str(eligible_rows.index[0]) if not eligible_rows.empty else ""
 
     summary = {
         "total_revenue_eur": float(result_df["net_revenue_eur"].sum()),
@@ -1521,6 +1823,10 @@ def run_mpc_controller(
         "activation_revenue_eur": float(result_df["activation_revenue_eur"].sum()),
         "degradation_cost_eur": float(result_df["degradation_cost_eur"].sum()),
         "comfort_penalty_eur": float(result_df["comfort_penalty_eur"].sum()),
+        "non_delivery_risk_cost_eur": float(result_df.get("non_delivery_risk_cost_eur", pd.Series([0.0])).sum()),
+        "activation_uncertainty_cost_eur": float(result_df.get("activation_uncertainty_cost_eur", pd.Series([0.0])).sum()),
+        "asset_fatigue_cost_eur": float(result_df.get("asset_fatigue_cost_eur", pd.Series([0.0])).sum()),
+        "risk_adjusted_profit_eur": float(result_df.get("risk_adjusted_profit_eur", pd.Series([0.0])).sum()),
         "delivered_up_mwh": float(result_df["delivered_up_kw"].sum() * df["dt_h"].iloc[0] / 1000.0),
         "delivered_down_mwh": float(result_df["delivered_down_kw"].sum() * df["dt_h"].iloc[0] / 1000.0),
         "co2_avoided_kg": float(result_df["delivered_up_kw"].sum() * df["dt_h"].iloc[0] / 1000.0 * 140.0),
@@ -1536,6 +1842,9 @@ def run_mpc_controller(
         "inner_mpc_horizon_seconds": int(inner_mpc_horizon_seconds),
         "rotation_strategy": rotation_strategy,
         "gateway_mode": gateway_mode,
+        "execute_lower_mpc": bool(execute_lower_mpc),
+        "market_gate_participation_intervals": int(len(eligible_rows)),
+        "next_participation_start": next_participation_start,
         "mean_tracking_error_kw": float(result_df["tracking_error_kw"].mean()) if "tracking_error_kw" in result_df else 0.0,
         "mean_shortfall_kw": float(result_df["shortfall_kw"].mean()) if "shortfall_kw" in result_df else 0.0,
     }

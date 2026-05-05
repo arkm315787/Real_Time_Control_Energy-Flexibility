@@ -74,7 +74,6 @@ def response_from_job(job: StoredJob) -> OptimizationResponse:
 def portfolio_kwargs(config: PortfolioConfig) -> Dict:
     payload = model_to_dict(config)
     payload["start_date"] = str(payload["start_date"])
-    payload.pop("hvac_response_s", None)
     return payload
 
 
@@ -111,12 +110,17 @@ def run_optimization_job(
             fleet_meta=fleet_meta_from_bundle(bundle, request.portfolio_config),
             market_mode=request.market_mode,
             resource_mode=request.resource_mode,
-            horizon_hours=int(request.horizon_hours),
-            dispatch_hours=int(request.dispatch_hours),
+            horizon_hours=float(request.horizon_hours),
+            dispatch_hours=float(request.dispatch_hours),
             penalty_weights={
                 "degradation": float(request.degradation_weight),
                 "comfort": float(request.comfort_weight),
                 "departure": float(request.departure_weight),
+                "risk_quantile": float(request.risk_quantile),
+                "reserve_buffer_pct": float(request.reserve_buffer_pct),
+                "non_delivery": float(request.non_delivery_penalty),
+                "activation_uncertainty": float(request.activation_uncertainty_weight),
+                "asset_fatigue": float(request.asset_fatigue_weight),
             },
             preview_4s=bundle["preview_4s"],
             optimizer=optimizer,
@@ -126,6 +130,7 @@ def run_optimization_job(
             inner_mpc_horizon_seconds=int(request.inner_mpc_horizon_seconds),
             rotation_strategy=request.rotation_strategy,
             gateway_mode=request.gateway_mode,
+            execute_lower_mpc=bool(request.execute_lower_mpc),
         )
         market_data_status = bundle.get("summary", {}).get("market_data_status", {})
         result.setdefault("summary", {})["market_data_source"] = market_data_status.get("mode_used", "synthetic")

@@ -48,12 +48,18 @@ class OptimizationRequest(BaseModel):
     inner_mpc_horizon_seconds: int = Field(20, ge=4, le=300)
     rotation_strategy: Literal["usage_aware"] = "usage_aware"
     gateway_mode: Literal["simulated_centralized"] = "simulated_centralized"
-    horizon_hours: int = Field(2, ge=1, le=72)
-    dispatch_hours: int = Field(4, ge=1, le=168)
+    execute_lower_mpc: bool = True
+    horizon_hours: float = Field(2.0, ge=0.25, le=72)
+    dispatch_hours: float = Field(4.0, ge=0.25, le=168)
     portfolio_config: PortfolioConfig = Field(default_factory=PortfolioConfig)
     degradation_weight: float = Field(18.0, ge=0.0)
     comfort_weight: float = Field(120.0, ge=0.0)
     departure_weight: float = Field(160.0, ge=0.0)
+    risk_quantile: float = Field(0.80, ge=0.50, le=0.95)
+    reserve_buffer_pct: float = Field(0.08, ge=0.0, le=0.40)
+    non_delivery_penalty: float = Field(650.0, ge=0.0)
+    activation_uncertainty_weight: float = Field(90.0, ge=0.0)
+    asset_fatigue_weight: float = Field(30.0, ge=0.0)
 
 
 class OptimizationResponse(BaseModel):

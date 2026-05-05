@@ -753,6 +753,7 @@ def main() -> None:
         "scarcity": scarcity,
         "freq_minutes": int(freq_minutes),
         "hvac_mode": hvac_mode,
+        "hvac_response_s": hvac_response_s,
     }
     portfolio_signature = scenario_portfolio_signature(scenario)
     if portfolio_bundle_is_current(st.session_state, portfolio_signature):
@@ -1190,18 +1191,41 @@ def main() -> None:
         st.subheader("MPC Optimizer & Market Participation")
         st.caption(
             f"The outer MPC, synthetic portfolio, and forecasting loop run at a {freq_minutes}-minute interval. "
-            "Inside each interval, a centralized 4-second MPC allocates selected household appliances through simulated gateway telemetry."
+            "First run the upper market decision. Start the centralized 4-second MPC only when you want to execute that market window."
         )
         opt1, opt2, opt3, opt4 = st.columns(4)
         market_mode = opt1.selectbox("Market product", ["Combined", "FCR-N", "aFRR"], help="Combined allows the MPC to split the portfolio across both products.")
         resource_mode = opt2.selectbox("Resource strategy", ["Hybrid portfolio", "Fast only"], help="Fast only uses BESS + EV. Hybrid also activates HVAC and PV for aFRR.")
-        horizon_hours = opt3.slider("MPC horizon (hours)", 4, 48, 24)
-        dispatch_hours = opt4.slider("Dispatch simulation horizon (hours)", 6, min(72, days * 24), min(24, days * 24))
+        horizon_options = [15, 30, 60, 120, 240, 360, 720, 1440, 2880]
+        dispatch_options = [15, 30, 60, 120, 240, 360, 720, 1440, 2880, 4320]
+        max_window_minutes = max(int(days * 24 * 60), 15)
+        horizon_options = [minutes for minutes in horizon_options if minutes <= max_window_minutes]
+        dispatch_options = [minutes for minutes in dispatch_options if minutes <= max_window_minutes]
+        format_window = lambda minutes: f"{minutes} min" if minutes < 60 else f"{minutes // 60:g} h"
+        horizon_minutes = opt3.select_slider("Upper planning horizon", options=horizon_options, value=60 if 60 in horizon_options else horizon_options[0], format_func=format_window)
+        dispatch_minutes = opt4.select_slider("Market simulation window", options=dispatch_options, value=60 if 60 in dispatch_options else dispatch_options[0], format_func=format_window)
+        horizon_hours = horizon_minutes / 60.0
+        dispatch_hours = dispatch_minutes / 60.0
 
         w1, w2, w3 = st.columns(3)
         degradation_w = w1.slider("Degradation weight", 1.0, 60.0, 18.0, 1.0)
         comfort_w = w2.slider("Comfort violation weight", 10.0, 300.0, 120.0, 5.0)
         departure_w = w3.slider("EV departure shortfall weight", 10.0, 300.0, 160.0, 5.0)
+        risk_profiles = {
+            "Balanced P70": {"quantile": 0.70, "buffer": 0.06, "penalty": 450.0},
+            "Conservative P80": {"quantile": 0.80, "buffer": 0.10, "penalty": 700.0},
+            "Defensive P90": {"quantile": 0.90, "buffer": 0.16, "penalty": 1100.0},
+            "Opportunistic P60": {"quantile": 0.60, "buffer": 0.03, "penalty": 300.0},
+        }
+        r1, r2, r3, r4 = st.columns(4)
+        risk_profile = r1.selectbox("Bid risk policy", list(risk_profiles), index=1)
+        risk_defaults = risk_profiles[risk_profile]
+        risk_quantile = r2.slider("Reliable bid quantile", 0.50, 0.95, float(risk_defaults["quantile"]), 0.05)
+        reserve_buffer_pct = r3.slider("Reserve buffer", 0.0, 0.30, float(risk_defaults["buffer"]), 0.01)
+        non_delivery_penalty = r4.slider("Non-delivery cost EUR/MWh", 0.0, 1600.0, float(risk_defaults["penalty"]), 50.0)
+        rr1, rr2 = st.columns(2)
+        activation_uncertainty_w = rr1.slider("Activation uncertainty weight", 0.0, 250.0, 90.0, 5.0)
+        asset_fatigue_w = rr2.slider("Asset fatigue/customer cost weight", 0.0, 120.0, 30.0, 2.0)
         forecaster_plugins = PLUGIN_REGISTRY.list_forecasters()
         optimizer_plugins = PLUGIN_REGISTRY.list_optimizers()
         p1, p2 = st.columns(2)
@@ -1219,14 +1243,33 @@ def main() -> None:
         )
 
         st.caption(
-            f"Current setup: about {int(horizon_hours / (freq_minutes / 60.0))} forecast/control steps per horizon and "
-            f"{int(dispatch_hours / (freq_minutes / 60.0))} MPC intervals over the full dispatch simulation."
+            f"Upper MPC checks {int(max(round(horizon_hours / (freq_minutes / 60.0)), 1))} forecast/control step(s) per horizon and "
+            f"{int(max(round(dispatch_hours / (freq_minutes / 60.0)), 1))} market interval(s) over the selected simulation window. "
+            f"{risk_profile} means the bid is derated toward P{int(risk_quantile * 100)} deliverability before market participation is accepted."
         )
-        run_mpc = st.button("Run MPC dispatch", type="primary")
+        btn_upper, btn_lower = st.columns([1, 1])
+        run_upper_mpc = btn_upper.button("Run upper market decision", type="primary")
+        run_lower_mpc = btn_lower.button("Start centralized 4-second MPC", disabled=not bool(st.session_state.get("mpc_result")) or bool(st.session_state.get("mpc_result", {}).get("history", pd.DataFrame()).empty))
         mpc_progress_bar = st.progress(0.0)
         mpc_progress_text = st.empty()
-        if run_mpc:
-            with st.spinner("Training default MPC forecasters and running receding-horizon optimization..."):
+        base_penalty_weights = {
+            "degradation": degradation_w,
+            "comfort": comfort_w,
+            "departure": departure_w,
+            "risk_quantile": risk_quantile,
+            "reserve_buffer_pct": reserve_buffer_pct,
+            "non_delivery": non_delivery_penalty,
+            "activation_uncertainty": activation_uncertainty_w,
+            "asset_fatigue": asset_fatigue_w,
+        }
+        if run_upper_mpc or run_lower_mpc:
+            execute_lower = bool(run_lower_mpc)
+            spinner_label = (
+                "Starting centralized 4-second lower MPC for the selected market window..."
+                if execute_lower
+                else "Solving risk-aware upper market decision..."
+            )
+            with st.spinner(spinner_label):
                 mpc_tracker = make_progress_tracker(mpc_progress_bar, mpc_progress_text, "MPC dispatch")
                 mpc_tracker(1, 100, "Preparing default forecasting models")
                 models = ensure_default_models(df, int(seed), mpc_forecaster_plugin)
@@ -1245,8 +1288,17 @@ def main() -> None:
                     "resource_mode": resource_mode,
                     "horizon_hours": horizon_hours,
                     "dispatch_hours": dispatch_hours,
+                    "horizon_minutes": horizon_minutes,
+                    "dispatch_minutes": dispatch_minutes,
                     "forecaster_plugin": mpc_forecaster_plugin,
                     "optimizer_plugin": optimizer_plugin,
+                    "risk_profile": risk_profile,
+                    "risk_quantile": risk_quantile,
+                    "reserve_buffer_pct": reserve_buffer_pct,
+                    "non_delivery_penalty": non_delivery_penalty,
+                    "activation_uncertainty_weight": activation_uncertainty_w,
+                    "asset_fatigue_weight": asset_fatigue_w,
+                    "execute_lower_mpc": execute_lower,
                     "inner_controller_mode": "mpc",
                     "inner_dt_seconds": 4,
                     "inner_mpc_horizon_seconds": 20,
@@ -1261,7 +1313,7 @@ def main() -> None:
                     resource_mode=resource_mode,
                     horizon_hours=horizon_hours,
                     dispatch_hours=dispatch_hours,
-                    penalty_weights={"degradation": degradation_w, "comfort": comfort_w, "departure": departure_w},
+                    penalty_weights=base_penalty_weights,
                     preview_4s=preview_4s,
                     optimizer=optimizer,
                     device_roster=device_roster,
@@ -1270,6 +1322,7 @@ def main() -> None:
                     inner_mpc_horizon_seconds=20,
                     rotation_strategy="usage_aware",
                     gateway_mode="simulated_centralized",
+                    execute_lower_mpc=execute_lower,
                     progress_callback=lambda current, total, message: mpc_tracker(
                         8 + int(round((current / max(total, 1)) * 92)),
                         100,
@@ -1277,7 +1330,8 @@ def main() -> None:
                     ),
                 )
                 st.session_state["mpc_result_stale"] = False
-                mpc_tracker(100, 100, "MPC dispatch finished")
+                st.session_state["mpc_phase"] = "lower" if execute_lower else "upper"
+                mpc_tracker(100, 100, "Lower MPC execution finished" if execute_lower else "Upper market decision finished")
         result = st.session_state.get(
             "mpc_result",
             {
@@ -1313,12 +1367,17 @@ def main() -> None:
             inner_mode = result_df["inner_solver_status"].mode().iloc[0] if "inner_solver_status" in result_df and not result_df["inner_solver_status"].empty else "unknown"
             mpc_status_cols[0].metric("Upper MPC status", solver_mode)
             mpc_status_cols[1].metric("MPC intervals", f"{len(result_df):,}")
-            mpc_status_cols[2].metric("4-sec MPC status", inner_mode)
+            mpc_status_cols[2].metric("4-sec MPC status", inner_mode if s.get("execute_lower_mpc") else "Not started")
             mpc_status_cols[3].metric("Mean shortfall", f"{float(result_df.get('shortfall_kw', pd.Series([0.0])).mean()):.1f} kW")
+            risk_cols = st.columns(4)
+            risk_cols[0].metric("Risk policy", st.session_state.get("mpc_config", {}).get("risk_profile", "P80"))
+            risk_cols[1].metric("Accepted market slots", f"{int(s.get('market_gate_participation_intervals', 0)):,}")
+            risk_cols[2].metric("Risk-adjusted profit", fmt_money(float(s.get("risk_adjusted_profit_eur", 0.0))))
+            risk_cols[3].metric("Delivery risk cost", fmt_money(float(s.get("non_delivery_risk_cost_eur", 0.0))))
             st.info(
                 f"MPC workflow: `{st.session_state.get('mpc_config', {}).get('forecaster_plugin', DEFAULT_FORECASTER_PLUGIN)}` forecasts each horizon, "
                 f"`{st.session_state.get('mpc_config', {}).get('optimizer_plugin', DEFAULT_OPTIMIZER_PLUGIN)}` chooses reserve bids and resource dispatch, "
-                "household appliances are selected with usage-aware rotation, and a centralized 20-second/4-second MPC applies gateway-level commands."
+                "the bid is derated by the selected reliability quantile and buffer, and the lower 20-second/4-second MPC runs only after you press Start."
             )
 
             left, right = st.columns([1.45, 1.0])
@@ -1329,6 +1388,29 @@ def main() -> None:
                 dispatch_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["afrr_down_bid_kw"] / 1000.0, name="aFRR down bid", stackgroup="two"))
                 dispatch_fig.update_layout(yaxis_title="MW")
                 st.plotly_chart(apply_chart_style(dispatch_fig, template, height=400, title="MPC reserve schedule"), use_container_width=True)
+                bidirectional_rows = []
+                for resource, fcr_col, up_col, down_col in [
+                    ("BESS", "bess_fcr_kw", "bess_afrr_up_kw", "bess_afrr_down_kw"),
+                    ("EV", "ev_fcr_kw", "ev_afrr_up_kw", "ev_afrr_down_kw"),
+                    ("HVAC", "hvac_fcr_kw", "hvac_afrr_up_kw", "hvac_afrr_down_kw"),
+                ]:
+                    if {fcr_col, up_col, down_col}.issubset(result_df.columns):
+                        bidirectional_rows.append({"Resource": resource, "Direction": "Up", "MW": float((result_df[fcr_col] + result_df[up_col]).mean()) / 1000.0})
+                        bidirectional_rows.append({"Resource": resource, "Direction": "Down", "MW": -float((result_df[fcr_col] + result_df[down_col]).mean()) / 1000.0})
+                if "pv_afrr_down_kw" in result_df:
+                    bidirectional_rows.append({"Resource": "PV", "Direction": "Down", "MW": -float(result_df["pv_afrr_down_kw"].mean()) / 1000.0})
+                if bidirectional_rows:
+                    bidirectional_fig = px.bar(
+                        pd.DataFrame(bidirectional_rows),
+                        x="Resource",
+                        y="MW",
+                        color="Direction",
+                        barmode="relative",
+                        template=template,
+                        title="Risk-adjusted bidirectional resource commitment",
+                    )
+                    bidirectional_fig.update_layout(yaxis_title="MW, up positive / down negative")
+                    st.plotly_chart(apply_chart_style(bidirectional_fig, template, height=320), use_container_width=True)
                 if {"fcrn_capacity_eur_per_mw_h", "afrr_up_capacity_eur_per_mw_h", "afrr_down_capacity_eur_per_mw_h"}.issubset(result_df.columns):
                     price_overlay = make_subplots(specs=[[{"secondary_y": True}]])
                     price_overlay.add_trace(
@@ -1367,8 +1449,17 @@ def main() -> None:
             first_schedule = result["first_schedule"].copy()
             if not first_schedule.empty:
                 first_schedule.index.name = "timestamp"
-                st.caption("First MPC horizon snapshot. This is the forward-looking schedule before only the first control move is applied.")
+                st.caption("First upper MPC horizon snapshot. Revenue, delivery risk, activation uncertainty, and fatigue costs are shown before the lower 4-second MPC is started.")
                 st.dataframe(styled_dataframe(first_schedule.head(12).round(2)), use_container_width=True, height=260)
+
+            if {"market_gate_status", "risk_adjusted_profit_eur", "reserve_buffer_kw"}.issubset(result_df.columns):
+                gate_cols = ["market_gate_status", "market_gate_reason", "risk_adjusted_profit_eur", "reserve_buffer_kw", "non_delivery_risk_cost_eur", "activation_uncertainty_cost_eur", "asset_fatigue_cost_eur"]
+                st.markdown("### Market gate decisions")
+                st.dataframe(
+                    styled_dataframe(result_df[[col for col in gate_cols if col in result_df.columns]].head(24).round(3)),
+                    use_container_width=True,
+                    height=260,
+                )
 
             rule_items = [
                 ("FCR-N minimum 0.1 MW", c["fcr_min_bid_ok"]),
@@ -1500,12 +1591,15 @@ def main() -> None:
             )
 
             contribution_fig = go.Figure()
-            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["bess_up_kw"] / 1000.0, name="BESS", stackgroup="one", line={"color": RESOURCE_COLORS["BESS"]}))
-            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["ev_up_kw"] / 1000.0, name="EV", stackgroup="one", line={"color": RESOURCE_COLORS["EV"]}))
-            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["hvac_up_kw"] / 1000.0, name="HVAC", stackgroup="one", line={"color": RESOURCE_COLORS["HVAC"]}))
-            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["pv_down_kw"] / 1000.0, name="PV down", stackgroup="two", line={"color": RESOURCE_COLORS["PV"]}))
-            contribution_fig.update_layout(yaxis_title="MW")
-            ts_right.plotly_chart(apply_chart_style(contribution_fig, template, height=420, title="Resource contribution stack"), use_container_width=True)
+            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["bess_up_kw"] / 1000.0, name="BESS up", stackgroup="up", line={"color": RESOURCE_COLORS["BESS"]}))
+            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["ev_up_kw"] / 1000.0, name="EV up", stackgroup="up", line={"color": RESOURCE_COLORS["EV"]}))
+            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["hvac_up_kw"] / 1000.0, name="HVAC up", stackgroup="up", line={"color": RESOURCE_COLORS["HVAC"]}))
+            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=-result_df["bess_down_kw"] / 1000.0, name="BESS down", stackgroup="down", line={"color": RESOURCE_COLORS["BESS"], "dash": "dot"}))
+            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=-result_df["ev_down_kw"] / 1000.0, name="EV down", stackgroup="down", line={"color": RESOURCE_COLORS["EV"], "dash": "dot"}))
+            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=-result_df["hvac_down_kw"] / 1000.0, name="HVAC down", stackgroup="down", line={"color": RESOURCE_COLORS["HVAC"], "dash": "dot"}))
+            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=-result_df["pv_down_kw"] / 1000.0, name="PV curtailment", stackgroup="down", line={"color": RESOURCE_COLORS["PV"]}))
+            contribution_fig.update_layout(yaxis_title="MW, up positive / down negative")
+            ts_right.plotly_chart(apply_chart_style(contribution_fig, template, height=420, title="Bidirectional resource contribution"), use_container_width=True)
 
             row1 = st.columns(3)
             row1[0].metric("Capacity revenue", fmt_money(s["capacity_revenue_eur"]))
@@ -1607,6 +1701,8 @@ def main() -> None:
                         hide_index=True,
                         height=310,
                     )
+            else:
+                st.info("The upper market decision is available. Start the centralized 4-second MPC from the MPC tab to generate requested-vs-delivered tracking and gateway commands.")
 
             st.markdown("### What-if scenario playground")
             wf1, wf2, wf3 = st.columns(3)
@@ -1653,7 +1749,16 @@ def main() -> None:
                         mpc_config["resource_mode"],
                         mpc_config["horizon_hours"],
                         mpc_config["dispatch_hours"],
-                        {"degradation": degradation_w, "comfort": comfort_w, "departure": departure_w},
+                        {
+                            "degradation": degradation_w,
+                            "comfort": comfort_w,
+                            "departure": departure_w,
+                            "risk_quantile": float(mpc_config.get("risk_quantile", 0.80)),
+                            "reserve_buffer_pct": float(mpc_config.get("reserve_buffer_pct", 0.08)),
+                            "non_delivery": float(mpc_config.get("non_delivery_penalty", 650.0)),
+                            "activation_uncertainty": float(mpc_config.get("activation_uncertainty_weight", 90.0)),
+                            "asset_fatigue": float(mpc_config.get("asset_fatigue_weight", 30.0)),
+                        },
                         preview_4s=preview_4s,
                         optimizer=whatif_optimizer,
                         device_roster=device_roster,
@@ -1662,6 +1767,7 @@ def main() -> None:
                         inner_mpc_horizon_seconds=int(mpc_config.get("inner_mpc_horizon_seconds", 20)),
                         rotation_strategy=mpc_config.get("rotation_strategy", "usage_aware"),
                         gateway_mode=mpc_config.get("gateway_mode", "simulated_centralized"),
+                        execute_lower_mpc=bool(mpc_config.get("execute_lower_mpc", True)),
                         progress_callback=lambda current, total, message: whatif_tracker(
                             18 + int(round((current / max(total, 1)) * 76)),
                             100,

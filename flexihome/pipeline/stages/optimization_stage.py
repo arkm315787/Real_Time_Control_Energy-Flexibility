@@ -53,8 +53,8 @@ class OptimizationStage(BasePipelineStage):
             fleet_meta=fleet_metadata,
             market_mode=self.config.market_mode,
             resource_mode=self.config.resource_mode,
-            horizon_hours=int(self.config.horizon_hours),
-            dispatch_hours=int(self.config.dispatch_hours),
+            horizon_hours=float(self.config.horizon_hours),
+            dispatch_hours=float(self.config.dispatch_hours),
             penalty_weights=self.config.penalty_weights(),
             preview_4s=context.artifacts.get("preview_4s"),
             optimizer=optimizer,
@@ -64,6 +64,7 @@ class OptimizationStage(BasePipelineStage):
             inner_mpc_horizon_seconds=int(self.config.inner_mpc_horizon_seconds),
             rotation_strategy=self.config.rotation_strategy,
             gateway_mode=self.config.gateway_mode,
+            execute_lower_mpc=bool(self.config.execute_lower_mpc),
         )
         result.setdefault("summary", {})["forecaster_plugin"] = self.config.forecaster_plugin
         result.setdefault("summary", {})["optimizer_plugin"] = self.config.optimizer_plugin

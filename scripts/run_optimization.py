@@ -37,8 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run FlexiHome MPC/MILP optimization outside the dashboard.")
     parser.add_argument("--market-mode", choices=["Combined", "FCR-N", "aFRR"], default="Combined")
     parser.add_argument("--resource-mode", choices=["Hybrid portfolio", "Fast only"], default="Hybrid portfolio")
-    parser.add_argument("--horizon-hours", type=int, default=24)
-    parser.add_argument("--dispatch-hours", type=int, default=24)
+    parser.add_argument("--horizon-hours", type=float, default=24)
+    parser.add_argument("--dispatch-hours", type=float, default=24)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--start-date", default="2026-01-15")
     parser.add_argument("--days", type=int, default=7)
@@ -53,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inner-mpc-horizon-seconds", type=int, default=20)
     parser.add_argument("--rotation-strategy", choices=["usage_aware"], default="usage_aware")
     parser.add_argument("--gateway-mode", choices=["simulated_centralized"], default="simulated_centralized")
+    parser.add_argument("--upper-only", action="store_true", help="Run only the risk-aware upper market decision without lower 4-second MPC execution.")
+    parser.add_argument("--risk-quantile", type=float, default=0.80)
+    parser.add_argument("--reserve-buffer-pct", type=float, default=0.08)
+    parser.add_argument("--non-delivery-penalty", type=float, default=650.0)
+    parser.add_argument("--activation-uncertainty-weight", type=float, default=90.0)
+    parser.add_argument("--asset-fatigue-weight", type=float, default=30.0)
     parser.add_argument("--output-root", default="runs")
     return parser.parse_args()
 
@@ -113,7 +119,16 @@ def main() -> None:
         resource_mode=args.resource_mode,
         horizon_hours=args.horizon_hours,
         dispatch_hours=args.dispatch_hours,
-        penalty_weights={"degradation": 18.0, "comfort": 120.0, "departure": 160.0},
+        penalty_weights={
+            "degradation": 18.0,
+            "comfort": 120.0,
+            "departure": 160.0,
+            "risk_quantile": args.risk_quantile,
+            "reserve_buffer_pct": args.reserve_buffer_pct,
+            "non_delivery": args.non_delivery_penalty,
+            "activation_uncertainty": args.activation_uncertainty_weight,
+            "asset_fatigue": args.asset_fatigue_weight,
+        },
         preview_4s=bundle["preview_4s"],
         optimizer=optimizer,
         device_roster=bundle.get("device_roster"),
@@ -122,6 +137,7 @@ def main() -> None:
         inner_mpc_horizon_seconds=args.inner_mpc_horizon_seconds,
         rotation_strategy=args.rotation_strategy,
         gateway_mode=args.gateway_mode,
+        execute_lower_mpc=not args.upper_only,
     )
 
     run_dir = new_run_dir(args.output_root, "optimization")
@@ -151,6 +167,10 @@ def main() -> None:
             "inner_mpc_horizon_seconds": args.inner_mpc_horizon_seconds,
             "rotation_strategy": args.rotation_strategy,
             "gateway_mode": args.gateway_mode,
+            "execute_lower_mpc": not args.upper_only,
+            "risk_quantile": args.risk_quantile,
+            "reserve_buffer_pct": args.reserve_buffer_pct,
+            "non_delivery_penalty": args.non_delivery_penalty,
             "market_mode": args.market_mode,
             "resource_mode": args.resource_mode,
             "horizon_hours": args.horizon_hours,

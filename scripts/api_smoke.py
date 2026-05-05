@@ -96,6 +96,8 @@ def main() -> None:
             raise SystemExit(f"Expected non-empty {key} rows")
     if summary.get("inner_controller_mode") != "mpc":
         raise SystemExit("Expected centralized lower controller mode to be mpc")
+    if "risk_adjusted_profit_eur" not in summary or "non_delivery_risk_cost_eur" not in summary:
+        raise SystemExit("Expected risk-aware bidding fields in optimization summary")
 
 
 if __name__ == "__main__":

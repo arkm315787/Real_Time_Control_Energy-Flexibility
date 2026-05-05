@@ -270,6 +270,21 @@ class CentralizedVPPController:
         aggregated = self._aggregate_interval(row, tracking_df)
         return aggregated, tracking_df, upper_schedule, command_summary
 
+    def select_upper_schedule(
+        self,
+        row: pd.Series,
+        plan: Dict[str, float],
+        interval_index: int,
+        resource_mode: str,
+    ) -> pd.DataFrame:
+        selected = self._select_upper_devices(row, plan, interval_index, resource_mode)
+        if selected.empty:
+            return selected.reset_index(drop=True)
+        upper_schedule = selected.reset_index(drop=True)
+        upper_schedule.insert(0, "timestamp", row.name)
+        upper_schedule.insert(1, "outer_interval", interval_index)
+        return upper_schedule
+
     def contribution_frames(self, command_summary: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         if command_summary is None or command_summary.empty:
             empty = pd.DataFrame()

@@ -32,6 +32,8 @@ Forecasting models
   - reserve bidding
   - aggregate resource allocation
   - revenue, degradation, comfort, and state penalties
+  - response-time eligibility for each market product
+  - risk quantile, reserve buffer, non-delivery, activation uncertainty, and asset fatigue costs
         |
         v
 Usage-aware household/appliance selection
@@ -49,7 +51,7 @@ Centralized 4-second lower MPC
   - requested vs delivered reserve trace
 ```
 
-The lower layer is implemented as MPC, not a reactive tracking controller. If the lower solver cannot solve an interval, the cycle is logged with failed status and shortfall. The controller does not switch to a greedy or reactive fallback path.
+The lower layer is implemented as MPC, not a reactive tracking controller. The dashboard does not run it automatically: first run the upper market decision, then start the centralized 4-second MPC when you want to execute the selected market window. If the lower solver cannot solve an interval, the cycle is logged with failed status and shortfall. The controller does not switch to a greedy or reactive fallback path.
 
 ## Implemented Plan Status
 
@@ -66,6 +68,8 @@ The lower layer is implemented as MPC, not a reactive tracking controller. If th
 | Export contribution CSVs | Implemented | CLI and pipeline serialization write the new MPC and contribution artifacts. |
 | Dashboard Apply Scenario form | Implemented | Scenario controls are inside an Apply form, the last applied portfolio bundle is reused across reruns, and stale MPC results are marked when inputs change. |
 | Dashboard MPC visualizations | Implemented | Upper selection, appliance mix, fatigue, lower reserve tracking, allocation, diagnostics, and gateway command tables are available. |
+| Risk-aware market bidding | Implemented for MVP | Upper MPC derates availability by bid quantile and buffer, prices non-delivery risk, activation uncertainty, and fatigue, and marks market slots as Participate/Wait. |
+| Optional lower MPC execution | Implemented | Dashboard upper-market decisions can be reviewed before the lower 4-second MPC is started. |
 | CI smoke coverage | Implemented | CI runs API, plugin, pipeline, Airflow, forecasting, optimization, centralized MPC, and dashboard scenario-apply smoke tests. |
 
 ## Key Modules
@@ -137,6 +141,13 @@ The dashboard is designed as an operational development tool, not a marketing pa
 
 Scenario controls are applied through an `Apply Scenario` form. Changing sliders does not immediately regenerate the portfolio; the dashboard keeps showing the last applied scenario, reuses the last applied portfolio bundle across normal reruns, and marks MPC results stale when inputs change.
 
+The MPC tab now follows a market-operator workflow:
+
+- choose a market product, dispatch window, planning horizon, and risk policy
+- run the risk-aware upper market decision
+- inspect bidirectional BESS/EV/HVAC/PV commitments, risk-adjusted profit, buffers, and Participate/Wait decisions
+- start the centralized 4-second lower MPC only when the selected market window should be executed
+
 ## API Defaults
 
 The optimization API defaults are aligned with the centralized MPC plan:
@@ -147,7 +158,10 @@ The optimization API defaults are aligned with the centralized MPC plan:
   "inner_dt_seconds": 4,
   "inner_mpc_horizon_seconds": 20,
   "rotation_strategy": "usage_aware",
-  "gateway_mode": "simulated_centralized"
+  "gateway_mode": "simulated_centralized",
+  "execute_lower_mpc": true,
+  "risk_quantile": 0.8,
+  "reserve_buffer_pct": 0.08
 }
 ```
 
@@ -222,6 +236,7 @@ Core local checks:
 ```cmd
 python -m py_compile app.py flexihome/core/engine.py flexihome/core/centralized_controller.py flexihome/api/services.py
 python scripts\centralized_mpc_smoke.py
+python scripts\risk_aware_mpc_smoke.py
 python scripts\dashboard_scenario_smoke.py
 python scripts\api_smoke.py
 python scripts\plugin_smoke.py
@@ -235,6 +250,7 @@ GitHub CI also runs:
 - API smoke test
 - plugin smoke test
 - centralized 4-second MPC smoke test
+- risk-aware upper MPC smoke test
 - dashboard scenario apply smoke test
 - pipeline smoke test
 - Airflow DAG smoke test

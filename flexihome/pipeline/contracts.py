@@ -160,13 +160,19 @@ class PipelineRunConfig:
     inner_mpc_horizon_seconds: int = 20
     rotation_strategy: str = "usage_aware"
     gateway_mode: str = "simulated_centralized"
+    execute_lower_mpc: bool = True
     market_mode: str = "Combined"
     resource_mode: str = "Hybrid portfolio"
-    horizon_hours: int = 1
-    dispatch_hours: int = 1
+    horizon_hours: float = 1
+    dispatch_hours: float = 1
     degradation_weight: float = 18.0
     comfort_weight: float = 120.0
     departure_weight: float = 160.0
+    risk_quantile: float = 0.80
+    reserve_buffer_pct: float = 0.08
+    non_delivery_penalty: float = 650.0
+    activation_uncertainty_weight: float = 90.0
+    asset_fatigue_weight: float = 30.0
     output_root: str = "runs"
     forecast_targets: Sequence[str] = field(default_factory=lambda: tuple(SUPPORTED_MPC_TARGETS))
     predictors: Sequence[str] = field(default_factory=lambda: tuple(DEFAULT_MPC_PREDICTORS))
@@ -191,6 +197,7 @@ class PipelineRunConfig:
             "scarcity": self.scarcity,
             "freq_minutes": self.freq_minutes,
             "hvac_mode": self.hvac_mode,
+            "hvac_response_s": self.hvac_response_s,
             "market_data_mode": self.market_data_mode,
             "market_lookback_days": self.market_lookback_days,
             "persist_market_data": self.persist_market_data,
@@ -201,6 +208,11 @@ class PipelineRunConfig:
             "degradation": float(self.degradation_weight),
             "comfort": float(self.comfort_weight),
             "departure": float(self.departure_weight),
+            "risk_quantile": float(self.risk_quantile),
+            "reserve_buffer_pct": float(self.reserve_buffer_pct),
+            "non_delivery": float(self.non_delivery_penalty),
+            "activation_uncertainty": float(self.activation_uncertainty_weight),
+            "asset_fatigue": float(self.asset_fatigue_weight),
         }
 
     def to_dict(self) -> Dict[str, Any]:

@@ -49,6 +49,8 @@ class PuLPOptimizer(BaseOptimizer):
             "EV energy window and departure slack",
             "HVAC comfort band slack",
             "FCR-N and aFRR market enablement",
+            "Response-time eligibility for market products",
+            "Risk quantile derating and reserve buffer",
             "Resource-mode gating for fast-only portfolios",
-            "Capacity, activation, degradation, and comfort objective terms",
+            "Capacity, activation, degradation, comfort, non-delivery, activation-risk, and fatigue objective terms",
         ]

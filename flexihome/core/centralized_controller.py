@@ -65,6 +65,8 @@ class InnerControllerConfig:
     gateway_mode: str = "simulated_centralized"
     max_devices_per_type: int = 100000
     tracking_tolerance_pct: float = 0.10
+    telemetry_error_pct: float = 0.004
+    meter_quantization_kw: float = 0.1
 
     @property
     def horizon_steps(self) -> int:
@@ -260,7 +262,11 @@ class CentralizedVPPController:
                 command_by_type = solution["command_by_type"]
 
             commands = self._apportion_commands(selected, available, delivered_by_type, target_by_type=command_by_type)
-            delivered = float(solution.get("predicted_power_kw", 0.0))
+            ideal_delivered = float(solution.get("predicted_power_kw", 0.0))
+            measured_by_type = self._metered_delivery(ts, delivered_by_type, request_now)
+            delivered = float(sum(measured_by_type.values()))
+            if solution["status"] == "Optimal":
+                self.pool_actual_dispatch.update(measured_by_type)
             self._apply_device_commands(commands, command_accumulator)
             tracking_error = delivered - request_now
             self.last_abs_tracking_error_kw = abs(tracking_error)
@@ -286,6 +292,8 @@ class CentralizedVPPController:
                     "delivered_down_kw": max(-delivered, 0.0),
                     "fleet_power_before_kw": float(solution.get("actual_before_kw", 0.0)),
                     "fleet_power_after_kw": delivered,
+                    "ideal_delivered_kw": ideal_delivered,
+                    "telemetry_error_kw": delivered - ideal_delivered,
                     "target_command_kw": float(solution.get("target_command_kw", 0.0)),
                     "optimized_net_load_kw": float(row["net_load_baseline_kw"] - max(delivered, 0.0) + max(-delivered, 0.0)),
                     "baseline_net_load_kw": float(row["net_load_baseline_kw"]),
@@ -306,13 +314,13 @@ class CentralizedVPPController:
                     "control_deadline_ms": float(self.config.dt_seconds * 1000.0),
                     "control_deadline_met": bool(control_latency_ms <= self.config.dt_seconds * 1000.0),
                     "optimization_strategy": str(solution.get("optimization_strategy", "proportional_allocation")),
-                    "bess_up_kw": max(delivered_by_type.get("BESS", 0.0), 0.0),
-                    "bess_down_kw": max(-delivered_by_type.get("BESS", 0.0), 0.0),
-                    "ev_up_kw": max(delivered_by_type.get("EV", 0.0), 0.0),
-                    "ev_down_kw": max(-delivered_by_type.get("EV", 0.0), 0.0),
-                    "hvac_up_kw": max(delivered_by_type.get("HVAC", 0.0), 0.0),
-                    "hvac_down_kw": max(-delivered_by_type.get("HVAC", 0.0), 0.0),
-                    "pv_down_kw": max(-delivered_by_type.get("PV", 0.0), 0.0),
+                    "bess_up_kw": max(measured_by_type.get("BESS", 0.0), 0.0),
+                    "bess_down_kw": max(-measured_by_type.get("BESS", 0.0), 0.0),
+                    "ev_up_kw": max(measured_by_type.get("EV", 0.0), 0.0),
+                    "ev_down_kw": max(-measured_by_type.get("EV", 0.0), 0.0),
+                    "hvac_up_kw": max(measured_by_type.get("HVAC", 0.0), 0.0),
+                    "hvac_down_kw": max(-measured_by_type.get("HVAC", 0.0), 0.0),
+                    "pv_down_kw": max(-measured_by_type.get("PV", 0.0), 0.0),
                     "selected_devices": int(len(selected)),
                     "inner_mpc_horizon_seconds": int(self.config.horizon_seconds),
                 }
@@ -767,6 +775,28 @@ class CentralizedVPPController:
             actual_before = float(actual_before_by_type.get(device_type, 0.0))
             delivered[device_type] = actual_before + alpha * (command - actual_before)
         return delivered
+
+    def _metered_delivery(self, timestamp: pd.Timestamp, delivered_by_type: Dict[str, float], request_now: float) -> Dict[str, float]:
+        if abs(float(request_now)) <= 1e-9:
+            return {device_type: 0.0 for device_type in DEVICE_ORDER}
+        ts = pd.Timestamp(timestamp)
+        seconds = ts.hour * 3600.0 + ts.minute * 60.0 + ts.second + ts.microsecond / 1_000_000.0
+        base_error = max(float(self.config.telemetry_error_pct), 0.0)
+        quantization = max(float(self.config.meter_quantization_kw), 0.0)
+        response_weight = {"BESS": 0.55, "EV": 0.80, "HVAC": 1.45, "PV": 0.95}
+        measured: Dict[str, float] = {}
+        for idx, device_type in enumerate(DEVICE_ORDER, start=1):
+            value = float(delivered_by_type.get(device_type, 0.0))
+            if abs(value) <= 1e-9:
+                measured[device_type] = 0.0
+                continue
+            ripple = 0.65 * np.sin(seconds / 19.0 + idx * 0.91) + 0.35 * np.cos(seconds / 43.0 + idx * 1.73)
+            factor = 1.0 + base_error * response_weight[device_type] * ripple
+            metered = value * factor
+            if quantization > 0.0:
+                metered = round(metered / quantization) * quantization
+            measured[device_type] = float(metered)
+        return measured
 
     def _allocate_tracking_delta(
         self,

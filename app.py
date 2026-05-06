@@ -1990,6 +1990,8 @@ def main() -> None:
                     "delivered_signed_kw",
                     "delivered_up_kw",
                     "delivered_down_kw",
+                    "ideal_delivered_kw",
+                    "telemetry_error_kw",
                     "tracking_error_kw",
                     "tracking_tolerance_kw",
                     "active_capacity_kw",

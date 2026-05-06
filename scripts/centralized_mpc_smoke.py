@@ -103,6 +103,8 @@ def main() -> None:
         "lower_tracking_mode",
         "fleet_power_before_kw",
         "fleet_power_after_kw",
+        "ideal_delivered_kw",
+        "telemetry_error_kw",
         "target_command_kw",
         "tracking_delta_kw",
         "tracking_error_kw",
@@ -130,6 +132,10 @@ def main() -> None:
         raise SystemExit("Centralized MPC trace missing solver diagnostics.")
     if summary["tracking_samples"] != len(tracking):
         raise SystemExit("Interval summary did not preserve tracking sample count.")
+    if tracking["telemetry_error_kw"].abs().max() <= 0.0:
+        raise SystemExit("Lower controller should report measured telemetry error instead of perfect predicted delivery.")
+    if tracking["tracking_error_kw"].abs().max() <= 0.0:
+        raise SystemExit("Lower controller should expose nonzero residual tracking error from the measured plant.")
 
     buffer_plan = dict(plan)
     buffer_plan["hvac_fcr_kw"] = 80.0

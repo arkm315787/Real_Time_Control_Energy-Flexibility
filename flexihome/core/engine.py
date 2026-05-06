@@ -1140,18 +1140,30 @@ def _market_gate_decision(plan: Dict[str, float], market_mode: str) -> Dict[str,
     )
     afrr_bid = max(afrr_up, afrr_down)
     risk_profit = float(plan.get("risk_adjusted_profit_eur", 0.0))
-    fcr_ok = fcr_bid >= FINGRID_RULES["FCR-N"]["min_bid_kw"] if market_mode in {"FCR-N", "Combined"} else True
-    afrr_ok = afrr_bid >= FINGRID_RULES["aFRR"]["min_bid_kw"] if market_mode in {"aFRR", "Combined"} else True
+    fcr_enabled = market_mode in {"FCR-N", "Combined"}
+    afrr_enabled = market_mode in {"aFRR", "Combined"}
+    fcr_ok = fcr_bid >= FINGRID_RULES["FCR-N"]["min_bid_kw"] if fcr_enabled else False
+    afrr_ok = afrr_bid >= FINGRID_RULES["aFRR"]["min_bid_kw"] if afrr_enabled else False
     profitable = risk_profit >= 0.0
-    if fcr_ok and afrr_ok and profitable and (fcr_bid + afrr_bid > 1.0):
+    if market_mode == "FCR-N":
+        product_ok = fcr_ok
+        size_reason = "Reliable FCR-N bid is below the selected market minimum size."
+    elif market_mode == "aFRR":
+        product_ok = afrr_ok
+        size_reason = "Reliable aFRR bid is below the selected market minimum size."
+    else:
+        product_ok = fcr_ok or afrr_ok
+        size_reason = "Reliable FCR-N and aFRR bids are both below their market minimum sizes."
+
+    if product_ok and profitable and (fcr_bid + afrr_bid > 1.0):
         status = "Participate"
         reason = "Risk-adjusted bid clears product size and expected profit gates."
     elif not profitable:
         status = "Wait"
         reason = "Expected revenue is lower than risk, fatigue, and delivery-cost allowance."
-    elif not fcr_ok or not afrr_ok:
+    elif not product_ok:
         status = "Wait"
-        reason = "Reliable bid is below the selected market minimum size."
+        reason = size_reason
     else:
         status = "Wait"
         reason = "No reliable flexibility bid is available for this slot."

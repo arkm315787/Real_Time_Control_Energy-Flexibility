@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 from flexihome.core.engine import (
     SUPPORTED_MPC_TARGETS,
     _available_up_down,
+    _market_gate_decision,
     generate_synthetic_portfolio,
     run_lower_mpc_from_upper_result,
     run_mpc_controller,
@@ -164,6 +165,16 @@ def main() -> None:
     )
     if avail["bess_down_av"] > 1e-6:
         raise SystemExit("A full BESS must not provide downward charging headroom.")
+
+    afrr_only_gate = _market_gate_decision({"bess_afrr_up_kw": 1200.0, "risk_adjusted_profit_eur": 5.0}, "Combined")
+    if afrr_only_gate["market_gate_status"] != "Participate":
+        raise SystemExit("Combined market mode must allow an aFRR-only bid that clears the aFRR minimum.")
+    fcr_only_gate = _market_gate_decision({"bess_fcr_kw": 120.0, "risk_adjusted_profit_eur": 1.0}, "Combined")
+    if fcr_only_gate["market_gate_status"] != "Participate":
+        raise SystemExit("Combined market mode must allow an FCR-only bid that clears the FCR-N minimum.")
+    tiny_gate = _market_gate_decision({"bess_fcr_kw": 20.0, "bess_afrr_up_kw": 200.0, "risk_adjusted_profit_eur": 5.0}, "Combined")
+    if tiny_gate["market_gate_status"] != "Wait":
+        raise SystemExit("Combined market mode must still reject bids below both product minimum sizes.")
 
     print("risk-aware MPC smoke checks passed")
     print(f"P50 mean bid kW: {p50_bid:.2f}")

@@ -53,6 +53,7 @@ def main() -> None:
         'button("Run Upper MPC Layer"',
         'button("Start Market Pressure"',
         'button("Activate Lower MPC"',
+        'button("Stop Market"',
         'run_lower_mpc_from_upper_result(',
         "upper_socket_ready",
         "upper_socket_metrics(",

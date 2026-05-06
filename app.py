@@ -1448,7 +1448,7 @@ def main() -> None:
         live_market_session = st.session_state.get("live_market_session", {})
         market_status = live_market_status(live_market_session)
         market_delay_seconds = st.slider("Market start delay after pressure signal (seconds)", 0, 120, 10, 1)
-        btn_upper, btn_market, btn_lower = st.columns([1, 1, 1])
+        btn_upper, btn_market, btn_lower, btn_stop = st.columns([1, 1, 1, 1])
         existing_upper_result = st.session_state.get("upper_mpc_result", st.session_state.get("mpc_result", {}))
         existing_history = existing_upper_result.get("history", pd.DataFrame()) if isinstance(existing_upper_result, dict) else pd.DataFrame()
         upper_market_ready = (
@@ -1471,6 +1471,7 @@ def main() -> None:
         run_upper_mpc = btn_upper.button("Run Upper MPC Layer", type="primary")
         start_market_pressure = btn_market.button("Start Market Pressure", disabled=not upper_socket_ready or market_status["status"] in {"scheduled", "live"})
         activate_lower_mpc = btn_lower.button("Activate Lower MPC", disabled=not market_started or not upper_socket_ready)
+        stop_live_market = btn_stop.button("Stop Market", disabled=not bool(live_market_session))
         if upper_market_ready and not socket_metrics["ready"]:
             st.warning(
                 "No executable market period is available yet: "
@@ -1580,6 +1581,13 @@ def main() -> None:
             st.session_state["lower_mpc_armed"] = False
             st.session_state.pop("live_lower_result", None)
             st.session_state["mpc_phase"] = "market_scheduled"
+            st.rerun()
+
+        if stop_live_market:
+            st.session_state.pop("live_market_session", None)
+            st.session_state.pop("lower_mpc_armed", None)
+            st.session_state.pop("live_lower_result", None)
+            st.session_state["mpc_phase"] = "upper" if upper_market_ready else "idle"
             st.rerun()
 
         if activate_lower_mpc:
@@ -1722,6 +1730,29 @@ def main() -> None:
                     f"mean buffer = {float(upper_socket_view_metrics['mean_buffer_kw']):.1f} kW. "
                     "A flat lower MPC plot is expected until the upper market decision clears nonzero reserve."
                 )
+            debug_cols = [
+                "market_gate_status",
+                "market_gate_reason",
+                "fcr_bid_kw",
+                "afrr_up_bid_kw",
+                "afrr_down_bid_kw",
+                "capacity_revenue_eur",
+                "activation_revenue_eur",
+                "degradation_cost_eur",
+                "comfort_penalty_eur",
+                "non_delivery_risk_cost_eur",
+                "activation_uncertainty_cost_eur",
+                "asset_fatigue_cost_eur",
+                "risk_adjusted_profit_eur",
+                "fcrn_capacity_eur_per_mw_h",
+                "afrr_up_capacity_eur_per_mw_h",
+                "afrr_down_capacity_eur_per_mw_h",
+            ]
+            available_debug_cols = [col for col in debug_cols if col in upper_plot_df.columns]
+            if available_debug_cols:
+                with st.expander("Upper MPC market debug", expanded=not upper_socket_view_metrics["ready"]):
+                    st.caption("This is the upper-layer market gate audit for each interval. It shows whether the block is caused by zero bids, minimum bid size, or risk-adjusted economics.")
+                    st.dataframe(styled_dataframe(upper_plot_df[available_debug_cols].head(24).round(3)), use_container_width=True, height=280)
             st.info(
                 f"MPC workflow: `{st.session_state.get('mpc_config', {}).get('forecaster_plugin', DEFAULT_FORECASTER_PLUGIN)}` forecasts each horizon, "
                 f"`{st.session_state.get('mpc_config', {}).get('optimizer_plugin', DEFAULT_OPTIMIZER_PLUGIN)}` chooses reserve bids and resource dispatch, "

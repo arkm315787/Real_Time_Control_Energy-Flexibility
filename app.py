@@ -47,6 +47,7 @@ from flexihome.core.engine import (
     sensitivity_scan,
     serialize_forecast_spec,
 )
+from flexihome.core.market_simulator import MarketSimulator, MarketSimulatorConfig
 from flexihome.plugins import DEFAULT_FORECASTER_PLUGIN, DEFAULT_OPTIMIZER_PLUGIN, register_default_plugins
 
 PLUGIN_REGISTRY = register_default_plugins(get_global_registry())
@@ -524,6 +525,54 @@ def build_live_market_feed(
             feed[col] = default
         feed[col] = feed[col].fillna(default)
     return feed[columns]
+
+
+def sync_market_simulator_feed(
+    preview_4s: pd.DataFrame,
+    upper_result: Dict[str, object],
+    session: Dict[str, object] | None,
+    duration_seconds: int,
+    dt_seconds: int = 4,
+    now_s: float | None = None,
+) -> pd.DataFrame:
+    feed = build_live_market_feed(preview_4s, upper_result, duration_seconds, dt_seconds=dt_seconds)
+    if not session:
+        return feed
+
+    start_at = float(session.get("start_at_wall_s", 0.0))
+    simulator = st.session_state.get("market_simulator")
+    if not isinstance(simulator, MarketSimulator) or float(getattr(simulator, "start_wall_time_s", 0.0) or 0.0) != start_at:
+        simulator = MarketSimulator(
+            preview_signals=preview_4s,
+            config=MarketSimulatorConfig(dt_seconds=int(dt_seconds)),
+            start_wall_time_s=start_at,
+        )
+        st.session_state["market_simulator"] = simulator
+        st.session_state["live_market_ticks"] = []
+
+    signal = simulator.get_current_signal(float(time.time() if now_s is None else now_s))
+    ticks: List[Dict[str, object]] = list(st.session_state.get("live_market_ticks", []))
+    if signal is not None:
+        tick_index = int(signal.get("tick_index", 0))
+        payload = {
+            "tick_index": tick_index,
+            "frequency_hz": float(signal.get("frequency_hz", 50.0)),
+            "fcr_signal_norm": float(signal.get("fcr_signal_norm", 0.0)),
+            "afrr_signal_norm": float(signal.get("afrr_signal_norm", 0.0)),
+            "wall_elapsed_seconds": float(signal.get("wall_elapsed_seconds", 0.0)),
+        }
+        ticks = [tick for tick in ticks if int(tick.get("tick_index", -1)) != tick_index]
+        ticks.append(payload)
+        ticks = sorted(ticks, key=lambda tick: int(tick.get("tick_index", 0)))
+        st.session_state["live_market_ticks"] = ticks
+
+    for tick in ticks:
+        tick_index = int(tick.get("tick_index", -1))
+        if tick_index < 0 or tick_index >= len(feed):
+            continue
+        for col in ["frequency_hz", "fcr_signal_norm", "afrr_signal_norm"]:
+            feed.iat[tick_index, feed.columns.get_loc(col)] = float(tick.get(col, feed.iloc[tick_index][col]))
+    return feed
 
 
 def data_quality_figure(df: pd.DataFrame, columns: List[str], template: str) -> go.Figure:
@@ -1461,6 +1510,8 @@ def main() -> None:
         upper_socket_ready = bool(upper_market_ready and socket_metrics["ready"])
         if live_market_session and upper_market_ready and not socket_metrics["ready"]:
             st.session_state.pop("live_market_session", None)
+            st.session_state.pop("market_simulator", None)
+            st.session_state.pop("live_market_ticks", None)
             st.session_state.pop("lower_mpc_armed", None)
             st.session_state.pop("live_lower_result", None)
             st.session_state["mpc_phase"] = "upper"
@@ -1554,6 +1605,8 @@ def main() -> None:
                 )
                 st.session_state["upper_mpc_result"] = st.session_state["mpc_result"]
                 st.session_state.pop("live_market_session", None)
+                st.session_state.pop("market_simulator", None)
+                st.session_state.pop("live_market_ticks", None)
                 st.session_state.pop("lower_mpc_armed", None)
                 st.session_state.pop("live_lower_result", None)
                 st.session_state["mpc_result_stale"] = False
@@ -1578,6 +1631,12 @@ def main() -> None:
                 "market_mode": market_mode,
                 "resource_mode": resource_mode,
             }
+            st.session_state["market_simulator"] = MarketSimulator(
+                preview_signals=preview_4s,
+                config=MarketSimulatorConfig(dt_seconds=4),
+                start_wall_time_s=now_s + float(market_delay_seconds),
+            )
+            st.session_state["live_market_ticks"] = []
             st.session_state["lower_mpc_armed"] = False
             st.session_state.pop("live_lower_result", None)
             st.session_state["mpc_phase"] = "market_scheduled"
@@ -1585,6 +1644,8 @@ def main() -> None:
 
         if stop_live_market:
             st.session_state.pop("live_market_session", None)
+            st.session_state.pop("market_simulator", None)
+            st.session_state.pop("live_market_ticks", None)
             st.session_state.pop("lower_mpc_armed", None)
             st.session_state.pop("live_lower_result", None)
             st.session_state["mpc_phase"] = "upper" if upper_market_ready else "idle"
@@ -1601,6 +1662,17 @@ def main() -> None:
         live_market_session = st.session_state.get("live_market_session", {})
         market_status = live_market_status(live_market_session)
         lower_armed = bool(st.session_state.get("lower_mpc_armed", False))
+        runtime_market_feed = (
+            sync_market_simulator_feed(
+                preview_4s,
+                st.session_state.get("upper_mpc_result", {}),
+                live_market_session,
+                int(float(live_market_session.get("duration_seconds", dispatch_minutes * 60))) if live_market_session else int(dispatch_minutes * 60),
+                dt_seconds=4,
+            )
+            if live_market_session
+            else preview_4s
+        )
         if live_market_session and market_status["status"] == "live" and st.session_state.get("mpc_phase") in {"market_scheduled", "lower_waiting"}:
             st.session_state["mpc_phase"] = "market_live" if not lower_armed else "lower_waiting"
         if lower_armed and not upper_socket_ready:
@@ -1624,7 +1696,7 @@ def main() -> None:
                 fleet_meta=fleet_meta,
                 market_mode=str(live_market_session.get("market_mode", market_mode)),
                 resource_mode=str(live_market_session.get("resource_mode", resource_mode)),
-                preview_4s=preview_4s,
+                preview_4s=runtime_market_feed,
                 device_roster=device_roster,
                 inner_controller_mode="mpc",
                 inner_dt_seconds=4,
@@ -1651,12 +1723,7 @@ def main() -> None:
             live_cols[2].metric("Market elapsed", f"{float(market_status['elapsed_seconds']):.0f} s")
             lower_ticks = len(result_frame(st.session_state.get("live_lower_result", {}), "tracking_4s"))
             live_cols[3].metric("Lower MPC", f"Live ({lower_ticks} ticks)" if st.session_state.get("live_lower_result") else ("Armed" if lower_armed else "Waiting"))
-            market_feed = build_live_market_feed(
-                preview_4s,
-                st.session_state.get("upper_mpc_result", {}),
-                int(float(live_market_session.get("duration_seconds", dispatch_minutes * 60))),
-                dt_seconds=4,
-            )
+            market_feed = runtime_market_feed
             visible_market_feed = live_visible_frame(market_feed, live_market_session)
             if visible_market_feed.empty and market_status["status"] == "scheduled":
                 st.info("Market pressure countdown is active. The live market plot will start at the scheduled wall-clock time.")
@@ -1992,6 +2059,11 @@ def main() -> None:
                     "delivered_down_kw",
                     "ideal_delivered_kw",
                     "telemetry_error_kw",
+                    "raw_request_kw",
+                    "socket_up_kw",
+                    "socket_down_kw",
+                    "socket_violation_up_kw",
+                    "socket_violation_down_kw",
                     "tracking_error_kw",
                     "tracking_tolerance_kw",
                     "active_capacity_kw",

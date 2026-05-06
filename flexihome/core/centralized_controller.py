@@ -223,7 +223,8 @@ class CentralizedVPPController:
         for _, (ts, signal_row) in enumerate(fine_signals.iterrows()):
             tick_started = time.perf_counter()
             available = self._availability(row, selected.index)
-            request_now = self._request_kw(signal_row, plan, market_mode)
+            request_context = self._request_context(signal_row, plan, market_mode)
+            request_now = float(request_context["request_kw"])
             committed_up_kw, committed_down_kw = self._commitment_limits(plan, market_mode)
             active_caps = self._pool_caps(selected, available, resource_mode, roles={"active"})
             buffer_caps = self._pool_caps(selected, available, resource_mode, roles={"buffer"})
@@ -284,6 +285,12 @@ class CentralizedVPPController:
                     "afrr_signal_norm": float(signal_row["afrr_signal_norm"]),
                     "committed_up_kw": committed_up_kw,
                     "committed_down_kw": committed_down_kw,
+                    "raw_request_kw": float(request_context["raw_request_kw"]),
+                    "product_clamped_request_kw": float(request_context["product_clamped_request_kw"]),
+                    "socket_up_kw": float(request_context["socket_up_kw"]),
+                    "socket_down_kw": float(request_context["socket_down_kw"]),
+                    "socket_violation_up_kw": float(request_context["socket_violation_up_kw"]),
+                    "socket_violation_down_kw": float(request_context["socket_violation_down_kw"]),
                     "requested_signed_kw": request_now,
                     "requested_up_kw": max(request_now, 0.0),
                     "requested_down_kw": max(-request_now, 0.0),
@@ -647,12 +654,27 @@ class CentralizedVPPController:
             caps[device_type]["down"] = float(np.minimum(group["upper_down_cap_kw"], group["available_down_kw_now"]).sum())
         return caps
 
-    def _request_kw(self, signal_row: pd.Series, plan: Dict[str, float], market_mode: str) -> float:
+    def _request_context(self, signal_row: pd.Series, plan: Dict[str, float], market_mode: str) -> Dict[str, float]:
         fcr_signal = float(signal_row["fcr_signal_norm"]) if market_mode in {"FCR-N", "Combined"} else 0.0
         afrr_signal = float(signal_row["afrr_signal_norm"]) if market_mode in {"aFRR", "Combined"} else 0.0
         up_limit, down_limit = self._commitment_limits(plan, market_mode)
         raw_request = fcr_signal * self._fcr_bid_kw(plan) + max(afrr_signal, 0.0) * self._afrr_up_bid_kw(plan) - max(-afrr_signal, 0.0) * self._afrr_down_bid_kw(plan)
-        return float(np.clip(raw_request, -max(down_limit, 0.0), max(up_limit, 0.0)))
+        clamped = float(np.clip(raw_request, -max(down_limit, 0.0), max(up_limit, 0.0)))
+        socket_up = max(float(plan.get("socket_up_kw", up_limit)), 0.0)
+        socket_down = max(float(plan.get("socket_down_kw", down_limit)), 0.0)
+        request = float(np.clip(clamped, -socket_down, socket_up))
+        return {
+            "raw_request_kw": float(raw_request),
+            "product_clamped_request_kw": clamped,
+            "request_kw": request,
+            "socket_up_kw": socket_up,
+            "socket_down_kw": socket_down,
+            "socket_violation_up_kw": max(clamped - socket_up, 0.0),
+            "socket_violation_down_kw": max(-socket_down - clamped, 0.0),
+        }
+
+    def _request_kw(self, signal_row: pd.Series, plan: Dict[str, float], market_mode: str) -> float:
+        return float(self._request_context(signal_row, plan, market_mode)["request_kw"])
 
     def _fcr_bid_kw(self, plan: Dict[str, float]) -> float:
         return float(plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0) + plan.get("hvac_fcr_kw", 0.0))
@@ -996,7 +1018,11 @@ class CentralizedVPPController:
             "optimized_net_load_kw": float(row["net_load_baseline_kw"] - max(delivered_signed.mean(), 0.0) + max(-delivered_signed.mean(), 0.0)),
             "baseline_net_load_kw": float(row["net_load_baseline_kw"]),
             "tracking_samples": int(len(tracking_df)),
-            "tracking_error_kw": float((delivered_signed - requested_signed).mean()),
+            "tracking_error_kw": float(np.abs(delivered_signed - requested_signed).mean()),
+            "mean_signed_error_kw": float((delivered_signed - requested_signed).mean()),
+            "max_abs_error_per_tick_kw": float(np.abs(delivered_signed - requested_signed).max()),
+            "socket_violation_up_kw": float(tracking_df.get("socket_violation_up_kw", pd.Series([0.0])).sum()),
+            "socket_violation_down_kw": float(tracking_df.get("socket_violation_down_kw", pd.Series([0.0])).sum()),
             "shortfall_kw": float(tracking_df["shortfall_kw"].mean()),
             "inner_solver_status": tracking_df["inner_solver_status"].mode().iloc[0] if not tracking_df.empty else "unknown",
         }

@@ -105,6 +105,11 @@ def main() -> None:
         "fleet_power_after_kw",
         "ideal_delivered_kw",
         "telemetry_error_kw",
+        "raw_request_kw",
+        "socket_up_kw",
+        "socket_down_kw",
+        "socket_violation_up_kw",
+        "socket_violation_down_kw",
         "target_command_kw",
         "tracking_delta_kw",
         "tracking_error_kw",
@@ -136,6 +141,27 @@ def main() -> None:
         raise SystemExit("Lower controller should report measured telemetry error instead of perfect predicted delivery.")
     if tracking["tracking_error_kw"].abs().max() <= 0.0:
         raise SystemExit("Lower controller should expose nonzero residual tracking error from the measured plant.")
+
+    socket_controller = CentralizedVPPController(
+        roster,
+        fleet_meta,
+        InnerControllerConfig(max_devices_per_type=8, horizon_seconds=4),
+    )
+    socket_plan = dict(plan)
+    socket_plan["socket_up_kw"] = 10.0
+    socket_plan["socket_down_kw"] = 10.0
+    _, socket_tracking, _, _ = socket_controller.execute_interval(
+        row=df.iloc[1],
+        fine_signals=constant_signal(df.index[1], periods=2),
+        plan=socket_plan,
+        interval_index=1,
+        market_mode="FCR-N",
+        resource_mode="Hybrid portfolio",
+    )
+    if socket_tracking["requested_up_kw"].max() > 10.001:
+        raise SystemExit("Lower controller must clamp TSO request to the upper socket.")
+    if socket_tracking["socket_violation_up_kw"].max() <= 0.0:
+        raise SystemExit("Lower controller should log raw request pressure above the upper socket.")
 
     buffer_plan = dict(plan)
     buffer_plan["hvac_fcr_kw"] = 80.0

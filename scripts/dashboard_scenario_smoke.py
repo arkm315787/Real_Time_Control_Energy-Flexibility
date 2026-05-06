@@ -55,6 +55,8 @@ def main() -> None:
         'button("Activate Lower MPC"',
         'button("Stop Market"',
         'run_lower_mpc_from_upper_result(',
+        "MarketSimulator(",
+        "sync_market_simulator_feed(",
         "upper_socket_ready",
         "upper_socket_metrics(",
     ]

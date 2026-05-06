@@ -1175,6 +1175,27 @@ def _market_gate_decision(plan: Dict[str, float], market_mode: str) -> Dict[str,
     }
 
 
+def _socket_limits_from_plan(plan: Dict[str, float], market_mode: str) -> tuple[float, float]:
+    fcr_bid = float(plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0) + plan.get("hvac_fcr_kw", 0.0))
+    afrr_up = float(plan.get("bess_afrr_up_kw", 0.0) + plan.get("ev_afrr_up_kw", 0.0) + plan.get("hvac_afrr_up_kw", 0.0))
+    afrr_down = float(
+        plan.get("bess_afrr_down_kw", 0.0)
+        + plan.get("ev_afrr_down_kw", 0.0)
+        + plan.get("hvac_afrr_down_kw", 0.0)
+        + plan.get("pv_afrr_down_kw", 0.0)
+    )
+    if market_mode == "FCR-N":
+        up_limit = fcr_bid
+        down_limit = fcr_bid
+    elif market_mode == "aFRR":
+        up_limit = afrr_up
+        down_limit = afrr_down
+    else:
+        up_limit = max(fcr_bid, afrr_up)
+        down_limit = max(fcr_bid, afrr_down)
+    return float(max(up_limit, 0.0)), float(max(down_limit, 0.0))
+
+
 def _upper_only_interval_summary(
     row: pd.Series,
     plan: Dict[str, float],
@@ -1651,6 +1672,9 @@ def run_mpc_controller(
             + plan.get("hvac_afrr_down_kw", 0.0)
             + plan.get("pv_afrr_down_kw", 0.0)
         )
+        socket_up_kw, socket_down_kw = _socket_limits_from_plan(plan, market_mode)
+        plan["socket_up_kw"] = socket_up_kw
+        plan["socket_down_kw"] = socket_down_kw
         capacity_revenue = dt_h / 1000.0 * (
             row["fcrn_capacity_eur_per_mw_h"] * fcr_bid_kw
             + row["afrr_up_capacity_eur_per_mw_h"] * afrr_up_bid_kw
@@ -1681,6 +1705,8 @@ def run_mpc_controller(
                 "fcr_bid_kw": fcr_bid_kw,
                 "afrr_up_bid_kw": afrr_up_bid_kw,
                 "afrr_down_bid_kw": afrr_down_bid_kw,
+                "socket_up_kw": socket_up_kw,
+                "socket_down_kw": socket_down_kw,
                 "bess_fcr_kw": float(plan.get("bess_fcr_kw", 0.0)),
                 "ev_fcr_kw": float(plan.get("ev_fcr_kw", 0.0)),
                 "hvac_fcr_kw": float(plan.get("hvac_fcr_kw", 0.0)),
@@ -1730,6 +1756,10 @@ def run_mpc_controller(
                 "down_accuracy_ratio": delivered_down / requested_down if requested_down > 1 else np.nan,
                 "inner_tracking_samples": interval_summary["tracking_samples"],
                 "tracking_error_kw": interval_summary.get("tracking_error_kw", 0.0),
+                "mean_signed_error_kw": interval_summary.get("mean_signed_error_kw", interval_summary.get("tracking_error_kw", 0.0)),
+                "max_abs_error_per_tick_kw": interval_summary.get("max_abs_error_per_tick_kw", abs(interval_summary.get("tracking_error_kw", 0.0))),
+                "socket_violation_up_kw": interval_summary.get("socket_violation_up_kw", 0.0),
+                "socket_violation_down_kw": interval_summary.get("socket_violation_down_kw", 0.0),
                 "shortfall_kw": interval_summary.get("shortfall_kw", 0.0),
             }
         )
@@ -1862,6 +1892,10 @@ def run_mpc_controller(
         "market_gate_participation_intervals": int(len(eligible_rows)),
         "next_participation_start": next_participation_start,
         "mean_tracking_error_kw": float(result_df["tracking_error_kw"].mean()) if "tracking_error_kw" in result_df else 0.0,
+        "mean_signed_error_kw": float(result_df.get("mean_signed_error_kw", pd.Series([0.0])).mean()),
+        "max_abs_error_per_tick_kw": float(result_df.get("max_abs_error_per_tick_kw", pd.Series([0.0])).max()),
+        "socket_violation_up_kw": float(result_df.get("socket_violation_up_kw", pd.Series([0.0])).sum()),
+        "socket_violation_down_kw": float(result_df.get("socket_violation_down_kw", pd.Series([0.0])).sum()),
         "mean_shortfall_kw": float(result_df["shortfall_kw"].mean()) if "shortfall_kw" in result_df else 0.0,
     }
     gateway_commands = pd.concat(gateway_command_summaries, ignore_index=True) if gateway_command_summaries else pd.DataFrame()
@@ -1937,6 +1971,8 @@ def run_lower_mpc_from_upper_result(
         "reserve_buffer_kw",
         "risk_quantile",
         "reserve_buffer_pct",
+        "socket_up_kw",
+        "socket_down_kw",
     ]
     controller_config = InnerControllerConfig(
         mode=inner_controller_mode,
@@ -1969,6 +2005,8 @@ def run_lower_mpc_from_upper_result(
             row_idx = min(t + 1, len(df) - 1)
         row = df.iloc[row_idx]
         plan = {key: float(upper_row.get(key, 0.0)) for key in plan_columns}
+        if plan["socket_up_kw"] <= 0.0 and plan["socket_down_kw"] <= 0.0:
+            plan["socket_up_kw"], plan["socket_down_kw"] = _socket_limits_from_plan(plan, market_mode)
         fine_signals = build_inner_tracking_window(df, preview_4s, row_idx, dt_seconds=int(inner_dt_seconds))
         if remaining_live_ticks is not None:
             fine_signals = fine_signals.iloc[:remaining_live_ticks].copy()
@@ -2034,6 +2072,8 @@ def run_lower_mpc_from_upper_result(
                 "fcr_bid_kw": fcr_bid_kw,
                 "afrr_up_bid_kw": afrr_up_bid_kw,
                 "afrr_down_bid_kw": afrr_down_bid_kw,
+                "socket_up_kw": float(plan.get("socket_up_kw", 0.0)),
+                "socket_down_kw": float(plan.get("socket_down_kw", 0.0)),
                 "requested_up_kw": interval_summary["requested_up_kw"],
                 "requested_down_kw": interval_summary["requested_down_kw"],
                 "delivered_up_kw": interval_summary["delivered_up_kw"],
@@ -2060,6 +2100,10 @@ def run_lower_mpc_from_upper_result(
                 "down_accuracy_ratio": interval_summary["delivered_down_kw"] / interval_summary["requested_down_kw"] if interval_summary["requested_down_kw"] > 1 else np.nan,
                 "inner_tracking_samples": interval_summary["tracking_samples"],
                 "tracking_error_kw": interval_summary.get("tracking_error_kw", 0.0),
+                "mean_signed_error_kw": interval_summary.get("mean_signed_error_kw", interval_summary.get("tracking_error_kw", 0.0)),
+                "max_abs_error_per_tick_kw": interval_summary.get("max_abs_error_per_tick_kw", abs(interval_summary.get("tracking_error_kw", 0.0))),
+                "socket_violation_up_kw": interval_summary.get("socket_violation_up_kw", 0.0),
+                "socket_violation_down_kw": interval_summary.get("socket_violation_down_kw", 0.0),
                 "shortfall_kw": interval_summary.get("shortfall_kw", 0.0),
             }
         )
@@ -2128,6 +2172,10 @@ def run_lower_mpc_from_upper_result(
             "execute_lower_mpc": True,
             "mean_tracking_error_kw": float(tracking_df["tracking_error_kw"].mean()) if "tracking_error_kw" in tracking_df else 0.0,
             "mean_abs_tracking_error_kw": float(tracking_df["tracking_error_kw"].abs().mean()) if "tracking_error_kw" in tracking_df else 0.0,
+            "mean_signed_error_kw": float(result_df.get("mean_signed_error_kw", pd.Series([0.0])).mean()),
+            "max_abs_error_per_tick_kw": float(result_df.get("max_abs_error_per_tick_kw", pd.Series([0.0])).max()),
+            "socket_violation_up_kw": float(tracking_df.get("socket_violation_up_kw", pd.Series([0.0])).sum()),
+            "socket_violation_down_kw": float(tracking_df.get("socket_violation_down_kw", pd.Series([0.0])).sum()),
             "mean_shortfall_kw": float(tracking_df["shortfall_kw"].mean()) if "shortfall_kw" in tracking_df else 0.0,
         }
     )

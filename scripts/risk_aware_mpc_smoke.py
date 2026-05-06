@@ -118,6 +118,25 @@ def main() -> None:
         raise SystemExit("Live lower MPC attach should produce tracking rows from an upper socket.")
     if not lower_from_socket["summary"].get("execute_lower_mpc"):
         raise SystemExit("Live lower MPC attach should mark lower execution active.")
+    partial_lower = run_lower_mpc_from_upper_result(
+        df=df,
+        upper_result=upper_only,
+        fleet_meta={
+            "bess_energy_cap_mwh": float(df["bess_energy_cap_mwh"].iloc[0]),
+            "setpoint_c": 21.0,
+            "comfort_band_c": 1.0,
+            "n_hvac": int(bundle["summary"]["n_hvac"]),
+            "hvac_mode": "Inverter / variable-speed",
+            "hvac_response_s": 20.0,
+        },
+        market_mode="Combined",
+        resource_mode="Hybrid portfolio",
+        preview_4s=bundle["preview_4s"],
+        device_roster=bundle.get("device_roster"),
+        elapsed_seconds=8.0,
+    )
+    if len(partial_lower["tracking_4s"]) > 3:
+        raise SystemExit("Live lower MPC attach should not precompute future ticks beyond elapsed market time.")
 
     _, lower, _ = run_case(0.80, execute_lower_mpc=True)
     if lower["tracking_4s"].empty:

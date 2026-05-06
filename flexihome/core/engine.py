@@ -1882,6 +1882,7 @@ def run_lower_mpc_from_upper_result(
     inner_mpc_horizon_seconds: int = 4,
     rotation_strategy: str = "usage_aware",
     gateway_mode: str = "live_market_coupled",
+    elapsed_seconds: float | None = None,
 ) -> Dict[str, object]:
     """Attach the lower 4-second controller to an already solved upper MPC socket.
 
@@ -1942,9 +1943,14 @@ def run_lower_mpc_from_upper_result(
     tracking_history: List[pd.DataFrame] = []
     upper_device_schedules: List[pd.DataFrame] = []
     gateway_command_summaries: List[pd.DataFrame] = []
+    remaining_live_ticks = None
+    if elapsed_seconds is not None:
+        remaining_live_ticks = max(int(float(elapsed_seconds) // max(int(inner_dt_seconds), 1)) + 1, 0)
     total_work = max(len(upper_history), 1)
 
     for t, (timestamp, upper_row) in enumerate(upper_history.iterrows()):
+        if remaining_live_ticks is not None and remaining_live_ticks <= 0:
+            break
         try:
             row_idx = int(df.index.get_loc(pd.Timestamp(timestamp)))
         except KeyError:
@@ -1952,6 +1958,11 @@ def run_lower_mpc_from_upper_result(
         row = df.iloc[row_idx]
         plan = {key: float(upper_row.get(key, 0.0)) for key in plan_columns}
         fine_signals = build_inner_tracking_window(df, preview_4s, row_idx, dt_seconds=int(inner_dt_seconds))
+        if remaining_live_ticks is not None:
+            fine_signals = fine_signals.iloc[:remaining_live_ticks].copy()
+            remaining_live_ticks -= len(fine_signals)
+        if fine_signals.empty:
+            continue
         if progress_callback:
             progress_callback(t + 1, total_work, f"Lower MPC live interval {t + 1}/{total_work}")
         interval_summary, interval_tracking, upper_schedule, command_summary = centralized_controller.execute_interval(
@@ -2034,6 +2045,22 @@ def run_lower_mpc_from_upper_result(
             }
         )
         history.append(record)
+
+    if not history:
+        empty = pd.DataFrame()
+        return {
+            "history": empty,
+            "summary": {**(dict(upper_result.get("summary", {})) if isinstance(upper_result, dict) else {}), "execute_lower_mpc": True},
+            "compliance": dict(upper_result.get("compliance", {})) if isinstance(upper_result, dict) else {},
+            "first_schedule": upper_result.get("first_schedule", pd.DataFrame()) if isinstance(upper_result, dict) else pd.DataFrame(),
+            "tracking_4s": empty,
+            "inner_mpc_trace": empty,
+            "upper_device_schedule": empty,
+            "gateway_commands": empty,
+            "household_contributions": empty,
+            "appliance_contributions": empty,
+            "usage_fatigue_summary": empty,
+        }
 
     result_df = pd.DataFrame(history).set_index("timestamp")
     tracking_df = pd.concat(tracking_history) if tracking_history else pd.DataFrame()

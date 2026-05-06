@@ -1406,7 +1406,7 @@ def main() -> None:
         market_started = bool(live_market_session) and market_status["status"] in {"scheduled", "live", "closed"}
         run_upper_mpc = btn_upper.button("Run Upper MPC Layer", type="primary")
         start_market_pressure = btn_market.button("Start Market Pressure", disabled=not upper_market_ready or market_status["status"] in {"scheduled", "live"})
-        activate_lower_mpc = btn_lower.button("Activate Lower MPC", disabled=not market_started or bool(st.session_state.get("live_lower_result")))
+        activate_lower_mpc = btn_lower.button("Activate Lower MPC", disabled=not market_started)
         mpc_progress_bar = st.progress(0.0)
         mpc_progress_text = st.empty()
         base_penalty_weights = {
@@ -1515,48 +1515,40 @@ def main() -> None:
         lower_armed = bool(st.session_state.get("lower_mpc_armed", False))
         if live_market_session and market_status["status"] == "live" and st.session_state.get("mpc_phase") in {"market_scheduled", "lower_waiting"}:
             st.session_state["mpc_phase"] = "market_live" if not lower_armed else "lower_waiting"
-        if lower_armed and live_market_session and market_status["status"] in {"live", "closed"} and not st.session_state.get("live_lower_result"):
-            with st.spinner("Lower MPC is attaching to the live market socket..."):
-                lower_tracker = make_progress_tracker(mpc_progress_bar, mpc_progress_text, "Lower MPC live attach")
-                fleet_meta = {
-                    "bess_energy_cap_mwh": float(df["bess_energy_cap_mwh"].iloc[0]),
-                    "setpoint_c": setpoint_c,
-                    "comfort_band_c": comfort_band_c,
-                    "n_hvac": summary["n_hvac"],
-                    "hvac_mode": hvac_mode,
-                    "hvac_response_s": hvac_response_s,
-                }
-                upper_socket = st.session_state.get("upper_mpc_result", st.session_state.get("mpc_result", {}))
-                lower_result = run_lower_mpc_from_upper_result(
-                    df=df,
-                    upper_result=upper_socket,
-                    fleet_meta=fleet_meta,
-                    market_mode=str(live_market_session.get("market_mode", market_mode)),
-                    resource_mode=str(live_market_session.get("resource_mode", resource_mode)),
-                    preview_4s=preview_4s,
-                    progress_callback=lambda current, total, message: lower_tracker(
-                        int(round((current / max(total, 1)) * 100)),
-                        100,
-                        message,
-                    ),
-                    device_roster=device_roster,
-                    inner_controller_mode="mpc",
-                    inner_dt_seconds=4,
-                    inner_mpc_horizon_seconds=4,
-                    rotation_strategy="usage_aware",
-                    gateway_mode="live_market_coupled",
-                )
-                st.session_state["live_lower_result"] = lower_result
-                st.session_state["mpc_result"] = lower_result
-                st.session_state["mpc_config"] = {
-                    **st.session_state.get("mpc_config", {}),
-                    "execute_lower_mpc": True,
-                    "gateway_mode": "live_market_coupled",
-                }
-                st.session_state["mpc_result_stale"] = False
-                st.session_state["mpc_phase"] = "lower_live"
-                lower_tracker(100, 100, "Lower MPC attached to live market")
-                st.rerun()
+        if lower_armed and live_market_session and market_status["status"] in {"live", "closed"}:
+            fleet_meta = {
+                "bess_energy_cap_mwh": float(df["bess_energy_cap_mwh"].iloc[0]),
+                "setpoint_c": setpoint_c,
+                "comfort_band_c": comfort_band_c,
+                "n_hvac": summary["n_hvac"],
+                "hvac_mode": hvac_mode,
+                "hvac_response_s": hvac_response_s,
+            }
+            upper_socket = st.session_state.get("upper_mpc_result", st.session_state.get("mpc_result", {}))
+            lower_result = run_lower_mpc_from_upper_result(
+                df=df,
+                upper_result=upper_socket,
+                fleet_meta=fleet_meta,
+                market_mode=str(live_market_session.get("market_mode", market_mode)),
+                resource_mode=str(live_market_session.get("resource_mode", resource_mode)),
+                preview_4s=preview_4s,
+                device_roster=device_roster,
+                inner_controller_mode="mpc",
+                inner_dt_seconds=4,
+                inner_mpc_horizon_seconds=4,
+                rotation_strategy="usage_aware",
+                gateway_mode="live_market_coupled",
+                elapsed_seconds=float(market_status["elapsed_seconds"]),
+            )
+            st.session_state["live_lower_result"] = lower_result
+            st.session_state["mpc_result"] = lower_result
+            st.session_state["mpc_config"] = {
+                **st.session_state.get("mpc_config", {}),
+                "execute_lower_mpc": True,
+                "gateway_mode": "live_market_coupled",
+            }
+            st.session_state["mpc_result_stale"] = False
+            st.session_state["mpc_phase"] = "lower_live"
 
         if live_market_session:
             status_label = str(market_status["status"]).replace("_", " ").title()
@@ -1564,7 +1556,8 @@ def main() -> None:
             live_cols[0].metric("Market process", status_label)
             live_cols[1].metric("Start countdown", f"{float(market_status['countdown_seconds']):.0f} s")
             live_cols[2].metric("Market elapsed", f"{float(market_status['elapsed_seconds']):.0f} s")
-            live_cols[3].metric("Lower MPC", "Armed" if lower_armed and not st.session_state.get("live_lower_result") else ("Live" if st.session_state.get("live_lower_result") else "Waiting"))
+            lower_ticks = len(result_frame(st.session_state.get("live_lower_result", {}), "tracking_4s"))
+            live_cols[3].metric("Lower MPC", f"Live ({lower_ticks} ticks)" if st.session_state.get("live_lower_result") else ("Armed" if lower_armed else "Waiting"))
             market_feed = build_live_market_feed(
                 preview_4s,
                 st.session_state.get("upper_mpc_result", {}),

@@ -138,6 +138,13 @@ def main() -> None:
     )
     if len(partial_lower["tracking_4s"]) > 3:
         raise SystemExit("Live lower MPC attach should not precompute future ticks beyond elapsed market time.")
+    required_live_cols = {"requested_signed_kw", "delivered_signed_kw", "optimized_net_load_kw", "baseline_net_load_kw"}
+    if not required_live_cols.issubset(partial_lower["tracking_4s"].columns):
+        raise SystemExit(f"Live lower tracking is missing visualization columns: {sorted(required_live_cols - set(partial_lower['tracking_4s'].columns))}")
+    tick_h = 4.0 / 3600.0
+    expected_up_mwh = float(partial_lower["tracking_4s"]["delivered_up_kw"].sum() * tick_h / 1000.0)
+    if abs(float(partial_lower["summary"].get("delivered_up_mwh", 0.0)) - expected_up_mwh) > 1e-9:
+        raise SystemExit("Partial live lower summary must scale delivered energy by solved 4-second ticks.")
 
     _, lower, _ = run_case(0.80, execute_lower_mpc=True)
     if lower["tracking_4s"].empty:

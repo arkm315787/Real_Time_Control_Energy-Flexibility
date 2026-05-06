@@ -1985,6 +1985,9 @@ def run_lower_mpc_from_upper_result(
             market_mode=market_mode,
             resource_mode=resource_mode,
         )
+        outer_dt_h = max(float(row["dt_h"]), 1e-9)
+        effective_dt_h = max(len(interval_tracking), 1) * max(int(inner_dt_seconds), 1) / 3600.0
+        interval_fraction = float(np.clip(effective_dt_h / outer_dt_h, 0.0, 1.0))
         tracking_history.append(interval_tracking)
         if not upper_schedule.empty:
             upper_device_schedules.append(upper_schedule)
@@ -1998,7 +2001,6 @@ def run_lower_mpc_from_upper_result(
         actual_hvac_up = interval_summary["hvac_up_kw"]
         actual_hvac_down = interval_summary["hvac_down_kw"]
         actual_pv_down = interval_summary["pv_down_kw"]
-        dt_h = float(row["dt_h"])
         fcr_bid_kw = plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0) + plan.get("hvac_fcr_kw", 0.0)
         afrr_up_bid_kw = plan.get("bess_afrr_up_kw", 0.0) + plan.get("ev_afrr_up_kw", 0.0) + plan.get("hvac_afrr_up_kw", 0.0)
         afrr_down_bid_kw = (
@@ -2007,22 +2009,22 @@ def run_lower_mpc_from_upper_result(
             + plan.get("hvac_afrr_down_kw", 0.0)
             + plan.get("pv_afrr_down_kw", 0.0)
         )
-        capacity_revenue = dt_h / 1000.0 * (
+        capacity_revenue = effective_dt_h / 1000.0 * (
             row["fcrn_capacity_eur_per_mw_h"] * fcr_bid_kw
             + row["afrr_up_capacity_eur_per_mw_h"] * afrr_up_bid_kw
             + row["afrr_down_capacity_eur_per_mw_h"] * afrr_down_bid_kw
         )
-        activation_revenue = dt_h / 1000.0 * (
+        activation_revenue = effective_dt_h / 1000.0 * (
             row["afrr_up_energy_eur_per_mwh"] * (actual_bess_up + actual_ev_up + actual_hvac_up)
             + row["afrr_down_energy_eur_per_mwh"] * (actual_bess_down + actual_ev_down + actual_hvac_down + actual_pv_down)
         )
-        degradation_cost = float(upper_row.get("degradation_cost_eur", 0.0))
-        comfort_penalty = float(upper_row.get("comfort_penalty_eur", 0.0))
+        degradation_cost = float(upper_row.get("degradation_cost_eur", 0.0)) * interval_fraction
+        comfort_penalty = float(upper_row.get("comfort_penalty_eur", 0.0)) * interval_fraction
         risk_cost = (
             float(plan.get("non_delivery_risk_cost_eur", 0.0))
             + float(plan.get("activation_uncertainty_cost_eur", 0.0))
             + float(plan.get("asset_fatigue_cost_eur", 0.0))
-        )
+        ) * interval_fraction
         record = upper_row.to_dict()
         record.update(
             {
@@ -2045,6 +2047,11 @@ def run_lower_mpc_from_upper_result(
                 "pv_down_kw": actual_pv_down,
                 "capacity_revenue_eur": capacity_revenue,
                 "activation_revenue_eur": activation_revenue,
+                "degradation_cost_eur": degradation_cost,
+                "comfort_penalty_eur": comfort_penalty,
+                "non_delivery_risk_cost_eur": float(plan.get("non_delivery_risk_cost_eur", 0.0)) * interval_fraction,
+                "activation_uncertainty_cost_eur": float(plan.get("activation_uncertainty_cost_eur", 0.0)) * interval_fraction,
+                "asset_fatigue_cost_eur": float(plan.get("asset_fatigue_cost_eur", 0.0)) * interval_fraction,
                 "net_revenue_eur": capacity_revenue + activation_revenue - degradation_cost - comfort_penalty - risk_cost,
                 "bess_soc_mwh": interval_summary["bess_soc_mwh"],
                 "ev_soc_mwh": interval_summary["ev_soc_mwh"],
@@ -2079,22 +2086,49 @@ def run_lower_mpc_from_upper_result(
     gateway_commands = pd.concat(gateway_command_summaries, ignore_index=True) if gateway_command_summaries else pd.DataFrame()
     household_contrib, appliance_contrib, usage_fatigue = centralized_controller.contribution_frames(gateway_commands)
     summary = dict(upper_result.get("summary", {})) if isinstance(upper_result, dict) else {}
-    dt_h0 = float(df["dt_h"].iloc[0])
+    tick_h = max(int(inner_dt_seconds), 1) / 3600.0
+    if not tracking_df.empty:
+        delivered_up_mwh = float(tracking_df["delivered_up_kw"].sum() * tick_h / 1000.0)
+        delivered_down_mwh = float(tracking_df["delivered_down_kw"].sum() * tick_h / 1000.0)
+        resource_energy_kwh = {
+            "BESS": float((tracking_df["bess_up_kw"] + tracking_df["bess_down_kw"]).sum() * tick_h),
+            "EV": float((tracking_df["ev_up_kw"] + tracking_df["ev_down_kw"]).sum() * tick_h),
+            "HVAC": float((tracking_df["hvac_up_kw"] + tracking_df["hvac_down_kw"]).sum() * tick_h),
+            "PV": float(tracking_df["pv_down_kw"].sum() * tick_h),
+        }
+    else:
+        delivered_up_mwh = float(result_df["delivered_up_kw"].sum() * float(df["dt_h"].iloc[0]) / 1000.0)
+        delivered_down_mwh = float(result_df["delivered_down_kw"].sum() * float(df["dt_h"].iloc[0]) / 1000.0)
+        resource_energy_kwh = {
+            "BESS": float((result_df["bess_up_kw"] + result_df["bess_down_kw"]).sum() * float(df["dt_h"].iloc[0])),
+            "EV": float((result_df["ev_up_kw"] + result_df["ev_down_kw"]).sum() * float(df["dt_h"].iloc[0])),
+            "HVAC": float((result_df["hvac_up_kw"] + result_df["hvac_down_kw"]).sum() * float(df["dt_h"].iloc[0])),
+            "PV": float(result_df["pv_down_kw"].sum() * float(df["dt_h"].iloc[0])),
+        }
+    total_resource_kwh = max(sum(resource_energy_kwh.values()), 1e-9)
+    total_revenue = float(result_df.get("net_revenue_eur", pd.Series([0.0])).sum())
     summary.update(
         {
-            "total_revenue_eur": float(result_df.get("net_revenue_eur", pd.Series([0.0])).sum()),
+            "total_revenue_eur": total_revenue,
             "capacity_revenue_eur": float(result_df.get("capacity_revenue_eur", pd.Series([0.0])).sum()),
             "activation_revenue_eur": float(result_df.get("activation_revenue_eur", pd.Series([0.0])).sum()),
-            "delivered_up_mwh": float(result_df["delivered_up_kw"].sum() * dt_h0 / 1000.0),
-            "delivered_down_mwh": float(result_df["delivered_down_kw"].sum() * dt_h0 / 1000.0),
+            "delivered_up_mwh": delivered_up_mwh,
+            "delivered_down_mwh": delivered_down_mwh,
+            "resource_revenue": {resource: total_revenue * energy_kwh / total_resource_kwh for resource, energy_kwh in resource_energy_kwh.items()},
+            "fast_vs_slow": {
+                "Fast (BESS + EV)": resource_energy_kwh["BESS"] + resource_energy_kwh["EV"],
+                "Slow (HVAC + PV)": resource_energy_kwh["HVAC"] + resource_energy_kwh["PV"],
+            },
+            "co2_avoided_kg": delivered_up_mwh * 140.0,
             "inner_controller_mode": inner_controller_mode,
             "inner_dt_seconds": int(inner_dt_seconds),
             "inner_mpc_horizon_seconds": int(inner_mpc_horizon_seconds),
             "rotation_strategy": rotation_strategy,
             "gateway_mode": gateway_mode,
             "execute_lower_mpc": True,
-            "mean_tracking_error_kw": float(result_df["tracking_error_kw"].mean()) if "tracking_error_kw" in result_df else 0.0,
-            "mean_shortfall_kw": float(result_df["shortfall_kw"].mean()) if "shortfall_kw" in result_df else 0.0,
+            "mean_tracking_error_kw": float(tracking_df["tracking_error_kw"].mean()) if "tracking_error_kw" in tracking_df else 0.0,
+            "mean_abs_tracking_error_kw": float(tracking_df["tracking_error_kw"].abs().mean()) if "tracking_error_kw" in tracking_df else 0.0,
+            "mean_shortfall_kw": float(tracking_df["shortfall_kw"].mean()) if "shortfall_kw" in tracking_df else 0.0,
         }
     )
     compliance = dict(upper_result.get("compliance", {})) if isinstance(upper_result, dict) else {}

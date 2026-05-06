@@ -1984,8 +1984,10 @@ def main() -> None:
                 lower_cols = [
                     "inner_solver_status",
                     "optimization_strategy",
+                    "requested_signed_kw",
                     "requested_up_kw",
                     "requested_down_kw",
+                    "delivered_signed_kw",
                     "delivered_up_kw",
                     "delivered_down_kw",
                     "tracking_error_kw",
@@ -2014,11 +2016,13 @@ def main() -> None:
         else:
             result_df = result["history"]
             tracking_df = live_visible_frame(result.get("tracking_4s", pd.DataFrame()), st.session_state.get("live_market_session", {}))
+            viz_df = tracking_df if not tracking_df.empty else result_df
+            contribution_df = viz_df
             s = result["summary"]
             ts_left, ts_right = st.columns([1.45, 1.0])
             ts_left.plotly_chart(
                 apply_chart_style(
-                    line_dual_axis(result_df, template),
+                    line_dual_axis(viz_df, template),
                     template,
                     height=420,
                     title="Optimized load, baseline, and frequency",
@@ -2027,15 +2031,17 @@ def main() -> None:
             )
 
             contribution_fig = go.Figure()
-            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["bess_up_kw"] / 1000.0, name="BESS up", stackgroup="up", line={"color": RESOURCE_COLORS["BESS"]}))
-            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["ev_up_kw"] / 1000.0, name="EV up", stackgroup="up", line={"color": RESOURCE_COLORS["EV"]}))
-            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["hvac_up_kw"] / 1000.0, name="HVAC up", stackgroup="up", line={"color": RESOURCE_COLORS["HVAC"]}))
-            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=-result_df["bess_down_kw"] / 1000.0, name="BESS down", stackgroup="down", line={"color": RESOURCE_COLORS["BESS"], "dash": "dot"}))
-            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=-result_df["ev_down_kw"] / 1000.0, name="EV down", stackgroup="down", line={"color": RESOURCE_COLORS["EV"], "dash": "dot"}))
-            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=-result_df["hvac_down_kw"] / 1000.0, name="HVAC down", stackgroup="down", line={"color": RESOURCE_COLORS["HVAC"], "dash": "dot"}))
-            contribution_fig.add_trace(go.Scatter(x=result_df.index, y=-result_df["pv_down_kw"] / 1000.0, name="PV curtailment", stackgroup="down", line={"color": RESOURCE_COLORS["PV"]}))
+            contribution_fig.add_trace(go.Scatter(x=contribution_df.index, y=contribution_df["bess_up_kw"] / 1000.0, name="BESS up", stackgroup="up", line={"color": RESOURCE_COLORS["BESS"]}))
+            contribution_fig.add_trace(go.Scatter(x=contribution_df.index, y=contribution_df["ev_up_kw"] / 1000.0, name="EV up", stackgroup="up", line={"color": RESOURCE_COLORS["EV"]}))
+            contribution_fig.add_trace(go.Scatter(x=contribution_df.index, y=contribution_df["hvac_up_kw"] / 1000.0, name="HVAC up", stackgroup="up", line={"color": RESOURCE_COLORS["HVAC"]}))
+            contribution_fig.add_trace(go.Scatter(x=contribution_df.index, y=-contribution_df["bess_down_kw"] / 1000.0, name="BESS down", stackgroup="down", line={"color": RESOURCE_COLORS["BESS"], "dash": "dot"}))
+            contribution_fig.add_trace(go.Scatter(x=contribution_df.index, y=-contribution_df["ev_down_kw"] / 1000.0, name="EV down", stackgroup="down", line={"color": RESOURCE_COLORS["EV"], "dash": "dot"}))
+            contribution_fig.add_trace(go.Scatter(x=contribution_df.index, y=-contribution_df["hvac_down_kw"] / 1000.0, name="HVAC down", stackgroup="down", line={"color": RESOURCE_COLORS["HVAC"], "dash": "dot"}))
+            contribution_fig.add_trace(go.Scatter(x=contribution_df.index, y=-contribution_df["pv_down_kw"] / 1000.0, name="PV curtailment", stackgroup="down", line={"color": RESOURCE_COLORS["PV"]}))
             contribution_fig.update_layout(yaxis_title="MW, up positive / down negative")
             ts_right.plotly_chart(apply_chart_style(contribution_fig, template, height=420, title="Bidirectional resource contribution"), use_container_width=True)
+            if not tracking_df.empty:
+                st.caption(f"Simulation plots are using {len(tracking_df):,} live 4-second lower-MPC ticks. Upper market history still contains {len(result_df):,} outer interval(s).")
 
             row1 = st.columns(3)
             row1[0].metric("Capacity revenue", fmt_money(s["capacity_revenue_eur"]))

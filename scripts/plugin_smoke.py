@@ -108,7 +108,7 @@ def main() -> None:
         },
         market_mode="Combined",
         resource_mode="Hybrid portfolio",
-        penalty_weights={"degradation": 18.0, "comfort": 120.0, "departure": 160.0},
+        penalty_weights={"degradation": 35.0, "comfort": 480.0, "departure": 1000.0},
     )
     if result.schedule.empty:
         raise SystemExit("Optimizer plugin returned an empty schedule.")

@@ -10,7 +10,13 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from flexihome.core.engine import SUPPORTED_MPC_TARGETS, _available_up_down, generate_synthetic_portfolio, run_mpc_controller
+from flexihome.core.engine import (
+    SUPPORTED_MPC_TARGETS,
+    _available_up_down,
+    generate_synthetic_portfolio,
+    run_lower_mpc_from_upper_result,
+    run_mpc_controller,
+)
 
 
 class PersistenceForecaster:
@@ -65,24 +71,24 @@ def run_case(risk_quantile: float, execute_lower_mpc: bool):
         horizon_hours=0.5,
         dispatch_hours=0.5,
         penalty_weights={
-            "degradation": 18.0,
-            "comfort": 120.0,
-            "departure": 160.0,
+            "degradation": 35.0,
+            "comfort": 480.0,
+            "departure": 1000.0,
             "risk_quantile": risk_quantile,
             "reserve_buffer_pct": 0.08,
             "non_delivery": 250.0,
-            "activation_uncertainty": 90.0,
-            "asset_fatigue": 30.0,
+            "activation_uncertainty": 100.0,
+            "asset_fatigue": 75.0,
         },
         preview_4s=bundle["preview_4s"],
         device_roster=bundle.get("device_roster"),
         execute_lower_mpc=execute_lower_mpc,
     )
-    return df, result
+    return df, result, bundle
 
 
 def main() -> None:
-    df, upper_only = run_case(0.80, execute_lower_mpc=False)
+    df, upper_only, bundle = run_case(0.80, execute_lower_mpc=False)
     history = upper_only["history"]
     if len(history) != 2:
         raise SystemExit(f"Expected a 30-minute dispatch window to produce 2 intervals, got {len(history)}")
@@ -92,12 +98,33 @@ def main() -> None:
     if not required_cols.issubset(history.columns):
         raise SystemExit(f"Missing risk-aware upper MPC columns: {sorted(required_cols - set(history.columns))}")
 
-    _, lower = run_case(0.80, execute_lower_mpc=True)
+    lower_from_socket = run_lower_mpc_from_upper_result(
+        df=df,
+        upper_result=upper_only,
+        fleet_meta={
+            "bess_energy_cap_mwh": float(df["bess_energy_cap_mwh"].iloc[0]),
+            "setpoint_c": 21.0,
+            "comfort_band_c": 1.0,
+            "n_hvac": int(bundle["summary"]["n_hvac"]),
+            "hvac_mode": "Inverter / variable-speed",
+            "hvac_response_s": 20.0,
+        },
+        market_mode="Combined",
+        resource_mode="Hybrid portfolio",
+        preview_4s=bundle["preview_4s"],
+        device_roster=bundle.get("device_roster"),
+    )
+    if lower_from_socket["tracking_4s"].empty:
+        raise SystemExit("Live lower MPC attach should produce tracking rows from an upper socket.")
+    if not lower_from_socket["summary"].get("execute_lower_mpc"):
+        raise SystemExit("Live lower MPC attach should mark lower execution active.")
+
+    _, lower, _ = run_case(0.80, execute_lower_mpc=True)
     if lower["tracking_4s"].empty:
         raise SystemExit("Explicit lower-MPC execution should produce 4-second tracking rows.")
 
-    _, p50 = run_case(0.50, execute_lower_mpc=False)
-    _, p90 = run_case(0.90, execute_lower_mpc=False)
+    _, p50, _ = run_case(0.50, execute_lower_mpc=False)
+    _, p90, _ = run_case(0.90, execute_lower_mpc=False)
     p50_bid = float((p50["history"]["fcr_bid_kw"] + p50["history"]["afrr_up_bid_kw"] + p50["history"]["afrr_down_bid_kw"]).mean())
     p90_bid = float((p90["history"]["fcr_bid_kw"] + p90["history"]["afrr_up_bid_kw"] + p90["history"]["afrr_down_bid_kw"]).mean())
     if p90_bid > p50_bid + 1e-6:

@@ -74,7 +74,7 @@ def main() -> None:
     controller = CentralizedVPPController(
         roster,
         fleet_meta,
-        InnerControllerConfig(max_devices_per_type=8, horizon_seconds=20),
+        InnerControllerConfig(max_devices_per_type=8, horizon_seconds=4),
     )
     plan = {
         "bess_fcr_kw": 20.0,
@@ -98,10 +98,58 @@ def main() -> None:
     )
     if tracking.empty or commands.empty or upper.empty:
         raise SystemExit("Expected centralized 4-second MPC tracking, commands, and selected devices.")
+    required_tracking = {
+        "inner_solver_status",
+        "lower_tracking_mode",
+        "fleet_power_before_kw",
+        "fleet_power_after_kw",
+        "target_command_kw",
+        "tracking_delta_kw",
+        "tracking_error_kw",
+        "tracking_tolerance_kw",
+        "error_rising",
+        "recovery_mode",
+        "buffer_used_kw",
+        "active_selected_devices",
+        "buffer_selected_devices",
+        "control_latency_ms",
+        "control_deadline_ms",
+        "control_deadline_met",
+        "optimization_strategy",
+    }
+    missing_tracking = required_tracking.difference(tracking.columns)
+    if missing_tracking:
+        raise SystemExit(f"Centralized MPC trace missing fast-tracker diagnostics: {sorted(missing_tracking)}")
+    if tracking["lower_tracking_mode"].nunique() != 1 or tracking["lower_tracking_mode"].iloc[0] != "proportional_buffer_tracker":
+        raise SystemExit("Lower controller should run as a one-step proportional buffer tracker.")
+    if int(tracking["inner_mpc_horizon_seconds"].max()) != 4:
+        raise SystemExit("Lower tracking horizon should default to one 4-second step.")
+    if not tracking["control_deadline_met"].all():
+        raise SystemExit("Lower controller should meet the 4-second control deadline in the smoke case.")
     if "inner_solver_status" not in tracking or "tracking_error_kw" not in tracking:
         raise SystemExit("Centralized MPC trace missing solver diagnostics.")
     if summary["tracking_samples"] != len(tracking):
         raise SystemExit("Interval summary did not preserve tracking sample count.")
+
+    buffer_plan = dict(plan)
+    buffer_plan["hvac_fcr_kw"] = 80.0
+    buffer_plan["reserve_buffer_kw"] = 40.0
+    _, buffer_tracking, buffer_upper, buffer_commands = controller.execute_interval(
+        row=df.iloc[2],
+        fine_signals=constant_signal(df.index[2], periods=4),
+        plan=buffer_plan,
+        interval_index=2,
+        market_mode="FCR-N",
+        resource_mode="Hybrid portfolio",
+    )
+    if "buffer" not in set(buffer_upper.get("selection_role", [])):
+        raise SystemExit("Upper device selection should keep a separate standby buffer roster.")
+    if not buffer_tracking["recovery_mode"].any():
+        raise SystemExit("Expected rising-error recovery mode to activate buffer capacity.")
+    if buffer_tracking["buffer_used_kw"].max() <= 0.0:
+        raise SystemExit("Expected lower controller to use standby buffer during recovery.")
+    if not (buffer_commands.get("selection_role") == "buffer").any():
+        raise SystemExit("Expected at least one gateway command to be sent to a buffer resource.")
 
     household, appliance, fatigue = controller.contribution_frames(commands)
     if household.empty or appliance.empty or fatigue.empty:
@@ -117,8 +165,30 @@ def main() -> None:
         market_mode="FCR-N",
         resource_mode="Fast only",
     )
-    if overload_summary["shortfall_kw"] <= 0.0 and overload_tracking["shortfall_kw"].max() <= 0.0:
-        raise SystemExit("Expected shortfall diagnostics for an infeasible high reserve request.")
+    if overload_plan["bess_fcr_kw"] >= 100000.0:
+        raise SystemExit("Infeasible upper commitment should be derated to the selected active roster.")
+    if overload_tracking["requested_up_kw"].max() > overload_tracking["committed_up_kw"].max() + 1e-6:
+        raise SystemExit("Requested reserve should never exceed committed upward reserve.")
+
+    combined_plan = dict(plan)
+    combined_plan.update(
+        {
+            "bess_fcr_kw": 100.0,
+            "ev_fcr_kw": 0.0,
+            "bess_afrr_up_kw": 80.0,
+            "ev_afrr_up_kw": 0.0,
+        }
+    )
+    combined_summary, combined_tracking, _, _ = controller.execute_interval(
+        row=df.iloc[1],
+        fine_signals=constant_signal(df.index[1]),
+        plan=combined_plan,
+        interval_index=3,
+        market_mode="Combined",
+        resource_mode="Fast only",
+    )
+    if combined_tracking["requested_up_kw"].max() > combined_tracking["committed_up_kw"].max() + 1e-6:
+        raise SystemExit("Combined product request should be clipped to committed reserve, not FCR plus aFRR.")
 
     rotation_bundle = make_bundle(n_homes=12)
     rotation_roster = rotation_bundle["device_roster"].copy()
@@ -129,7 +199,7 @@ def main() -> None:
     rotation_controller = CentralizedVPPController(
         rotation_roster,
         fleet_meta,
-        InnerControllerConfig(max_devices_per_type=1, horizon_seconds=20),
+        InnerControllerConfig(max_devices_per_type=1, horizon_seconds=4),
     )
     small_plan = {key: 0.0 for key in plan}
     small_plan["bess_fcr_kw"] = 4.0

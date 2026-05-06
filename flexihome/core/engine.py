@@ -784,9 +784,9 @@ def _risk_cost_terms(
     risk_factors: Dict[str, float],
     penalty_weights: Dict[str, float],
 ) -> Dict[str, float]:
-    non_delivery_penalty = float(penalty_weights.get("non_delivery", 650.0))
-    activation_uncertainty_weight = float(penalty_weights.get("activation_uncertainty", 90.0))
-    asset_fatigue_weight = float(penalty_weights.get("asset_fatigue", 30.0))
+    non_delivery_penalty = float(penalty_weights.get("non_delivery", 900.0))
+    activation_uncertainty_weight = float(penalty_weights.get("activation_uncertainty", 100.0))
+    asset_fatigue_weight = float(penalty_weights.get("asset_fatigue", 75.0))
     q = float(np.clip(penalty_weights.get("risk_quantile", 0.80), 0.50, 0.95))
 
     fcr_signal_risk = float(np.clip(row.get("fcr_up_act_frac", 0.0) + row.get("fcr_down_act_frac", 0.0), 0.0, 1.0))
@@ -980,7 +980,10 @@ def solve_mpc_step(
             (afrr_up_frac * bess_up[k] + afrr_down_frac * bess_down[k] + (fcr_up_frac + fcr_down_frac) * bess_fcr[k])
             + 0.4 * (afrr_up_frac * ev_up[k] + afrr_down_frac * ev_down[k] + (fcr_up_frac + fcr_down_frac) * ev_fcr[k])
         )
-        discomfort = penalty_weights["comfort"] * (temp_low_slack[k] + temp_high_slack[k]) + penalty_weights["departure"] * ev_slack[k]
+        discomfort = (
+            penalty_weights["comfort"] * dt_h * (temp_low_slack[k] + temp_high_slack[k])
+            + penalty_weights["departure"] * ev_slack[k]
+        )
         risk_terms = _risk_cost_terms(
             {
                 "bess_fcr_kw": bess_fcr[k],
@@ -1467,7 +1470,7 @@ def run_mpc_controller(
     device_roster: pd.DataFrame | None = None,
     inner_controller_mode: str = "mpc",
     inner_dt_seconds: int = 4,
-    inner_mpc_horizon_seconds: int = 20,
+    inner_mpc_horizon_seconds: int = 4,
     rotation_strategy: str = "usage_aware",
     gateway_mode: str = "simulated_centralized",
     execute_lower_mpc: bool = True,
@@ -1569,10 +1572,11 @@ def run_mpc_controller(
             break
         schedule_snapshots.append(solution["schedule"])
         plan = solution["controls"]
-        row = df.iloc[t]
+        execution_row_idx = min(t + 1, len(df) - 1)
+        row = df.iloc[execution_row_idx]
         dt_h = row["dt_h"]
         if execute_lower_mpc:
-            fine_signals = build_inner_tracking_window(df, preview_4s, t, dt_seconds=int(inner_dt_seconds))
+            fine_signals = build_inner_tracking_window(df, preview_4s, execution_row_idx, dt_seconds=int(inner_dt_seconds))
             if progress_callback:
                 progress_callback(
                     base_progress + horizon_steps + 2,
@@ -1597,6 +1601,7 @@ def run_mpc_controller(
                     total_work,
                     f"Evaluating market gate for interval {t + 1}/{sim_steps}",
                 )
+            upper_schedule = centralized_controller.select_upper_schedule(row, plan, t, resource_mode)
             interval_summary = _upper_only_interval_summary(
                 row=row,
                 plan=plan,
@@ -1605,7 +1610,6 @@ def run_mpc_controller(
                 market_mode=market_mode,
             )
             interval_tracking = pd.DataFrame()
-            upper_schedule = centralized_controller.select_upper_schedule(row, plan, t, resource_mode)
             command_summary = pd.DataFrame()
         if not upper_schedule.empty:
             upper_device_schedules.append(upper_schedule)
@@ -1647,7 +1651,7 @@ def run_mpc_controller(
         degradation_cost = penalty_weights["degradation"] * dt_h / 1000.0 * (
             actual_bess_up + actual_bess_down + 0.4 * (actual_ev_up + actual_ev_down)
         )
-        comfort_penalty = penalty_weights["comfort"] * max(
+        comfort_penalty = penalty_weights["comfort"] * dt_h * max(
             0.0,
             abs(row["indoor_temp_c_ref"] + state["temp_delta_c"] - fleet_meta["setpoint_c"]) - fleet_meta["comfort_band_c"],
         )
@@ -1857,6 +1861,211 @@ def run_mpc_controller(
         "summary": summary,
         "compliance": compliance,
         "first_schedule": schedule_snapshots[0] if schedule_snapshots else pd.DataFrame(),
+        "upper_device_schedule": pd.concat(upper_device_schedules, ignore_index=True) if upper_device_schedules else pd.DataFrame(),
+        "gateway_commands": gateway_commands,
+        "household_contributions": household_contrib,
+        "appliance_contributions": appliance_contrib,
+        "usage_fatigue_summary": usage_fatigue,
+    }
+
+def run_lower_mpc_from_upper_result(
+    df: pd.DataFrame,
+    upper_result: Dict[str, object],
+    fleet_meta: Dict[str, float],
+    market_mode: str,
+    resource_mode: str,
+    preview_4s: pd.DataFrame | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    device_roster: pd.DataFrame | None = None,
+    inner_controller_mode: str = "mpc",
+    inner_dt_seconds: int = 4,
+    inner_mpc_horizon_seconds: int = 4,
+    rotation_strategy: str = "usage_aware",
+    gateway_mode: str = "live_market_coupled",
+) -> Dict[str, object]:
+    """Attach the lower 4-second controller to an already solved upper MPC socket.
+
+    This path intentionally does not forecast or re-solve the upper MPC. It
+    uses the reserve commitments stored in ``upper_result["history"]`` and
+    consumes the 4-second market feed only when the live market session starts.
+    """
+
+    upper_history = upper_result.get("history", pd.DataFrame()) if isinstance(upper_result, dict) else pd.DataFrame()
+    if not isinstance(upper_history, pd.DataFrame) or upper_history.empty:
+        empty = pd.DataFrame()
+        return {
+            "history": empty,
+            "summary": {},
+            "compliance": {},
+            "first_schedule": pd.DataFrame(),
+            "tracking_4s": empty,
+            "inner_mpc_trace": empty,
+            "upper_device_schedule": empty,
+            "gateway_commands": empty,
+            "household_contributions": empty,
+            "appliance_contributions": empty,
+            "usage_fatigue_summary": empty,
+        }
+
+    plan_columns = [
+        "bess_fcr_kw",
+        "ev_fcr_kw",
+        "hvac_fcr_kw",
+        "bess_afrr_up_kw",
+        "bess_afrr_down_kw",
+        "ev_afrr_up_kw",
+        "ev_afrr_down_kw",
+        "hvac_afrr_up_kw",
+        "hvac_afrr_down_kw",
+        "pv_afrr_down_kw",
+        "non_delivery_risk_cost_eur",
+        "activation_uncertainty_cost_eur",
+        "asset_fatigue_cost_eur",
+        "reserve_buffer_kw",
+        "risk_quantile",
+        "reserve_buffer_pct",
+    ]
+    controller_config = InnerControllerConfig(
+        mode=inner_controller_mode,
+        dt_seconds=int(inner_dt_seconds),
+        horizon_seconds=int(inner_mpc_horizon_seconds),
+        rotation_strategy=rotation_strategy,
+        gateway_mode=gateway_mode,
+    )
+    centralized_controller = CentralizedVPPController(
+        device_roster=device_roster if device_roster is not None else representative_roster_from_frame(df, fleet_meta),
+        fleet_meta=fleet_meta,
+        config=controller_config,
+    )
+
+    history: List[Dict[str, float]] = []
+    tracking_history: List[pd.DataFrame] = []
+    upper_device_schedules: List[pd.DataFrame] = []
+    gateway_command_summaries: List[pd.DataFrame] = []
+    total_work = max(len(upper_history), 1)
+
+    for t, (timestamp, upper_row) in enumerate(upper_history.iterrows()):
+        try:
+            row_idx = int(df.index.get_loc(pd.Timestamp(timestamp)))
+        except KeyError:
+            row_idx = min(t + 1, len(df) - 1)
+        row = df.iloc[row_idx]
+        plan = {key: float(upper_row.get(key, 0.0)) for key in plan_columns}
+        fine_signals = build_inner_tracking_window(df, preview_4s, row_idx, dt_seconds=int(inner_dt_seconds))
+        if progress_callback:
+            progress_callback(t + 1, total_work, f"Lower MPC live interval {t + 1}/{total_work}")
+        interval_summary, interval_tracking, upper_schedule, command_summary = centralized_controller.execute_interval(
+            row=row,
+            fine_signals=fine_signals,
+            plan=plan,
+            interval_index=t,
+            market_mode=market_mode,
+            resource_mode=resource_mode,
+        )
+        tracking_history.append(interval_tracking)
+        if not upper_schedule.empty:
+            upper_device_schedules.append(upper_schedule)
+        if not command_summary.empty:
+            gateway_command_summaries.append(command_summary)
+
+        actual_bess_up = interval_summary["bess_up_kw"]
+        actual_bess_down = interval_summary["bess_down_kw"]
+        actual_ev_up = interval_summary["ev_up_kw"]
+        actual_ev_down = interval_summary["ev_down_kw"]
+        actual_hvac_up = interval_summary["hvac_up_kw"]
+        actual_hvac_down = interval_summary["hvac_down_kw"]
+        actual_pv_down = interval_summary["pv_down_kw"]
+        dt_h = float(row["dt_h"])
+        fcr_bid_kw = plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0) + plan.get("hvac_fcr_kw", 0.0)
+        afrr_up_bid_kw = plan.get("bess_afrr_up_kw", 0.0) + plan.get("ev_afrr_up_kw", 0.0) + plan.get("hvac_afrr_up_kw", 0.0)
+        afrr_down_bid_kw = (
+            plan.get("bess_afrr_down_kw", 0.0)
+            + plan.get("ev_afrr_down_kw", 0.0)
+            + plan.get("hvac_afrr_down_kw", 0.0)
+            + plan.get("pv_afrr_down_kw", 0.0)
+        )
+        capacity_revenue = dt_h / 1000.0 * (
+            row["fcrn_capacity_eur_per_mw_h"] * fcr_bid_kw
+            + row["afrr_up_capacity_eur_per_mw_h"] * afrr_up_bid_kw
+            + row["afrr_down_capacity_eur_per_mw_h"] * afrr_down_bid_kw
+        )
+        activation_revenue = dt_h / 1000.0 * (
+            row["afrr_up_energy_eur_per_mwh"] * (actual_bess_up + actual_ev_up + actual_hvac_up)
+            + row["afrr_down_energy_eur_per_mwh"] * (actual_bess_down + actual_ev_down + actual_hvac_down + actual_pv_down)
+        )
+        degradation_cost = float(upper_row.get("degradation_cost_eur", 0.0))
+        comfort_penalty = float(upper_row.get("comfort_penalty_eur", 0.0))
+        risk_cost = (
+            float(plan.get("non_delivery_risk_cost_eur", 0.0))
+            + float(plan.get("activation_uncertainty_cost_eur", 0.0))
+            + float(plan.get("asset_fatigue_cost_eur", 0.0))
+        )
+        record = upper_row.to_dict()
+        record.update(
+            {
+                "timestamp": row.name,
+                "inner_solver_status": str(interval_summary.get("inner_solver_status", "unknown")),
+                "inner_controller_mode": inner_controller_mode,
+                "fcr_bid_kw": fcr_bid_kw,
+                "afrr_up_bid_kw": afrr_up_bid_kw,
+                "afrr_down_bid_kw": afrr_down_bid_kw,
+                "requested_up_kw": interval_summary["requested_up_kw"],
+                "requested_down_kw": interval_summary["requested_down_kw"],
+                "delivered_up_kw": interval_summary["delivered_up_kw"],
+                "delivered_down_kw": interval_summary["delivered_down_kw"],
+                "bess_up_kw": actual_bess_up,
+                "bess_down_kw": actual_bess_down,
+                "ev_up_kw": actual_ev_up,
+                "ev_down_kw": actual_ev_down,
+                "hvac_up_kw": actual_hvac_up,
+                "hvac_down_kw": actual_hvac_down,
+                "pv_down_kw": actual_pv_down,
+                "capacity_revenue_eur": capacity_revenue,
+                "activation_revenue_eur": activation_revenue,
+                "net_revenue_eur": capacity_revenue + activation_revenue - degradation_cost - comfort_penalty - risk_cost,
+                "bess_soc_mwh": interval_summary["bess_soc_mwh"],
+                "ev_soc_mwh": interval_summary["ev_soc_mwh"],
+                "indoor_temp_c": interval_summary["indoor_temp_c"],
+                "fcr_accuracy_ratio": interval_summary["delivered_up_kw"] / interval_summary["requested_up_kw"] if interval_summary["requested_up_kw"] > 1 else np.nan,
+                "down_accuracy_ratio": interval_summary["delivered_down_kw"] / interval_summary["requested_down_kw"] if interval_summary["requested_down_kw"] > 1 else np.nan,
+                "inner_tracking_samples": interval_summary["tracking_samples"],
+                "tracking_error_kw": interval_summary.get("tracking_error_kw", 0.0),
+                "shortfall_kw": interval_summary.get("shortfall_kw", 0.0),
+            }
+        )
+        history.append(record)
+
+    result_df = pd.DataFrame(history).set_index("timestamp")
+    tracking_df = pd.concat(tracking_history) if tracking_history else pd.DataFrame()
+    gateway_commands = pd.concat(gateway_command_summaries, ignore_index=True) if gateway_command_summaries else pd.DataFrame()
+    household_contrib, appliance_contrib, usage_fatigue = centralized_controller.contribution_frames(gateway_commands)
+    summary = dict(upper_result.get("summary", {})) if isinstance(upper_result, dict) else {}
+    dt_h0 = float(df["dt_h"].iloc[0])
+    summary.update(
+        {
+            "total_revenue_eur": float(result_df.get("net_revenue_eur", pd.Series([0.0])).sum()),
+            "capacity_revenue_eur": float(result_df.get("capacity_revenue_eur", pd.Series([0.0])).sum()),
+            "activation_revenue_eur": float(result_df.get("activation_revenue_eur", pd.Series([0.0])).sum()),
+            "delivered_up_mwh": float(result_df["delivered_up_kw"].sum() * dt_h0 / 1000.0),
+            "delivered_down_mwh": float(result_df["delivered_down_kw"].sum() * dt_h0 / 1000.0),
+            "inner_controller_mode": inner_controller_mode,
+            "inner_dt_seconds": int(inner_dt_seconds),
+            "inner_mpc_horizon_seconds": int(inner_mpc_horizon_seconds),
+            "rotation_strategy": rotation_strategy,
+            "gateway_mode": gateway_mode,
+            "execute_lower_mpc": True,
+            "mean_tracking_error_kw": float(result_df["tracking_error_kw"].mean()) if "tracking_error_kw" in result_df else 0.0,
+            "mean_shortfall_kw": float(result_df["shortfall_kw"].mean()) if "shortfall_kw" in result_df else 0.0,
+        }
+    )
+    compliance = dict(upper_result.get("compliance", {})) if isinstance(upper_result, dict) else {}
+    return {
+        "history": result_df,
+        "tracking_4s": tracking_df,
+        "inner_mpc_trace": tracking_df,
+        "summary": summary,
+        "compliance": compliance,
+        "first_schedule": upper_result.get("first_schedule", pd.DataFrame()) if isinstance(upper_result, dict) else pd.DataFrame(),
         "upper_device_schedule": pd.concat(upper_device_schedules, ignore_index=True) if upper_device_schedules else pd.DataFrame(),
         "gateway_commands": gateway_commands,
         "household_contributions": household_contrib,

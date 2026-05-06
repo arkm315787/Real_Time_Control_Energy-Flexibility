@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import linprog
-
 
 DEVICE_ORDER = ["BESS", "EV", "HVAC", "PV"]
+RECOVERY_PRIORITY = ["BESS", "EV", "PV", "HVAC"]
 
 DEVICE_DEFAULTS = {
     "BESS": {
@@ -60,10 +60,11 @@ DEVICE_DEFAULTS = {
 class InnerControllerConfig:
     mode: str = "mpc"
     dt_seconds: int = 4
-    horizon_seconds: int = 20
+    horizon_seconds: int = 4
     rotation_strategy: str = "usage_aware"
     gateway_mode: str = "simulated_centralized"
-    max_devices_per_type: int = 48
+    max_devices_per_type: int = 100000
+    tracking_tolerance_pct: float = 0.10
 
     @property
     def horizon_steps(self) -> int:
@@ -199,6 +200,8 @@ class CentralizedVPPController:
                 self.devices[column] = default
         self.devices = self.devices.set_index("device_id", drop=False)
         self.previous_pool_dispatch = {device_type: 0.0 for device_type in DEVICE_ORDER}
+        self.pool_actual_dispatch = {device_type: 0.0 for device_type in DEVICE_ORDER}
+        self.last_abs_tracking_error_kw = 0.0
 
     def execute_interval(
         self,
@@ -210,48 +213,102 @@ class CentralizedVPPController:
         resource_mode: str,
     ) -> tuple[Dict[str, float], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         selected = self._select_upper_devices(row, plan, interval_index, resource_mode)
+        self._derate_plan_to_selected(plan, selected)
         tracking_rows: List[Dict[str, float]] = []
         command_accumulator: Dict[str, Dict[str, object]] = {}
         outer_dt_seconds = int(round(float(row["dt_h"]) * 3600.0))
 
-        for tick_idx, (ts, signal_row) in enumerate(fine_signals.iterrows()):
-            horizon = self._signal_horizon(fine_signals, tick_idx)
+        for _, (ts, signal_row) in enumerate(fine_signals.iterrows()):
+            tick_started = time.perf_counter()
             available = self._availability(row, selected.index)
-            caps = self._pool_caps(selected, available, resource_mode)
             request_now = self._request_kw(signal_row, plan, market_mode)
-            solution = self._solve_pool_mpc(horizon, plan, caps, market_mode)
+            committed_up_kw, committed_down_kw = self._commitment_limits(plan, market_mode)
+            active_caps = self._pool_caps(selected, available, resource_mode, roles={"active"})
+            buffer_caps = self._pool_caps(selected, available, resource_mode, roles={"buffer"})
+            normal_solution = self._allocate_tracking_delta(
+                signal_row,
+                plan,
+                active_caps,
+                {device_type: {"up": 0.0, "down": 0.0} for device_type in DEVICE_ORDER},
+                market_mode,
+                recovery_mode=False,
+                apply_state=False,
+            )
+            normal_error = float(normal_solution.get("predicted_power_kw", 0.0)) - request_now
+            tolerance_kw = max(abs(request_now) * float(self.config.tracking_tolerance_pct), 1.0)
+            error_rising = abs(normal_error) >= self.last_abs_tracking_error_kw + 0.5
+            recovery_mode = abs(normal_error) > tolerance_kw and (error_rising or self.last_abs_tracking_error_kw > tolerance_kw)
+            solution = (
+                self._allocate_tracking_delta(signal_row, plan, active_caps, buffer_caps, market_mode, recovery_mode=True, apply_state=True)
+                if recovery_mode
+                else self._allocate_tracking_delta(
+                    signal_row,
+                    plan,
+                    active_caps,
+                    {device_type: {"up": 0.0, "down": 0.0} for device_type in DEVICE_ORDER},
+                    market_mode,
+                    recovery_mode=False,
+                    apply_state=True,
+                )
+            )
 
             if solution["status"] != "Optimal":
-                dispatch_by_type = {device_type: 0.0 for device_type in DEVICE_ORDER}
+                delivered_by_type = {device_type: 0.0 for device_type in DEVICE_ORDER}
+                command_by_type = {device_type: 0.0 for device_type in DEVICE_ORDER}
             else:
-                dispatch_by_type = solution["dispatch_by_type"]
+                delivered_by_type = solution["delivered_by_type"]
+                command_by_type = solution["command_by_type"]
 
-            commands = self._apportion_commands(selected, available, dispatch_by_type)
-            delivered = float(commands["command_kw"].sum()) if not commands.empty else 0.0
+            commands = self._apportion_commands(selected, available, delivered_by_type, target_by_type=command_by_type)
+            delivered = float(solution.get("predicted_power_kw", 0.0))
             self._apply_device_commands(commands, command_accumulator)
+            tracking_error = delivered - request_now
+            self.last_abs_tracking_error_kw = abs(tracking_error)
+            control_latency_ms = (time.perf_counter() - tick_started) * 1000.0
 
             tracking_rows.append(
                 {
                     "timestamp": ts,
                     "inner_solver_status": solution["status"],
                     "inner_controller_mode": self.config.mode,
+                    "lower_tracking_mode": "proportional_buffer_tracker",
                     "gateway_mode": self.config.gateway_mode,
                     "frequency_hz": float(signal_row["frequency_hz"]),
                     "fcr_signal_norm": float(signal_row["fcr_signal_norm"]),
                     "afrr_signal_norm": float(signal_row["afrr_signal_norm"]),
+                    "committed_up_kw": committed_up_kw,
+                    "committed_down_kw": committed_down_kw,
                     "requested_up_kw": max(request_now, 0.0),
                     "requested_down_kw": max(-request_now, 0.0),
                     "delivered_up_kw": max(delivered, 0.0),
                     "delivered_down_kw": max(-delivered, 0.0),
-                    "tracking_error_kw": delivered - request_now,
+                    "fleet_power_before_kw": float(solution.get("actual_before_kw", 0.0)),
+                    "fleet_power_after_kw": delivered,
+                    "target_command_kw": float(solution.get("target_command_kw", 0.0)),
+                    "tracking_delta_kw": float(solution.get("tracking_delta_kw", request_now - delivered)),
+                    "tracking_error_kw": tracking_error,
+                    "tracking_tolerance_kw": tolerance_kw,
+                    "tracking_tolerance_pct": float(self.config.tracking_tolerance_pct),
+                    "error_rising": bool(error_rising),
+                    "recovery_mode": bool(recovery_mode),
                     "shortfall_kw": max(abs(request_now) - abs(delivered), 0.0),
-                    "bess_up_kw": max(dispatch_by_type.get("BESS", 0.0), 0.0),
-                    "bess_down_kw": max(-dispatch_by_type.get("BESS", 0.0), 0.0),
-                    "ev_up_kw": max(dispatch_by_type.get("EV", 0.0), 0.0),
-                    "ev_down_kw": max(-dispatch_by_type.get("EV", 0.0), 0.0),
-                    "hvac_up_kw": max(dispatch_by_type.get("HVAC", 0.0), 0.0),
-                    "hvac_down_kw": max(-dispatch_by_type.get("HVAC", 0.0), 0.0),
-                    "pv_down_kw": max(-dispatch_by_type.get("PV", 0.0), 0.0),
+                    "reserve_buffer_kw": float(plan.get("reserve_buffer_kw", 0.0)),
+                    "buffer_used_kw": float(solution.get("buffer_used_kw", 0.0)),
+                    "active_capacity_kw": float(solution.get("active_capacity_kw", 0.0)),
+                    "buffer_capacity_kw": float(solution.get("buffer_capacity_kw", 0.0)),
+                    "active_selected_devices": int((selected.get("selection_role", pd.Series(dtype=object)) == "active").sum()),
+                    "buffer_selected_devices": int((selected.get("selection_role", pd.Series(dtype=object)) == "buffer").sum()),
+                    "control_latency_ms": float(control_latency_ms),
+                    "control_deadline_ms": float(self.config.dt_seconds * 1000.0),
+                    "control_deadline_met": bool(control_latency_ms <= self.config.dt_seconds * 1000.0),
+                    "optimization_strategy": str(solution.get("optimization_strategy", "proportional_allocation")),
+                    "bess_up_kw": max(delivered_by_type.get("BESS", 0.0), 0.0),
+                    "bess_down_kw": max(-delivered_by_type.get("BESS", 0.0), 0.0),
+                    "ev_up_kw": max(delivered_by_type.get("EV", 0.0), 0.0),
+                    "ev_down_kw": max(-delivered_by_type.get("EV", 0.0), 0.0),
+                    "hvac_up_kw": max(delivered_by_type.get("HVAC", 0.0), 0.0),
+                    "hvac_down_kw": max(-delivered_by_type.get("HVAC", 0.0), 0.0),
+                    "pv_down_kw": max(-delivered_by_type.get("PV", 0.0), 0.0),
                     "selected_devices": int(len(selected)),
                     "inner_mpc_horizon_seconds": int(self.config.horizon_seconds),
                 }
@@ -278,6 +335,7 @@ class CentralizedVPPController:
         resource_mode: str,
     ) -> pd.DataFrame:
         selected = self._select_upper_devices(row, plan, interval_index, resource_mode)
+        self._derate_plan_to_selected(plan, selected)
         if selected.empty:
             return selected.reset_index(drop=True)
         upper_schedule = selected.reset_index(drop=True)
@@ -333,50 +391,111 @@ class CentralizedVPPController:
             + np.where(devices["cooldown_seconds"] > 0, 100.0, 0.0)
         )
 
-        requirements = self._requirements_by_type(plan, resource_mode)
+        active_requirements = self._requirements_by_type(plan, resource_mode)
+        buffer_requirements = self._buffer_requirements_by_type(plan, active_requirements, resource_mode)
         selected_parts = []
-        for device_type in DEVICE_ORDER:
-            req = requirements[device_type]
-            if req["up"] <= 0.0 and req["down"] <= 0.0:
-                continue
-            candidates = devices[
-                (devices["device_type"] == device_type)
-                & devices["online"].astype(bool)
-                & (devices["cooldown_seconds"].astype(float) <= 0.0)
-                & (devices["consecutive_seconds"].astype(float) < devices["max_consecutive_seconds"].astype(float))
-                & ((devices["available_up_kw"] > 0.001) | (devices["available_down_kw"] > 0.001))
-            ].copy()
-            if candidates.empty:
-                continue
-            candidates = candidates.sort_values(["usage_score", "response_time_s", "household_id"])
-            selected = []
-            up_remaining = float(req["up"])
-            down_remaining = float(req["down"])
-            for _, candidate in candidates.iterrows():
-                if len(selected) >= self.config.max_devices_per_type:
-                    break
-                up_cap = min(max(up_remaining, 0.0), float(candidate["available_up_kw"]))
-                down_cap = min(max(down_remaining, 0.0), float(candidate["available_down_kw"]))
-                if up_cap <= 0.001 and down_cap <= 0.001:
+        selected_ids: set[str] = set()
+
+        def select_for_requirements(requirements: Dict[str, Dict[str, float]], role: str) -> None:
+            for device_type in DEVICE_ORDER:
+                req = requirements[device_type]
+                if req["up"] <= 0.0 and req["down"] <= 0.0:
                     continue
-                row_payload = candidate.to_dict()
-                row_payload["upper_up_cap_kw"] = up_cap
-                row_payload["upper_down_cap_kw"] = down_cap
-                row_payload["upper_plan_up_kw"] = float(req["up"])
-                row_payload["upper_plan_down_kw"] = float(req["down"])
-                row_payload["selection_reason"] = self.config.rotation_strategy
-                selected.append(row_payload)
-                up_remaining -= up_cap
-                down_remaining -= down_cap
-                if up_remaining <= 0.001 and down_remaining <= 0.001:
-                    break
-            if selected:
-                selected_parts.append(pd.DataFrame(selected))
+                candidates = devices[
+                    (devices["device_type"] == device_type)
+                    & ~devices["device_id"].astype(str).isin(selected_ids)
+                    & devices["online"].astype(bool)
+                    & (devices["cooldown_seconds"].astype(float) <= 0.0)
+                    & (devices["consecutive_seconds"].astype(float) < devices["max_consecutive_seconds"].astype(float))
+                    & ((devices["available_up_kw"] > 0.001) | (devices["available_down_kw"] > 0.001))
+                ].copy()
+                if candidates.empty:
+                    continue
+                if role == "buffer":
+                    candidates = candidates.sort_values(["response_time_s", "usage_score", "household_id"])
+                else:
+                    candidates = candidates.sort_values(["usage_score", "response_time_s", "household_id"])
+                selected = []
+                up_remaining = float(req["up"])
+                down_remaining = float(req["down"])
+                for _, candidate in candidates.iterrows():
+                    if len(selected) >= self.config.max_devices_per_type:
+                        break
+                    up_cap = min(max(up_remaining, 0.0), float(candidate["available_up_kw"]))
+                    down_cap = min(max(down_remaining, 0.0), float(candidate["available_down_kw"]))
+                    if up_cap <= 0.001 and down_cap <= 0.001:
+                        continue
+                    row_payload = candidate.to_dict()
+                    row_payload["upper_up_cap_kw"] = up_cap
+                    row_payload["upper_down_cap_kw"] = down_cap
+                    row_payload["upper_plan_up_kw"] = float(req["up"])
+                    row_payload["upper_plan_down_kw"] = float(req["down"])
+                    row_payload["selection_reason"] = self.config.rotation_strategy
+                    row_payload["selection_role"] = role
+                    selected.append(row_payload)
+                    selected_ids.add(str(candidate["device_id"]))
+                    up_remaining -= up_cap
+                    down_remaining -= down_cap
+                    if up_remaining <= 0.001 and down_remaining <= 0.001:
+                        break
+                if selected:
+                    selected_parts.append(pd.DataFrame(selected))
+
+        select_for_requirements(active_requirements, "active")
+        select_for_requirements(buffer_requirements, "buffer")
 
         if not selected_parts:
             return pd.DataFrame(columns=list(self.devices.columns) + ["upper_up_cap_kw", "upper_down_cap_kw"])
         selected_df = pd.concat(selected_parts, ignore_index=True).set_index("device_id", drop=False)
         return selected_df
+
+    def _derate_plan_to_selected(self, plan: Dict[str, float], selected: pd.DataFrame) -> None:
+        if selected.empty:
+            for key in [
+                "bess_fcr_kw",
+                "ev_fcr_kw",
+                "hvac_fcr_kw",
+                "bess_afrr_up_kw",
+                "bess_afrr_down_kw",
+                "ev_afrr_up_kw",
+                "ev_afrr_down_kw",
+                "hvac_afrr_up_kw",
+                "hvac_afrr_down_kw",
+                "pv_afrr_down_kw",
+            ]:
+                plan[key] = 0.0
+            return
+        active = selected[selected.get("selection_role", "active") == "active"] if "selection_role" in selected else selected
+        caps = {
+            device_type: {
+                "up": float(active.loc[active["device_type"] == device_type, "upper_up_cap_kw"].sum()),
+                "down": float(active.loc[active["device_type"] == device_type, "upper_down_cap_kw"].sum()),
+            }
+            for device_type in DEVICE_ORDER
+        }
+
+        for prefix, device_type in [("bess", "BESS"), ("ev", "EV"), ("hvac", "HVAC")]:
+            fcr_key = f"{prefix}_fcr_kw"
+            up_key = f"{prefix}_afrr_up_kw"
+            down_key = f"{prefix}_afrr_down_kw"
+            fcr = float(plan.get(fcr_key, 0.0))
+            up = float(plan.get(up_key, 0.0))
+            down = float(plan.get(down_key, 0.0))
+            up_req = fcr + up
+            down_req = fcr + down
+            ratio = 1.0
+            if up_req > 0.001:
+                ratio = min(ratio, caps[device_type]["up"] / up_req)
+            if down_req > 0.001:
+                ratio = min(ratio, caps[device_type]["down"] / down_req)
+            ratio = float(np.clip(ratio, 0.0, 1.0))
+            plan[fcr_key] = fcr * ratio
+            plan[up_key] = up * ratio
+            plan[down_key] = down * ratio
+
+        pv_down = float(plan.get("pv_afrr_down_kw", 0.0))
+        if pv_down > 0.001:
+            plan["pv_afrr_down_kw"] = min(pv_down, caps["PV"]["down"])
 
     def _requirements_by_type(self, plan: Dict[str, float], resource_mode: str) -> Dict[str, Dict[str, float]]:
         requirements = {
@@ -397,6 +516,44 @@ class CentralizedVPPController:
         if resource_mode == "Fast only":
             requirements["HVAC"] = {"up": 0.0, "down": 0.0}
             requirements["PV"] = {"up": 0.0, "down": 0.0}
+        return requirements
+
+    def _buffer_requirements_by_type(
+        self,
+        plan: Dict[str, float],
+        active_requirements: Dict[str, Dict[str, float]],
+        resource_mode: str,
+    ) -> Dict[str, Dict[str, float]]:
+        requirements = {device_type: {"up": 0.0, "down": 0.0} for device_type in DEVICE_ORDER}
+        buffer_kw = max(float(plan.get("reserve_buffer_kw", 0.0)), 0.0)
+        if buffer_kw <= 0.0:
+            return requirements
+        up_total = sum(req["up"] for req in active_requirements.values())
+        down_total = sum(req["down"] for req in active_requirements.values())
+        allowed_up = ["BESS", "EV", "HVAC"]
+        allowed_down = ["BESS", "EV", "PV", "HVAC"]
+        if resource_mode == "Fast only":
+            allowed_up = ["BESS", "EV"]
+            allowed_down = ["BESS", "EV"]
+
+        def assign(direction: str, allowed: List[str], total: float) -> None:
+            if total <= 0.0:
+                return
+            weights = {
+                device_type: 1.0 / max(
+                    float(self.fleet_meta.get("hvac_response_s", DEVICE_DEFAULTS[device_type]["response_time_s"]))
+                    if device_type == "HVAC"
+                    else float(DEVICE_DEFAULTS[device_type]["response_time_s"]),
+                    1e-6,
+                )
+                for device_type in allowed
+            }
+            weight_sum = sum(weights.values())
+            for device_type, weight in weights.items():
+                requirements[device_type][direction] = buffer_kw * weight / max(weight_sum, 1e-9)
+
+        assign("up", allowed_up, up_total)
+        assign("down", allowed_down, down_total)
         return requirements
 
     def _availability(self, row: pd.Series, device_ids: Iterable[str]) -> pd.DataFrame:
@@ -458,11 +615,19 @@ class CentralizedVPPController:
             }
         ).set_index("device_id")
 
-    def _pool_caps(self, selected: pd.DataFrame, available: pd.DataFrame, resource_mode: str) -> Dict[str, Dict[str, float]]:
+    def _pool_caps(
+        self,
+        selected: pd.DataFrame,
+        available: pd.DataFrame,
+        resource_mode: str,
+        roles: set[str] | None = None,
+    ) -> Dict[str, Dict[str, float]]:
         caps = {device_type: {"up": 0.0, "down": 0.0} for device_type in DEVICE_ORDER}
         if selected.empty:
             return caps
         working = selected.join(available[["available_up_kw", "available_down_kw"]], rsuffix="_now")
+        if roles is not None and "selection_role" in working:
+            working = working[working["selection_role"].isin(roles)]
         for device_type, group in working.groupby("device_type"):
             if resource_mode == "Fast only" and device_type in {"HVAC", "PV"}:
                 continue
@@ -470,19 +635,28 @@ class CentralizedVPPController:
             caps[device_type]["down"] = float(np.minimum(group["upper_down_cap_kw"], group["available_down_kw_now"]).sum())
         return caps
 
-    def _signal_horizon(self, fine_signals: pd.DataFrame, tick_idx: int) -> pd.DataFrame:
-        horizon = fine_signals.iloc[tick_idx : tick_idx + self.config.horizon_steps].copy()
-        if horizon.empty:
-            horizon = fine_signals.iloc[[-1]].copy()
-        while len(horizon) < self.config.horizon_steps:
-            next_row = horizon.iloc[[-1]].copy()
-            next_row.index = [horizon.index[-1] + pd.Timedelta(seconds=self.config.dt_seconds)]
-            horizon = pd.concat([horizon, next_row])
-        return horizon
-
     def _request_kw(self, signal_row: pd.Series, plan: Dict[str, float], market_mode: str) -> float:
         fcr_signal = float(signal_row["fcr_signal_norm"]) if market_mode in {"FCR-N", "Combined"} else 0.0
         afrr_signal = float(signal_row["afrr_signal_norm"]) if market_mode in {"aFRR", "Combined"} else 0.0
+        up_limit, down_limit = self._commitment_limits(plan, market_mode)
+        raw_request = fcr_signal * self._fcr_bid_kw(plan) + max(afrr_signal, 0.0) * self._afrr_up_bid_kw(plan) - max(-afrr_signal, 0.0) * self._afrr_down_bid_kw(plan)
+        return float(np.clip(raw_request, -max(down_limit, 0.0), max(up_limit, 0.0)))
+
+    def _fcr_bid_kw(self, plan: Dict[str, float]) -> float:
+        return float(plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0) + plan.get("hvac_fcr_kw", 0.0))
+
+    def _afrr_up_bid_kw(self, plan: Dict[str, float]) -> float:
+        return float(plan.get("bess_afrr_up_kw", 0.0) + plan.get("ev_afrr_up_kw", 0.0) + plan.get("hvac_afrr_up_kw", 0.0))
+
+    def _afrr_down_bid_kw(self, plan: Dict[str, float]) -> float:
+        return float(
+            plan.get("bess_afrr_down_kw", 0.0)
+            + plan.get("ev_afrr_down_kw", 0.0)
+            + plan.get("hvac_afrr_down_kw", 0.0)
+            + plan.get("pv_afrr_down_kw", 0.0)
+        )
+
+    def _commitment_limits(self, plan: Dict[str, float], market_mode: str) -> tuple[float, float]:
         fcr_bid = float(plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0) + plan.get("hvac_fcr_kw", 0.0))
         afrr_up = float(plan.get("bess_afrr_up_kw", 0.0) + plan.get("ev_afrr_up_kw", 0.0) + plan.get("hvac_afrr_up_kw", 0.0))
         afrr_down = float(
@@ -491,83 +665,172 @@ class CentralizedVPPController:
             + plan.get("hvac_afrr_down_kw", 0.0)
             + plan.get("pv_afrr_down_kw", 0.0)
         )
-        return fcr_signal * fcr_bid + max(afrr_signal, 0.0) * afrr_up - max(-afrr_signal, 0.0) * afrr_down
+        if market_mode == "FCR-N":
+            up_limit = fcr_bid
+            down_limit = fcr_bid
+        elif market_mode == "aFRR":
+            up_limit = afrr_up
+            down_limit = afrr_down
+        else:
+            up_limit = max(fcr_bid, afrr_up)
+            down_limit = max(fcr_bid, afrr_down)
+        return float(max(up_limit, 0.0)), float(max(down_limit, 0.0))
 
-    def _solve_pool_mpc(
+    def _response_alpha(self, device_type: str) -> float:
+        response_seconds = float(DEVICE_DEFAULTS[device_type]["response_time_s"])
+        if device_type == "HVAC":
+            response_seconds = float(self.fleet_meta.get("hvac_response_s", response_seconds))
+        return float(np.clip(self.config.dt_seconds / max(response_seconds, 1e-6), 0.0, 1.0))
+
+    def _plan_requirement_weights(self, plan: Dict[str, float], market_mode: str, direction: str) -> Dict[str, float]:
+        fcr_active = market_mode in {"FCR-N", "Combined"}
+        afrr_active = market_mode in {"aFRR", "Combined"}
+        if direction == "up":
+            return {
+                "BESS": (float(plan.get("bess_fcr_kw", 0.0)) if fcr_active else 0.0) + (float(plan.get("bess_afrr_up_kw", 0.0)) if afrr_active else 0.0),
+                "EV": (float(plan.get("ev_fcr_kw", 0.0)) if fcr_active else 0.0) + (float(plan.get("ev_afrr_up_kw", 0.0)) if afrr_active else 0.0),
+                "HVAC": (float(plan.get("hvac_fcr_kw", 0.0)) if fcr_active else 0.0) + (float(plan.get("hvac_afrr_up_kw", 0.0)) if afrr_active else 0.0),
+                "PV": 0.0,
+            }
+        return {
+            "BESS": (float(plan.get("bess_fcr_kw", 0.0)) if fcr_active else 0.0) + (float(plan.get("bess_afrr_down_kw", 0.0)) if afrr_active else 0.0),
+            "EV": (float(plan.get("ev_fcr_kw", 0.0)) if fcr_active else 0.0) + (float(plan.get("ev_afrr_down_kw", 0.0)) if afrr_active else 0.0),
+            "HVAC": (float(plan.get("hvac_fcr_kw", 0.0)) if fcr_active else 0.0) + (float(plan.get("hvac_afrr_down_kw", 0.0)) if afrr_active else 0.0),
+            "PV": float(plan.get("pv_afrr_down_kw", 0.0)) if afrr_active else 0.0,
+        }
+
+    def _proportional_commands(
         self,
-        horizon: pd.DataFrame,
-        plan: Dict[str, float],
+        requested_abs_kw: float,
         caps: Dict[str, Dict[str, float]],
+        direction: str,
+        weights: Dict[str, float],
+        order: List[str] | None = None,
+    ) -> Dict[str, float]:
+        commands = {device_type: 0.0 for device_type in DEVICE_ORDER}
+        remaining = max(float(requested_abs_kw), 0.0)
+        cap_by_type = {device_type: max(float(caps[device_type][direction]), 0.0) for device_type in DEVICE_ORDER}
+        active_types = [device_type for device_type in DEVICE_ORDER if cap_by_type[device_type] > 0.001]
+        if remaining <= 0.001 or not active_types:
+            return commands
+        if order:
+            for device_type in order:
+                if remaining <= 0.001:
+                    break
+                take = min(cap_by_type.get(device_type, 0.0), remaining)
+                commands[device_type] += take
+                remaining -= take
+            return commands
+
+        weighted_types = [device_type for device_type in active_types if weights.get(device_type, 0.0) > 0.0]
+        if not weighted_types:
+            weighted_types = active_types
+            weights = {device_type: cap_by_type[device_type] for device_type in active_types}
+
+        open_types = set(weighted_types)
+        while remaining > 0.001 and open_types:
+            total_weight = sum(max(float(weights.get(device_type, 0.0)), 0.0) for device_type in open_types)
+            if total_weight <= 0.0:
+                total_weight = sum(cap_by_type[device_type] - commands[device_type] for device_type in open_types)
+                local_weights = {device_type: cap_by_type[device_type] - commands[device_type] for device_type in open_types}
+            else:
+                local_weights = weights
+            allocated_this_round = 0.0
+            saturated = []
+            for device_type in list(open_types):
+                headroom = cap_by_type[device_type] - commands[device_type]
+                if headroom <= 0.001:
+                    saturated.append(device_type)
+                    continue
+                share = remaining * max(float(local_weights.get(device_type, 0.0)), 0.0) / max(total_weight, 1e-9)
+                take = min(headroom, share)
+                commands[device_type] += take
+                allocated_this_round += take
+                if headroom - take <= 0.001:
+                    saturated.append(device_type)
+            remaining -= allocated_this_round
+            for device_type in saturated:
+                open_types.discard(device_type)
+            if allocated_this_round <= 0.001:
+                break
+        return commands
+
+    def _delivered_from_commands(self, command_by_type: Dict[str, float], actual_before_by_type: Dict[str, float]) -> Dict[str, float]:
+        delivered = {}
+        for device_type in DEVICE_ORDER:
+            alpha = self._response_alpha(device_type)
+            command = float(command_by_type.get(device_type, 0.0))
+            actual_before = float(actual_before_by_type.get(device_type, 0.0))
+            delivered[device_type] = actual_before + alpha * (command - actual_before)
+        return delivered
+
+    def _allocate_tracking_delta(
+        self,
+        signal_row: pd.Series,
+        plan: Dict[str, float],
+        active_caps: Dict[str, Dict[str, float]],
+        buffer_caps: Dict[str, Dict[str, float]],
         market_mode: str,
+        recovery_mode: bool,
+        apply_state: bool = False,
     ) -> Dict[str, object]:
-        resource_count = len(DEVICE_ORDER)
-        steps = len(horizon)
-        up_start = 0
-        down_start = up_start + resource_count * steps
-        slack_pos_start = down_start + resource_count * steps
-        slack_neg_start = slack_pos_start + steps
-        move_pos_start = slack_neg_start + steps
-        move_neg_start = move_pos_start + resource_count * steps
-        n_vars = move_neg_start + resource_count * steps
+        actual_before_by_type = {device_type: float(self.pool_actual_dispatch.get(device_type, 0.0)) for device_type in DEVICE_ORDER}
+        request_now = self._request_kw(signal_row, plan, market_mode)
+        direction = "up" if request_now >= 0.0 else "down"
+        sign = 1.0 if direction == "up" else -1.0
+        request_abs = abs(request_now)
+        plan_weights = self._plan_requirement_weights(plan, market_mode, direction)
 
-        def r_index(start: int, resource_idx: int, step_idx: int) -> int:
-            return start + step_idx * resource_count + resource_idx
+        active_abs = self._proportional_commands(request_abs, active_caps, direction, plan_weights)
+        buffer_abs = {device_type: 0.0 for device_type in DEVICE_ORDER}
+        command_by_type = {device_type: sign * active_abs[device_type] for device_type in DEVICE_ORDER}
+        delivered_by_type = self._delivered_from_commands(command_by_type, actual_before_by_type)
+        predicted_power_kw = sum(delivered_by_type.values())
 
-        c = np.zeros(n_vars)
-        bounds = [(0.0, None)] * n_vars
-        for k in range(steps):
-            c[slack_pos_start + k] = 10000.0
-            c[slack_neg_start + k] = 10000.0
-            for r, device_type in enumerate(DEVICE_ORDER):
-                bounds[r_index(up_start, r, k)] = (0.0, max(float(caps[device_type]["up"]), 0.0))
-                bounds[r_index(down_start, r, k)] = (0.0, max(float(caps[device_type]["down"]), 0.0))
-                cost = DEVICE_DEFAULTS[device_type]["degradation_cost"]
-                c[r_index(up_start, r, k)] = cost
-                c[r_index(down_start, r, k)] = cost
-                c[r_index(move_pos_start, r, k)] = 1.5
-                c[r_index(move_neg_start, r, k)] = 1.5
+        residual_kw = request_now - predicted_power_kw
+        if recovery_mode and abs(residual_kw) > 0.001 and np.sign(residual_kw) == sign:
+            remaining_response_kw = abs(residual_kw)
+            for device_type in RECOVERY_PRIORITY:
+                alpha = max(self._response_alpha(device_type), 1e-6)
+                available_command_kw = max(float(buffer_caps[device_type][direction]), 0.0)
+                command_kw = min(available_command_kw, remaining_response_kw / alpha)
+                if command_kw <= 0.001:
+                    continue
+                buffer_abs[device_type] = command_kw
+                remaining_response_kw -= alpha * command_kw
+                if remaining_response_kw <= 0.001:
+                    break
+            for device_type in DEVICE_ORDER:
+                command_by_type[device_type] += sign * buffer_abs[device_type]
+            delivered_by_type = self._delivered_from_commands(command_by_type, actual_before_by_type)
+            predicted_power_kw = sum(delivered_by_type.values())
 
-        a_eq = []
-        b_eq = []
-        for k, (_, signal_row) in enumerate(horizon.iterrows()):
-            row = np.zeros(n_vars)
-            for r in range(resource_count):
-                row[r_index(up_start, r, k)] = 1.0
-                row[r_index(down_start, r, k)] = -1.0
-            row[slack_pos_start + k] = -1.0
-            row[slack_neg_start + k] = 1.0
-            a_eq.append(row)
-            b_eq.append(self._request_kw(signal_row, plan, market_mode))
+        if apply_state:
+            for device_type in DEVICE_ORDER:
+                self.previous_pool_dispatch[device_type] = command_by_type[device_type]
+                self.pool_actual_dispatch[device_type] = delivered_by_type[device_type]
+        target_command_kw = sum(command_by_type.values())
+        return {
+            "status": "Optimal",
+            "command_by_type": command_by_type,
+            "delivered_by_type": delivered_by_type,
+            "actual_before_kw": sum(actual_before_by_type.values()),
+            "predicted_power_kw": predicted_power_kw,
+            "target_command_kw": target_command_kw,
+            "tracking_delta_kw": request_now - sum(actual_before_by_type.values()),
+            "buffer_used_kw": sum(buffer_abs.values()),
+            "active_capacity_kw": sum(active_caps[device_type][direction] for device_type in DEVICE_ORDER),
+            "buffer_capacity_kw": sum(buffer_caps[device_type][direction] for device_type in DEVICE_ORDER),
+            "optimization_strategy": "proportional_buffer_recovery" if recovery_mode else "proportional_active_tracking",
+        }
 
-        for k in range(steps):
-            for r, device_type in enumerate(DEVICE_ORDER):
-                row = np.zeros(n_vars)
-                row[r_index(up_start, r, k)] = 1.0
-                row[r_index(down_start, r, k)] = -1.0
-                if k > 0:
-                    row[r_index(up_start, r, k - 1)] = -1.0
-                    row[r_index(down_start, r, k - 1)] = 1.0
-                    rhs = 0.0
-                else:
-                    rhs = float(self.previous_pool_dispatch.get(device_type, 0.0))
-                row[r_index(move_pos_start, r, k)] = -1.0
-                row[r_index(move_neg_start, r, k)] = 1.0
-                a_eq.append(row)
-                b_eq.append(rhs)
-
-        result = linprog(c, A_eq=np.asarray(a_eq), b_eq=np.asarray(b_eq), bounds=bounds, method="highs")
-        if not result.success:
-            return {"status": "Failed", "dispatch_by_type": {device_type: 0.0 for device_type in DEVICE_ORDER}}
-
-        dispatch_by_type = {}
-        for r, device_type in enumerate(DEVICE_ORDER):
-            up = float(result.x[r_index(up_start, r, 0)])
-            down = float(result.x[r_index(down_start, r, 0)])
-            dispatch_by_type[device_type] = up - down
-            self.previous_pool_dispatch[device_type] = up - down
-        return {"status": "Optimal", "dispatch_by_type": dispatch_by_type}
-
-    def _apportion_commands(self, selected: pd.DataFrame, available: pd.DataFrame, dispatch_by_type: Dict[str, float]) -> pd.DataFrame:
+    def _apportion_commands(
+        self,
+        selected: pd.DataFrame,
+        available: pd.DataFrame,
+        dispatch_by_type: Dict[str, float],
+        target_by_type: Dict[str, float] | None = None,
+    ) -> pd.DataFrame:
         records = []
         if selected.empty:
             return pd.DataFrame(columns=["device_id", "command_kw"])
@@ -578,13 +841,28 @@ class CentralizedVPPController:
             direction = "up" if command_kw > 0 else "down"
             remaining = abs(float(command_kw))
             cap_col = "available_up_kw_now" if direction == "up" else "available_down_kw_now"
-            group = working[working["device_type"] == device_type].sort_values(["usage_score", "household_id"]).copy()
+            group = working[working["device_type"] == device_type].copy()
+            if "selection_role" in group:
+                group["role_order"] = np.where(group["selection_role"] == "active", 0, 1)
+                group = group.sort_values(["role_order", "usage_score", "household_id"])
+            else:
+                group = group.sort_values(["usage_score", "household_id"])
+            target_ratio = 1.0
+            if target_by_type is not None and abs(command_kw) > 1e-6:
+                target_ratio = float(target_by_type.get(device_type, command_kw)) / float(command_kw)
             for _, device in group.iterrows():
                 cap = min(float(device.get(cap_col, 0.0)), float(device.get(f"upper_{direction}_cap_kw", 0.0)))
                 if cap <= 0.001 or remaining <= 0.001:
                     continue
                 dispatched = min(cap, remaining)
-                records.append({**device.to_dict(), "command_kw": dispatched if direction == "up" else -dispatched})
+                signed_dispatch = dispatched if direction == "up" else -dispatched
+                records.append(
+                    {
+                        **device.to_dict(),
+                        "command_kw": signed_dispatch,
+                        "target_command_kw": signed_dispatch * target_ratio,
+                    }
+                )
                 remaining -= dispatched
                 if remaining <= 0.001:
                     break
@@ -633,6 +911,7 @@ class CentralizedVPPController:
                         "device_type": device_type,
                         "gateway_id": str(command["gateway_id"]),
                         "protocol": str(command.get("protocol", "")),
+                        "selection_role": str(command.get("selection_role", "active")),
                         "up_energy_kwh": 0.0,
                         "down_energy_kwh": 0.0,
                         "active_seconds": 0.0,

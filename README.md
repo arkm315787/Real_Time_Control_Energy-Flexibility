@@ -45,31 +45,33 @@ Usage-aware household/appliance selection
         |
         v
 Centralized 4-second lower MPC
-  - 20-second look-ahead horizon
+  - one-step proportional tracking
+  - active roster plus standby buffer roster
+  - rising-error recovery with fast-resource priority
   - simulated gateway telemetry
   - gateway command summaries
   - requested vs delivered reserve trace
 ```
 
-The lower layer is implemented as MPC, not a reactive tracking controller. The dashboard does not run it automatically: first run the upper market decision, then start the centralized 4-second MPC when you want to execute the selected market window. If the lower solver cannot solve an interval, the cycle is logged with failed status and shortfall. The controller does not switch to a greedy or reactive fallback path.
+The lower layer is implemented as a one-step proportional tracking allocator, not a second scheduler. The dashboard does not run it automatically: first run the upper MPC layer, start the independent Market Pressure process, and then arm the centralized 4-second tracker. If the lower MPC is armed before the market start timestamp, it waits until the live market clock begins before attaching. The upper layer selects an active resource roster and a standby buffer roster from devices that satisfy availability, response-time, energy, usage, and cooldown limits. The executable plan is derated to the selected active roster when a paper bid exceeds physically selected capacity. Every 4-second tick, the lower layer clips the TSO request to the committed product limit, then distributes the request proportionally across the active BESS, EV, HVAC, and PV pools. If the predicted tracking error exceeds the 10% tolerance and is rising, the lower layer enters recovery mode and allocates the residual error to standby buffer capacity using fast-resource priority: BESS, then EV, then PV, then HVAC.
 
 ## Implemented Plan Status
 
 | Plan item | Status | Notes |
 | --- | --- | --- |
 | Keep 15-minute outer MPC | Implemented | Existing receding-horizon optimizer remains the supervisory layer. |
-| Add centralized 4-second lower MPC | Implemented | `CentralizedVPPController` runs with `inner_dt_seconds=4` and `inner_mpc_horizon_seconds=20`. |
+| Add centralized 4-second lower MPC | Implemented | `CentralizedVPPController` runs with `inner_dt_seconds=4` and a one-step proportional tracking horizon. |
 | Remove active reactive fallback | Implemented | Failed lower-MPC cycles log failed status and shortfall instead of switching controller mode. |
 | Add household/appliance roster | Implemented | Synthetic roster includes household, device, device type, gateway, protocol, power limits, state, response time, and usage counters. |
-| Add usage-aware rotation | Implemented | Devices are penalized by usage, activations, throughput, and cooldown; cooldown and max-consecutive limits are enforced. |
+| Add usage-aware rotation | Implemented | Devices are penalized by usage, activations, throughput, and cooldown; cooldown and max-consecutive limits are enforced. The upper selection separates active and buffer devices. |
 | Add centralized gateway abstraction | Implemented for simulation | Gateway IDs and protocol labels are simulated. No local residential hardware or Modbus adapter is implemented. |
-| Extend API defaults | Implemented | Request defaults use `inner_controller_mode="mpc"`, 4-second step, 20-second horizon, usage-aware rotation, and simulated centralized gateway mode. |
+| Extend API defaults | Implemented | Request defaults use `inner_controller_mode="mpc"`, 4-second step, one-step lower tracking, usage-aware rotation, and simulated centralized gateway mode. |
 | Extend API/result artifacts | Implemented | Results include household/appliance contributions, upper device schedule, inner MPC trace, gateway commands, and usage/fatigue summary. |
 | Export contribution CSVs | Implemented | CLI and pipeline serialization write the new MPC and contribution artifacts. |
 | Dashboard Apply Scenario form | Implemented | Scenario controls are inside an Apply form, the last applied portfolio bundle is reused across reruns, and stale MPC results are marked when inputs change. |
 | Dashboard MPC visualizations | Implemented | Upper selection, appliance mix, fatigue, lower reserve tracking, allocation, diagnostics, and gateway command tables are available. |
 | Risk-aware market bidding | Implemented for MVP | Upper MPC derates availability by bid quantile and buffer, prices non-delivery risk, activation uncertainty, and fatigue, and marks market slots as Participate/Wait. |
-| Optional lower MPC execution | Implemented | Dashboard upper-market decisions can be reviewed before the lower 4-second MPC is started. |
+| Decoupled market and lower execution | Implemented | Dashboard upper decisions create a socket, Market Pressure runs on a wall-clock countdown, and the lower MPC attaches after the market starts. |
 | CI smoke coverage | Implemented | CI runs API, plugin, pipeline, Airflow, forecasting, optimization, centralized MPC, and dashboard scenario-apply smoke tests. |
 
 ## Key Modules
@@ -144,9 +146,12 @@ Scenario controls are applied through an `Apply Scenario` form. Changing sliders
 The MPC tab now follows a market-operator workflow:
 
 - choose a market product, dispatch window, planning horizon, and risk policy
-- run the risk-aware upper market decision
+- run the risk-aware upper MPC layer to create the executable reserve socket
 - inspect bidirectional BESS/EV/HVAC/PV commitments, risk-adjusted profit, buffers, and Participate/Wait decisions
-- start the centralized 4-second lower MPC only when the selected market window should be executed
+- start the independent Market Pressure process with a wall-clock countdown delay
+- arm the lower MPC; if it is armed early, it waits for the market start timestamp before attaching
+- reveal the live market and lower MPC traces according to elapsed wall-clock time
+- inspect whether the lower layer stayed in normal proportional mode or entered buffer recovery mode
 
 ## API Defaults
 
@@ -156,7 +161,7 @@ The optimization API defaults are aligned with the centralized MPC plan:
 {
   "inner_controller_mode": "mpc",
   "inner_dt_seconds": 4,
-  "inner_mpc_horizon_seconds": 20,
+  "inner_mpc_horizon_seconds": 4,
   "rotation_strategy": "usage_aware",
   "gateway_mode": "simulated_centralized",
   "execute_lower_mpc": true,
@@ -166,6 +171,21 @@ The optimization API defaults are aligned with the centralized MPC plan:
 ```
 
 Only these lower-controller values are currently supported in this branch. This is intentional: the active path should remain centralized lower-layer MPC.
+
+## Optimization Weight Units
+
+The upper MPC uses unit-aware economic weights:
+
+| Dashboard control | Default | Unit | Meaning |
+| --- | ---: | --- | --- |
+| Battery wear cost | 35 | EUR/MWh throughput | BESS activation cycling cost; EV activation uses 40% of this value. |
+| Comfort cost | 480 | EUR/degC-hour | Indoor comfort-band violation cost, multiplied by temperature slack and interval hours. |
+| EV shortfall cost | 1000 | EUR/MWh shortfall | Penalty for missing EV required departure energy. |
+| Non-delivery cost | 900 | EUR/MWh exposure | Market penalty/risk premium for reserve capacity that may not be delivered. |
+| Activation volatility cost | 100 | EUR/MWh-equivalent | Heuristic cost for bidding during uncertain activation periods. |
+| Customer fatigue cost | 75 | EUR/MWh-equivalent | Heuristic cost for repeated customer/device use. |
+
+Comfort is time-normalized as `comfort_weight * degC_slack * dt_h`, so changing the dashboard timestep does not silently change the value of comfort protection.
 
 ## Local Setup
 

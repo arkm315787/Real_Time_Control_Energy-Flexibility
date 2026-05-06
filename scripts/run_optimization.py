@@ -50,15 +50,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--optimizer-plugin", default=DEFAULT_OPTIMIZER_PLUGIN)
     parser.add_argument("--inner-controller-mode", choices=["mpc"], default="mpc")
     parser.add_argument("--inner-dt-seconds", type=int, default=4)
-    parser.add_argument("--inner-mpc-horizon-seconds", type=int, default=20)
+    parser.add_argument("--inner-mpc-horizon-seconds", type=int, default=4)
     parser.add_argument("--rotation-strategy", choices=["usage_aware"], default="usage_aware")
     parser.add_argument("--gateway-mode", choices=["simulated_centralized"], default="simulated_centralized")
     parser.add_argument("--upper-only", action="store_true", help="Run only the risk-aware upper market decision without lower 4-second MPC execution.")
     parser.add_argument("--risk-quantile", type=float, default=0.80)
     parser.add_argument("--reserve-buffer-pct", type=float, default=0.08)
-    parser.add_argument("--non-delivery-penalty", type=float, default=650.0)
-    parser.add_argument("--activation-uncertainty-weight", type=float, default=90.0)
-    parser.add_argument("--asset-fatigue-weight", type=float, default=30.0)
+    parser.add_argument("--degradation-weight", type=float, default=35.0, help="Battery wear cost in EUR/MWh throughput.")
+    parser.add_argument("--comfort-weight", type=float, default=480.0, help="Comfort violation cost in EUR/degC-hour.")
+    parser.add_argument("--departure-weight", type=float, default=1000.0, help="EV departure shortfall cost in EUR/MWh.")
+    parser.add_argument("--non-delivery-penalty", type=float, default=900.0)
+    parser.add_argument("--activation-uncertainty-weight", type=float, default=100.0)
+    parser.add_argument("--asset-fatigue-weight", type=float, default=75.0)
     parser.add_argument("--output-root", default="runs")
     return parser.parse_args()
 
@@ -120,9 +123,9 @@ def main() -> None:
         horizon_hours=args.horizon_hours,
         dispatch_hours=args.dispatch_hours,
         penalty_weights={
-            "degradation": 18.0,
-            "comfort": 120.0,
-            "departure": 160.0,
+            "degradation": args.degradation_weight,
+            "comfort": args.comfort_weight,
+            "departure": args.departure_weight,
             "risk_quantile": args.risk_quantile,
             "reserve_buffer_pct": args.reserve_buffer_pct,
             "non_delivery": args.non_delivery_penalty,
@@ -170,7 +173,12 @@ def main() -> None:
             "execute_lower_mpc": not args.upper_only,
             "risk_quantile": args.risk_quantile,
             "reserve_buffer_pct": args.reserve_buffer_pct,
+            "degradation_weight": args.degradation_weight,
+            "comfort_weight": args.comfort_weight,
+            "departure_weight": args.departure_weight,
             "non_delivery_penalty": args.non_delivery_penalty,
+            "activation_uncertainty_weight": args.activation_uncertainty_weight,
+            "asset_fatigue_weight": args.asset_fatigue_weight,
             "market_mode": args.market_mode,
             "resource_mode": args.resource_mode,
             "horizon_hours": args.horizon_hours,

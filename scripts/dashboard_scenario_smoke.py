@@ -14,7 +14,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app import default_scenario_inputs, portfolio_bundle_is_current, scenario_portfolio_signature
+import pandas as pd
+
+from app import default_scenario_inputs, live_market_status, live_visible_frame, portfolio_bundle_is_current, scenario_portfolio_signature
 
 
 def main() -> None:
@@ -48,10 +50,25 @@ def main() -> None:
         'st.form_submit_button("Apply Scenario"',
         'st.session_state["portfolio_bundle"]',
         'st.session_state["portfolio_signature"]',
+        'button("Run Upper MPC Layer"',
+        'button("Start Market Pressure"',
+        'button("Activate Lower MPC"',
+        'run_lower_mpc_from_upper_result(',
     ]
     missing = [fragment for fragment in required_fragments if fragment not in source]
     if missing:
         raise SystemExit(f"Dashboard scenario form/cache guard is incomplete: {missing}")
+
+    session = {"start_at_wall_s": 110.0, "duration_seconds": 20.0, "dt_seconds": 4}
+    if live_market_status(session, now_s=100.0)["status"] != "scheduled":
+        raise SystemExit("Live market session should be scheduled before the start wall-clock.")
+    if live_market_status(session, now_s=112.0)["status"] != "live":
+        raise SystemExit("Live market session should become live at the start wall-clock.")
+    if live_market_status(session, now_s=135.0)["status"] != "closed":
+        raise SystemExit("Live market session should close after its duration.")
+    frame = pd.DataFrame({"signal": range(10)}, index=pd.date_range("2026-01-01", periods=10, freq="4s"))
+    if len(live_visible_frame(frame, session, now_s=119.0)) != 3:
+        raise SystemExit("Live visible frame should reveal rows according to elapsed market seconds.")
 
     print("dashboard scenario apply smoke checks passed")
 

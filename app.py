@@ -42,6 +42,7 @@ from flexihome.core.engine import (
     generate_synthetic_portfolio as generate_synthetic_portfolio_core,
     make_pdf_summary,
     response_model_profiles,
+    run_lower_mpc_from_upper_result,
     run_mpc_controller,
     sensitivity_scan,
     serialize_forecast_spec,
@@ -380,6 +381,97 @@ def signal_line_figure(df: pd.DataFrame, columns: List[str], title: str, y_title
     return fig
 
 
+def live_market_status(session: Dict[str, object] | None, now_s: float | None = None) -> Dict[str, float | str]:
+    if not session:
+        return {"status": "idle", "countdown_seconds": 0.0, "elapsed_seconds": 0.0, "remaining_seconds": 0.0}
+    now = float(time.time() if now_s is None else now_s)
+    start_at = float(session.get("start_at_wall_s", now))
+    duration = max(float(session.get("duration_seconds", 0.0)), 0.0)
+    end_at = start_at + duration
+    if now < start_at:
+        return {
+            "status": "scheduled",
+            "countdown_seconds": start_at - now,
+            "elapsed_seconds": 0.0,
+            "remaining_seconds": duration,
+        }
+    if duration <= 0.0 or now <= end_at:
+        return {
+            "status": "live",
+            "countdown_seconds": 0.0,
+            "elapsed_seconds": max(now - start_at, 0.0),
+            "remaining_seconds": max(end_at - now, 0.0),
+        }
+    return {
+        "status": "closed",
+        "countdown_seconds": 0.0,
+        "elapsed_seconds": duration,
+        "remaining_seconds": 0.0,
+    }
+
+
+def live_visible_frame(frame: pd.DataFrame, session: Dict[str, object] | None, now_s: float | None = None) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    status = live_market_status(session, now_s)
+    if status["status"] == "idle":
+        return frame
+    dt_seconds = max(int(float(session.get("dt_seconds", 4))) if session else 4, 1)
+    if status["status"] == "scheduled":
+        return frame.iloc[:0]
+    visible_rows = min(int(float(status["elapsed_seconds"]) // dt_seconds) + 1, len(frame))
+    return frame.iloc[:visible_rows]
+
+
+def result_history(result: Dict[str, object] | None) -> pd.DataFrame:
+    if not isinstance(result, dict):
+        return pd.DataFrame()
+    history = result.get("history", pd.DataFrame())
+    return history if isinstance(history, pd.DataFrame) else pd.DataFrame()
+
+
+def result_frame(result: Dict[str, object] | None, key: str) -> pd.DataFrame:
+    if not isinstance(result, dict):
+        return pd.DataFrame()
+    frame = result.get(key, pd.DataFrame())
+    return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+
+
+def result_summary(result: Dict[str, object] | None) -> Dict[str, object]:
+    if not isinstance(result, dict):
+        return {}
+    summary = result.get("summary", {})
+    return summary if isinstance(summary, dict) else {}
+
+
+def build_live_market_feed(
+    preview_4s: pd.DataFrame,
+    upper_result: Dict[str, object],
+    duration_seconds: int,
+    dt_seconds: int = 4,
+) -> pd.DataFrame:
+    upper_history = upper_result.get("history", pd.DataFrame()) if isinstance(upper_result, dict) else pd.DataFrame()
+    if isinstance(upper_history, pd.DataFrame) and not upper_history.empty:
+        start_ts = pd.Timestamp(upper_history.index[0])
+    elif preview_4s is not None and not preview_4s.empty:
+        start_ts = pd.Timestamp(preview_4s.index[0])
+    else:
+        start_ts = pd.Timestamp.utcnow().tz_localize(None)
+    periods = max(int(duration_seconds // max(dt_seconds, 1)) + 1, 1)
+    index = pd.date_range(start_ts, periods=periods, freq=f"{int(dt_seconds)}s")
+    columns = ["frequency_hz", "fcr_signal_norm", "afrr_signal_norm"]
+    if preview_4s is not None and not preview_4s.empty:
+        feed = preview_4s.reindex(index)
+        feed = feed[[col for col in columns if col in feed.columns]].interpolate(method="time").ffill().bfill()
+    else:
+        feed = pd.DataFrame(index=index)
+    for col, default in {"frequency_hz": 50.0, "fcr_signal_norm": 0.0, "afrr_signal_norm": 0.0}.items():
+        if col not in feed:
+            feed[col] = default
+        feed[col] = feed[col].fillna(default)
+    return feed[columns]
+
+
 def data_quality_figure(df: pd.DataFrame, columns: List[str], template: str) -> go.Figure:
     rows = []
     for col in columns:
@@ -707,6 +799,9 @@ def main() -> None:
             st.session_state["mpc_result_stale"] = True
             st.session_state.pop("default_mpc_models", None)
             st.session_state.pop("default_mpc_signature", None)
+            st.session_state.pop("live_market_session", None)
+            st.session_state.pop("lower_mpc_armed", None)
+            st.session_state.pop("live_lower_result", None)
 
     scenario = st.session_state["scenario_inputs"]
     start_date = scenario["start_date"]
@@ -812,6 +907,7 @@ def main() -> None:
             "Advanced / Export",
         ]
     )
+    live_refresh_requested = False
 
     with tabs[0]:
         st.title("FlexiHome: Aggregated Residential Flexibility for Fingrid Balancing Markets")
@@ -1191,7 +1287,7 @@ def main() -> None:
         st.subheader("MPC Optimizer & Market Participation")
         st.caption(
             f"The outer MPC, synthetic portfolio, and forecasting loop run at a {freq_minutes}-minute interval. "
-            "First run the upper market decision. Start the centralized 4-second MPC only when you want to execute that market window."
+            "First run the upper MPC socket, then start market pressure, then arm the lower 4-second MPC against the live market clock."
         )
         opt1, opt2, opt3, opt4 = st.columns(4)
         market_mode = opt1.selectbox("Market product", ["Combined", "FCR-N", "aFRR"], help="Combined allows the MPC to split the portfolio across both products.")
@@ -1208,13 +1304,37 @@ def main() -> None:
         dispatch_hours = dispatch_minutes / 60.0
 
         w1, w2, w3 = st.columns(3)
-        degradation_w = w1.slider("Degradation weight", 1.0, 60.0, 18.0, 1.0)
-        comfort_w = w2.slider("Comfort violation weight", 10.0, 300.0, 120.0, 5.0)
-        departure_w = w3.slider("EV departure shortfall weight", 10.0, 300.0, 160.0, 5.0)
+        w1.caption("Battery/EV wear. Unit: EUR/MWh throughput.")
+        degradation_w = w1.slider(
+            "Battery wear cost (EUR/MWh)",
+            0.0,
+            150.0,
+            35.0,
+            5.0,
+            help="Throughput cost for BESS reserve activation. EV cycling uses 40% of this value in the upper MPC.",
+        )
+        w2.caption("Indoor comfort slack. Unit: EUR/degC-hour.")
+        comfort_w = w2.slider(
+            "Comfort cost (EUR/degC-hour)",
+            0.0,
+            1200.0,
+            480.0,
+            20.0,
+            help="Cost of violating the indoor comfort band. It is multiplied by temperature slack in degC and interval length in hours.",
+        )
+        w3.caption("Missed EV energy promise. Unit: EUR/MWh shortfall.")
+        departure_w = w3.slider(
+            "EV shortfall cost (EUR/MWh)",
+            0.0,
+            5000.0,
+            1000.0,
+            50.0,
+            help="Penalty for missing EV required energy. One MWh equals 1000 kWh, so 1000 EUR/MWh is 1 EUR/kWh short.",
+        )
         risk_profiles = {
-            "Balanced P70": {"quantile": 0.70, "buffer": 0.06, "penalty": 450.0},
-            "Conservative P80": {"quantile": 0.80, "buffer": 0.10, "penalty": 700.0},
-            "Defensive P90": {"quantile": 0.90, "buffer": 0.16, "penalty": 1100.0},
+            "Balanced P70": {"quantile": 0.70, "buffer": 0.06, "penalty": 500.0},
+            "Conservative P80": {"quantile": 0.80, "buffer": 0.10, "penalty": 900.0},
+            "Defensive P90": {"quantile": 0.90, "buffer": 0.16, "penalty": 1500.0},
             "Opportunistic P60": {"quantile": 0.60, "buffer": 0.03, "penalty": 300.0},
         }
         r1, r2, r3, r4 = st.columns(4)
@@ -1222,10 +1342,34 @@ def main() -> None:
         risk_defaults = risk_profiles[risk_profile]
         risk_quantile = r2.slider("Reliable bid quantile", 0.50, 0.95, float(risk_defaults["quantile"]), 0.05)
         reserve_buffer_pct = r3.slider("Reserve buffer", 0.0, 0.30, float(risk_defaults["buffer"]), 0.01)
-        non_delivery_penalty = r4.slider("Non-delivery cost EUR/MWh", 0.0, 1600.0, float(risk_defaults["penalty"]), 50.0)
+        r4.caption("Delivery failure exposure. Unit: EUR/MWh.")
+        non_delivery_penalty = r4.slider(
+            "Non-delivery cost (EUR/MWh)",
+            0.0,
+            3000.0,
+            float(risk_defaults["penalty"]),
+            50.0,
+            help="Expected market penalty/risk premium for reserve capacity that may not be delivered.",
+        )
         rr1, rr2 = st.columns(2)
-        activation_uncertainty_w = rr1.slider("Activation uncertainty weight", 0.0, 250.0, 90.0, 5.0)
-        asset_fatigue_w = rr2.slider("Asset fatigue/customer cost weight", 0.0, 120.0, 30.0, 2.0)
+        rr1.caption("Activation signal volatility. Unit: EUR/MWh-equivalent.")
+        activation_uncertainty_w = rr1.slider(
+            "Activation volatility cost (EUR/MWh-eq)",
+            0.0,
+            500.0,
+            100.0,
+            10.0,
+            help="Heuristic cost for uncertain activation intensity. Higher values reduce bids during volatile signal periods.",
+        )
+        rr2.caption("Repeated customer/device use. Unit: EUR/MWh-equivalent.")
+        asset_fatigue_w = rr2.slider(
+            "Customer fatigue cost (EUR/MWh-eq)",
+            0.0,
+            500.0,
+            75.0,
+            5.0,
+            help="Heuristic cost for repeated use of customer devices. Resource multipliers are BESS 1.00, EV 0.65, HVAC 0.45, PV 0.20.",
+        )
         forecaster_plugins = PLUGIN_REGISTRY.list_forecasters()
         optimizer_plugins = PLUGIN_REGISTRY.list_optimizers()
         p1, p2 = st.columns(2)
@@ -1247,9 +1391,22 @@ def main() -> None:
             f"{int(max(round(dispatch_hours / (freq_minutes / 60.0)), 1))} market interval(s) over the selected simulation window. "
             f"{risk_profile} means the bid is derated toward P{int(risk_quantile * 100)} deliverability before market participation is accepted."
         )
-        btn_upper, btn_lower = st.columns([1, 1])
-        run_upper_mpc = btn_upper.button("Run upper market decision", type="primary")
-        run_lower_mpc = btn_lower.button("Start centralized 4-second MPC", disabled=not bool(st.session_state.get("mpc_result")) or bool(st.session_state.get("mpc_result", {}).get("history", pd.DataFrame()).empty))
+        live_market_session = st.session_state.get("live_market_session", {})
+        market_status = live_market_status(live_market_session)
+        market_delay_seconds = st.slider("Market start delay after pressure signal (seconds)", 0, 120, 10, 1)
+        btn_upper, btn_market, btn_lower = st.columns([1, 1, 1])
+        existing_upper_result = st.session_state.get("upper_mpc_result", st.session_state.get("mpc_result", {}))
+        existing_history = existing_upper_result.get("history", pd.DataFrame()) if isinstance(existing_upper_result, dict) else pd.DataFrame()
+        upper_market_ready = (
+            isinstance(existing_history, pd.DataFrame)
+            and not existing_history.empty
+            and not bool(st.session_state.get("mpc_result_stale", False))
+            and st.session_state.get("mpc_phase") in {"upper", "market_scheduled", "market_live", "lower_waiting", "lower_live", "lower"}
+        )
+        market_started = bool(live_market_session) and market_status["status"] in {"scheduled", "live", "closed"}
+        run_upper_mpc = btn_upper.button("Run Upper MPC Layer", type="primary")
+        start_market_pressure = btn_market.button("Start Market Pressure", disabled=not upper_market_ready or market_status["status"] in {"scheduled", "live"})
+        activate_lower_mpc = btn_lower.button("Activate Lower MPC", disabled=not market_started or bool(st.session_state.get("live_lower_result")))
         mpc_progress_bar = st.progress(0.0)
         mpc_progress_text = st.empty()
         base_penalty_weights = {
@@ -1262,14 +1419,8 @@ def main() -> None:
             "activation_uncertainty": activation_uncertainty_w,
             "asset_fatigue": asset_fatigue_w,
         }
-        if run_upper_mpc or run_lower_mpc:
-            execute_lower = bool(run_lower_mpc)
-            spinner_label = (
-                "Starting centralized 4-second lower MPC for the selected market window..."
-                if execute_lower
-                else "Solving risk-aware upper market decision..."
-            )
-            with st.spinner(spinner_label):
+        if run_upper_mpc:
+            with st.spinner("Solving risk-aware upper MPC socket..."):
                 mpc_tracker = make_progress_tracker(mpc_progress_bar, mpc_progress_text, "MPC dispatch")
                 mpc_tracker(1, 100, "Preparing default forecasting models")
                 models = ensure_default_models(df, int(seed), mpc_forecaster_plugin)
@@ -1298,10 +1449,10 @@ def main() -> None:
                     "non_delivery_penalty": non_delivery_penalty,
                     "activation_uncertainty_weight": activation_uncertainty_w,
                     "asset_fatigue_weight": asset_fatigue_w,
-                    "execute_lower_mpc": execute_lower,
+                    "execute_lower_mpc": False,
                     "inner_controller_mode": "mpc",
                     "inner_dt_seconds": 4,
-                    "inner_mpc_horizon_seconds": 20,
+                    "inner_mpc_horizon_seconds": 4,
                     "rotation_strategy": "usage_aware",
                     "gateway_mode": "simulated_centralized",
                 }
@@ -1319,20 +1470,119 @@ def main() -> None:
                     device_roster=device_roster,
                     inner_controller_mode="mpc",
                     inner_dt_seconds=4,
-                    inner_mpc_horizon_seconds=20,
+                    inner_mpc_horizon_seconds=4,
                     rotation_strategy="usage_aware",
                     gateway_mode="simulated_centralized",
-                    execute_lower_mpc=execute_lower,
+                    execute_lower_mpc=False,
                     progress_callback=lambda current, total, message: mpc_tracker(
                         8 + int(round((current / max(total, 1)) * 92)),
                         100,
                         message,
                     ),
                 )
+                st.session_state["upper_mpc_result"] = st.session_state["mpc_result"]
+                st.session_state.pop("live_market_session", None)
+                st.session_state.pop("lower_mpc_armed", None)
+                st.session_state.pop("live_lower_result", None)
                 st.session_state["mpc_result_stale"] = False
-                st.session_state["mpc_phase"] = "lower" if execute_lower else "upper"
-                mpc_tracker(100, 100, "Lower MPC execution finished" if execute_lower else "Upper market decision finished")
-        result = st.session_state.get(
+                st.session_state["mpc_phase"] = "upper"
+                mpc_tracker(100, 100, "Upper MPC socket ready")
+                st.rerun()
+
+        if start_market_pressure:
+            now_s = time.time()
+            st.session_state["live_market_session"] = {
+                "created_at_wall_s": now_s,
+                "start_at_wall_s": now_s + float(market_delay_seconds),
+                "delay_seconds": float(market_delay_seconds),
+                "duration_seconds": float(dispatch_minutes * 60),
+                "dt_seconds": 4,
+                "market_mode": market_mode,
+                "resource_mode": resource_mode,
+            }
+            st.session_state["lower_mpc_armed"] = False
+            st.session_state.pop("live_lower_result", None)
+            st.session_state["mpc_phase"] = "market_scheduled"
+            st.rerun()
+
+        if activate_lower_mpc:
+            st.session_state["lower_mpc_armed"] = True
+            st.session_state["mpc_phase"] = "lower_waiting" if market_status["status"] == "scheduled" else "market_live"
+            st.rerun()
+
+        live_market_session = st.session_state.get("live_market_session", {})
+        market_status = live_market_status(live_market_session)
+        lower_armed = bool(st.session_state.get("lower_mpc_armed", False))
+        if live_market_session and market_status["status"] == "live" and st.session_state.get("mpc_phase") in {"market_scheduled", "lower_waiting"}:
+            st.session_state["mpc_phase"] = "market_live" if not lower_armed else "lower_waiting"
+        if lower_armed and live_market_session and market_status["status"] in {"live", "closed"} and not st.session_state.get("live_lower_result"):
+            with st.spinner("Lower MPC is attaching to the live market socket..."):
+                lower_tracker = make_progress_tracker(mpc_progress_bar, mpc_progress_text, "Lower MPC live attach")
+                fleet_meta = {
+                    "bess_energy_cap_mwh": float(df["bess_energy_cap_mwh"].iloc[0]),
+                    "setpoint_c": setpoint_c,
+                    "comfort_band_c": comfort_band_c,
+                    "n_hvac": summary["n_hvac"],
+                    "hvac_mode": hvac_mode,
+                    "hvac_response_s": hvac_response_s,
+                }
+                upper_socket = st.session_state.get("upper_mpc_result", st.session_state.get("mpc_result", {}))
+                lower_result = run_lower_mpc_from_upper_result(
+                    df=df,
+                    upper_result=upper_socket,
+                    fleet_meta=fleet_meta,
+                    market_mode=str(live_market_session.get("market_mode", market_mode)),
+                    resource_mode=str(live_market_session.get("resource_mode", resource_mode)),
+                    preview_4s=preview_4s,
+                    progress_callback=lambda current, total, message: lower_tracker(
+                        int(round((current / max(total, 1)) * 100)),
+                        100,
+                        message,
+                    ),
+                    device_roster=device_roster,
+                    inner_controller_mode="mpc",
+                    inner_dt_seconds=4,
+                    inner_mpc_horizon_seconds=4,
+                    rotation_strategy="usage_aware",
+                    gateway_mode="live_market_coupled",
+                )
+                st.session_state["live_lower_result"] = lower_result
+                st.session_state["mpc_result"] = lower_result
+                st.session_state["mpc_config"] = {
+                    **st.session_state.get("mpc_config", {}),
+                    "execute_lower_mpc": True,
+                    "gateway_mode": "live_market_coupled",
+                }
+                st.session_state["mpc_result_stale"] = False
+                st.session_state["mpc_phase"] = "lower_live"
+                lower_tracker(100, 100, "Lower MPC attached to live market")
+                st.rerun()
+
+        if live_market_session:
+            status_label = str(market_status["status"]).replace("_", " ").title()
+            live_cols = st.columns(4)
+            live_cols[0].metric("Market process", status_label)
+            live_cols[1].metric("Start countdown", f"{float(market_status['countdown_seconds']):.0f} s")
+            live_cols[2].metric("Market elapsed", f"{float(market_status['elapsed_seconds']):.0f} s")
+            live_cols[3].metric("Lower MPC", "Armed" if lower_armed and not st.session_state.get("live_lower_result") else ("Live" if st.session_state.get("live_lower_result") else "Waiting"))
+            market_feed = build_live_market_feed(
+                preview_4s,
+                st.session_state.get("upper_mpc_result", {}),
+                int(float(live_market_session.get("duration_seconds", dispatch_minutes * 60))),
+                dt_seconds=4,
+            )
+            visible_market_feed = live_visible_frame(market_feed, live_market_session)
+            if visible_market_feed.empty and market_status["status"] == "scheduled":
+                st.info("Market pressure countdown is active. The live market plot will start at the scheduled wall-clock time.")
+            else:
+                market_fig = go.Figure()
+                market_fig.add_trace(go.Scatter(x=visible_market_feed.index, y=visible_market_feed["fcr_signal_norm"], name="FCR signal", line={"color": RESOURCE_COLORS["Frequency"]}))
+                market_fig.add_trace(go.Scatter(x=visible_market_feed.index, y=visible_market_feed["afrr_signal_norm"], name="aFRR signal", line={"color": RESOURCE_COLORS["Net"], "dash": "dot"}))
+                market_fig.update_layout(yaxis_title="normalized signal")
+                st.plotly_chart(apply_chart_style(market_fig, template, height=260, title="Live Market Pressure"), use_container_width=True)
+            if market_status["status"] in {"scheduled", "live"}:
+                live_refresh_requested = True
+        active_result = st.session_state.get(
             "mpc_result",
             {
                 "history": pd.DataFrame(),
@@ -1347,21 +1597,31 @@ def main() -> None:
                 "usage_fatigue_summary": pd.DataFrame(),
             },
         )
-        result_df = result["history"]
+        upper_view_result = st.session_state.get("upper_mpc_result", {})
+        if result_history(upper_view_result).empty:
+            upper_view_result = active_result
+        lower_view_result = st.session_state.get("live_lower_result", {})
+        if result_history(lower_view_result).empty and result_summary(active_result).get("execute_lower_mpc"):
+            lower_view_result = active_result
+        result = lower_view_result if not result_history(lower_view_result).empty else upper_view_result
+        result_df = result_history(result)
+        upper_result_df = result_history(upper_view_result)
+        lower_result_df = result_history(lower_view_result)
+        upper_plot_df = upper_result_df if not upper_result_df.empty else result_df
 
         if st.session_state.get("mpc_result_stale") and not result_df.empty:
             st.warning("Scenario inputs changed. The charts below still show the previous MPC run until you run dispatch again.")
 
         if result_df.empty:
-            st.info("Configure the scenario and click Run MPC dispatch. The optimizer will not run automatically.")
+            st.info("Configure the scenario and click Run Upper MPC Layer. Market pressure and lower MPC attach only after their own buttons are pressed.")
         else:
-            s = result["summary"]
-            c = result["compliance"]
+            s = result_summary(result)
+            c = result.get("compliance", {}) if isinstance(result, dict) else {}
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total revenue", fmt_money(s["total_revenue_eur"]))
-            m2.metric("Delivered up energy", f"{s['delivered_up_mwh']:.2f} MWh")
-            m3.metric("Requirement score", f"{s['requirement_score_pct']:.0f}%")
-            m4.metric("Comfort violations", f"{s['comfort_violations_h']:.1f} h")
+            m1.metric("Total revenue", fmt_money(float(s.get("total_revenue_eur", 0.0))))
+            m2.metric("Delivered up energy", f"{float(s.get('delivered_up_mwh', 0.0)):.2f} MWh")
+            m3.metric("Requirement score", f"{float(s.get('requirement_score_pct', 0.0)):.0f}%")
+            m4.metric("Comfort violations", f"{float(s.get('comfort_violations_h', 0.0)):.1f} h")
             mpc_status_cols = st.columns(4)
             solver_mode = result_df["solver_status"].mode().iloc[0] if "solver_status" in result_df and not result_df["solver_status"].empty else "unknown"
             inner_mode = result_df["inner_solver_status"].mode().iloc[0] if "inner_solver_status" in result_df and not result_df["inner_solver_status"].empty else "unknown"
@@ -1377,28 +1637,28 @@ def main() -> None:
             st.info(
                 f"MPC workflow: `{st.session_state.get('mpc_config', {}).get('forecaster_plugin', DEFAULT_FORECASTER_PLUGIN)}` forecasts each horizon, "
                 f"`{st.session_state.get('mpc_config', {}).get('optimizer_plugin', DEFAULT_OPTIMIZER_PLUGIN)}` chooses reserve bids and resource dispatch, "
-                "the bid is derated by the selected reliability quantile and buffer, and the lower 20-second/4-second MPC runs only after you press Start."
+                "the market clock runs as a separate pressure process, and the lower 4-second tracker attaches to that live market state inside the upper socket."
             )
 
             left, right = st.columns([1.45, 1.0])
             with left:
                 dispatch_fig = go.Figure()
-                dispatch_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["fcr_bid_kw"] / 1000.0, name="FCR-N bid", stackgroup="one"))
-                dispatch_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["afrr_up_bid_kw"] / 1000.0, name="aFRR up bid", stackgroup="one"))
-                dispatch_fig.add_trace(go.Scatter(x=result_df.index, y=result_df["afrr_down_bid_kw"] / 1000.0, name="aFRR down bid", stackgroup="two"))
+                dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=upper_plot_df["fcr_bid_kw"] / 1000.0, name="FCR-N bid", stackgroup="one"))
+                dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=upper_plot_df["afrr_up_bid_kw"] / 1000.0, name="aFRR up bid", stackgroup="one"))
+                dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=upper_plot_df["afrr_down_bid_kw"] / 1000.0, name="aFRR down bid", stackgroup="two"))
                 dispatch_fig.update_layout(yaxis_title="MW")
-                st.plotly_chart(apply_chart_style(dispatch_fig, template, height=400, title="MPC reserve schedule"), use_container_width=True)
+                st.plotly_chart(apply_chart_style(dispatch_fig, template, height=400, title="Upper MPC reserve socket"), use_container_width=True)
                 bidirectional_rows = []
                 for resource, fcr_col, up_col, down_col in [
                     ("BESS", "bess_fcr_kw", "bess_afrr_up_kw", "bess_afrr_down_kw"),
                     ("EV", "ev_fcr_kw", "ev_afrr_up_kw", "ev_afrr_down_kw"),
                     ("HVAC", "hvac_fcr_kw", "hvac_afrr_up_kw", "hvac_afrr_down_kw"),
                 ]:
-                    if {fcr_col, up_col, down_col}.issubset(result_df.columns):
-                        bidirectional_rows.append({"Resource": resource, "Direction": "Up", "MW": float((result_df[fcr_col] + result_df[up_col]).mean()) / 1000.0})
-                        bidirectional_rows.append({"Resource": resource, "Direction": "Down", "MW": -float((result_df[fcr_col] + result_df[down_col]).mean()) / 1000.0})
-                if "pv_afrr_down_kw" in result_df:
-                    bidirectional_rows.append({"Resource": "PV", "Direction": "Down", "MW": -float(result_df["pv_afrr_down_kw"].mean()) / 1000.0})
+                    if {fcr_col, up_col, down_col}.issubset(upper_plot_df.columns):
+                        bidirectional_rows.append({"Resource": resource, "Direction": "Up", "MW": float((upper_plot_df[fcr_col] + upper_plot_df[up_col]).mean()) / 1000.0})
+                        bidirectional_rows.append({"Resource": resource, "Direction": "Down", "MW": -float((upper_plot_df[fcr_col] + upper_plot_df[down_col]).mean()) / 1000.0})
+                if "pv_afrr_down_kw" in upper_plot_df:
+                    bidirectional_rows.append({"Resource": "PV", "Direction": "Down", "MW": -float(upper_plot_df["pv_afrr_down_kw"].mean()) / 1000.0})
                 if bidirectional_rows:
                     bidirectional_fig = px.bar(
                         pd.DataFrame(bidirectional_rows),
@@ -1411,18 +1671,18 @@ def main() -> None:
                     )
                     bidirectional_fig.update_layout(yaxis_title="MW, up positive / down negative")
                     st.plotly_chart(apply_chart_style(bidirectional_fig, template, height=320), use_container_width=True)
-                if {"fcrn_capacity_eur_per_mw_h", "afrr_up_capacity_eur_per_mw_h", "afrr_down_capacity_eur_per_mw_h"}.issubset(result_df.columns):
+                if {"fcrn_capacity_eur_per_mw_h", "afrr_up_capacity_eur_per_mw_h", "afrr_down_capacity_eur_per_mw_h"}.issubset(upper_plot_df.columns):
                     price_overlay = make_subplots(specs=[[{"secondary_y": True}]])
                     price_overlay.add_trace(
-                        go.Scatter(x=result_df.index, y=result_df["net_revenue_eur"], name="Net revenue EUR", line={"color": RESOURCE_COLORS["Net"], "width": 3}),
+                        go.Scatter(x=upper_plot_df.index, y=upper_plot_df["net_revenue_eur"], name="Net revenue EUR", line={"color": RESOURCE_COLORS["Net"], "width": 3}),
                         secondary_y=False,
                     )
                     price_overlay.add_trace(
-                        go.Scatter(x=result_df.index, y=result_df["fcrn_capacity_eur_per_mw_h"], name="FCR-N price", line={"dash": "dot"}),
+                        go.Scatter(x=upper_plot_df.index, y=upper_plot_df["fcrn_capacity_eur_per_mw_h"], name="FCR-N price", line={"dash": "dot"}),
                         secondary_y=True,
                     )
                     price_overlay.add_trace(
-                        go.Scatter(x=result_df.index, y=result_df["afrr_up_capacity_eur_per_mw_h"], name="aFRR up price", line={"dash": "dash"}),
+                        go.Scatter(x=upper_plot_df.index, y=upper_plot_df["afrr_up_capacity_eur_per_mw_h"], name="aFRR up price", line={"dash": "dash"}),
                         secondary_y=True,
                     )
                     price_overlay.update_yaxes(title_text="EUR", secondary_y=False)
@@ -1430,53 +1690,55 @@ def main() -> None:
                     st.plotly_chart(apply_chart_style(price_overlay, template, height=330, title="Revenue response to market prices"), use_container_width=True)
             with right:
                 compliance_cols = st.columns(2)
-                compliance_cols[0].plotly_chart(apply_chart_style(indicator_figure(float(result_df["fcr_bid_kw"].mean()), "Average FCR bid (kW)", 100.0), template, height=240), use_container_width=True)
-                compliance_cols[1].plotly_chart(apply_chart_style(indicator_figure(float(np.maximum(result_df["afrr_up_bid_kw"], result_df["afrr_down_bid_kw"]).mean()), "Average aFRR bid (kW)", 1000.0), template, height=240), use_container_width=True)
+                compliance_cols[0].plotly_chart(apply_chart_style(indicator_figure(float(upper_plot_df["fcr_bid_kw"].mean()), "Average FCR bid (kW)", 100.0), template, height=240), use_container_width=True)
+                compliance_cols[1].plotly_chart(apply_chart_style(indicator_figure(float(np.maximum(upper_plot_df["afrr_up_bid_kw"], upper_plot_df["afrr_down_bid_kw"]).mean()), "Average aFRR bid (kW)", 1000.0), template, height=240), use_container_width=True)
                 st.markdown(
                     f"""
                     <div class="flexi-card">
                         <h4>Compliance snapshot</h4>
                         <p class="small-note">
-                            FCR response estimate: <b>{c['fcr_response_s']:.1f} s</b><br/>
-                            aFRR response estimate: <b>{c['afrr_response_s']:.0f} s</b><br/>
-                            Mean delivered/requested ratio: <b>{c['mean_accuracy']:.2f}</b>
+                            FCR response estimate: <b>{float(c.get('fcr_response_s', 0.0)):.1f} s</b><br/>
+                            aFRR response estimate: <b>{float(c.get('afrr_response_s', 0.0)):.0f} s</b><br/>
+                            Mean delivered/requested ratio: <b>{float(c.get('mean_accuracy', 0.0)):.2f}</b>
                         </p>
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
 
-            first_schedule = result["first_schedule"].copy()
+            first_schedule = result_frame(upper_view_result, "first_schedule").copy()
             if not first_schedule.empty:
                 first_schedule.index.name = "timestamp"
                 st.caption("First upper MPC horizon snapshot. Revenue, delivery risk, activation uncertainty, and fatigue costs are shown before the lower 4-second MPC is started.")
                 st.dataframe(styled_dataframe(first_schedule.head(12).round(2)), use_container_width=True, height=260)
 
-            if {"market_gate_status", "risk_adjusted_profit_eur", "reserve_buffer_kw"}.issubset(result_df.columns):
+            if {"market_gate_status", "risk_adjusted_profit_eur", "reserve_buffer_kw"}.issubset(upper_plot_df.columns):
                 gate_cols = ["market_gate_status", "market_gate_reason", "risk_adjusted_profit_eur", "reserve_buffer_kw", "non_delivery_risk_cost_eur", "activation_uncertainty_cost_eur", "asset_fatigue_cost_eur"]
                 st.markdown("### Market gate decisions")
                 st.dataframe(
-                    styled_dataframe(result_df[[col for col in gate_cols if col in result_df.columns]].head(24).round(3)),
+                    styled_dataframe(upper_plot_df[[col for col in gate_cols if col in upper_plot_df.columns]].head(24).round(3)),
                     use_container_width=True,
                     height=260,
                 )
 
             rule_items = [
-                ("FCR-N minimum 0.1 MW", c["fcr_min_bid_ok"]),
-                ("aFRR minimum 1 MW", c["afrr_min_bid_ok"]),
-                ("FCR-N fast response", c["fcr_response_ok"]),
-                ("aFRR 5-minute full activation", c["afrr_response_ok"]),
-                ("aFRR 90-110% accuracy", c["accuracy_ok"]),
-                ("Storage 1 h endurance per direction", c["storage_endurance_ok"]),
-                ("Baseline methodology available", c["baseline_method_ok"]),
+                ("FCR-N minimum 0.1 MW", c.get("fcr_min_bid_ok", False)),
+                ("aFRR minimum 1 MW", c.get("afrr_min_bid_ok", False)),
+                ("FCR-N fast response", c.get("fcr_response_ok", False)),
+                ("aFRR 5-minute full activation", c.get("afrr_response_ok", False)),
+                ("aFRR 90-110% accuracy", c.get("accuracy_ok", False)),
+                ("Storage 1 h endurance per direction", c.get("storage_endurance_ok", False)),
+                ("Baseline methodology available", c.get("baseline_method_ok", False)),
             ]
             rule_df = pd.DataFrame(rule_items, columns=["Rule", "Pass"]).assign(Status=lambda x: np.where(x["Pass"], "Pass", "Needs attention"))
             st.dataframe(styled_dataframe(rule_df), use_container_width=True, hide_index=True)
 
-            household_contrib = result.get("household_contributions", pd.DataFrame())
-            appliance_contrib = result.get("appliance_contributions", pd.DataFrame())
-            upper_device_schedule = result.get("upper_device_schedule", pd.DataFrame())
-            usage_fatigue = result.get("usage_fatigue_summary", pd.DataFrame())
+            household_contrib = result_frame(result, "household_contributions")
+            appliance_contrib = result_frame(result, "appliance_contributions")
+            upper_device_schedule = result_frame(upper_view_result, "upper_device_schedule")
+            if upper_device_schedule.empty:
+                upper_device_schedule = result_frame(result, "upper_device_schedule")
+            usage_fatigue = result_frame(result, "usage_fatigue_summary")
             if not household_contrib.empty and not appliance_contrib.empty:
                 st.markdown("### Usage-aware household selection")
                 select_left, select_right = st.columns([1.15, 1.0])
@@ -1570,6 +1832,61 @@ def main() -> None:
                     height=260,
                 )
 
+            lower_tracking_full = result_frame(lower_view_result, "tracking_4s")
+            if not lower_tracking_full.empty:
+                st.markdown("### Lower MPC 4-second Optimization Trace")
+                live_lower_tracking = live_visible_frame(lower_tracking_full, st.session_state.get("live_market_session", {}))
+                lower_visible = live_lower_tracking if not live_lower_tracking.empty else lower_tracking_full
+                lm1, lm2, lm3, lm4 = st.columns(4)
+                lm1.metric("4-sec ticks solved", f"{len(lower_tracking_full):,}")
+                lm2.metric("Mean abs tracking error", f"{float(lower_tracking_full['tracking_error_kw'].abs().mean()):.2f} kW")
+                lm3.metric("Max control latency", f"{float(lower_tracking_full.get('control_latency_ms', pd.Series([0.0])).max()):.1f} ms")
+                lm4.metric("Recovery ticks", f"{int(lower_tracking_full.get('recovery_mode', pd.Series(dtype=bool)).astype(bool).sum()):,}")
+
+                lower_trace_fig = go.Figure()
+                signed_request = lower_visible["requested_up_kw"] - lower_visible["requested_down_kw"]
+                signed_delivery = lower_visible["delivered_up_kw"] - lower_visible["delivered_down_kw"]
+                lower_trace_fig.add_trace(go.Scatter(x=lower_visible.index, y=signed_request / 1000.0, name="TSO request", line={"color": RESOURCE_COLORS["Frequency"], "dash": "dot"}))
+                lower_trace_fig.add_trace(go.Scatter(x=lower_visible.index, y=signed_delivery / 1000.0, name="Lower delivered", line={"color": RESOURCE_COLORS["Net"], "width": 3}))
+                if {"committed_up_kw", "committed_down_kw"}.issubset(lower_visible.columns):
+                    lower_trace_fig.add_trace(go.Scatter(x=lower_visible.index, y=lower_visible["committed_up_kw"] / 1000.0, name="Committed up limit", line={"color": "#6b7280", "dash": "dash"}))
+                    lower_trace_fig.add_trace(go.Scatter(x=lower_visible.index, y=-lower_visible["committed_down_kw"] / 1000.0, name="Committed down limit", line={"color": "#6b7280", "dash": "dash"}))
+                lower_trace_fig.update_layout(yaxis_title="MW")
+                st.plotly_chart(apply_chart_style(lower_trace_fig, template, height=340, title="Lower MPC live request vs delivered"), use_container_width=True)
+
+                lower_diag_left, lower_diag_right = st.columns([1.15, 1.0])
+                if {"fleet_power_before_kw", "fleet_power_after_kw", "target_command_kw"}.issubset(lower_visible.columns):
+                    power_fig = signal_line_figure(lower_visible, ["fleet_power_before_kw", "fleet_power_after_kw", "target_command_kw"], "Lower MPC internal power state", "kW")
+                    lower_diag_left.plotly_chart(apply_chart_style(power_fig, template, height=320), use_container_width=True)
+                if {"control_latency_ms", "control_deadline_ms"}.issubset(lower_visible.columns):
+                    latency_fig = signal_line_figure(lower_visible, ["control_latency_ms", "control_deadline_ms"], "4-second control deadline check", "ms")
+                    lower_diag_right.plotly_chart(apply_chart_style(latency_fig, template, height=320), use_container_width=True)
+
+                lower_cols = [
+                    "inner_solver_status",
+                    "optimization_strategy",
+                    "requested_up_kw",
+                    "requested_down_kw",
+                    "delivered_up_kw",
+                    "delivered_down_kw",
+                    "tracking_error_kw",
+                    "tracking_tolerance_kw",
+                    "active_capacity_kw",
+                    "buffer_capacity_kw",
+                    "buffer_used_kw",
+                    "recovery_mode",
+                    "error_rising",
+                    "control_latency_ms",
+                    "control_deadline_met",
+                ]
+                st.dataframe(
+                    styled_dataframe(lower_tracking_full[[col for col in lower_cols if col in lower_tracking_full.columns]].head(80).round(3)),
+                    use_container_width=True,
+                    height=320,
+                )
+            elif st.session_state.get("live_market_session"):
+                st.info("Lower MPC has not produced a tracking trace yet. If it is armed early, it will attach when the Market Pressure countdown reaches zero.")
+
     with tabs[5]:
         st.subheader("Simulation & Impact Visualizations")
         result = st.session_state.get("mpc_result")
@@ -1577,7 +1894,7 @@ def main() -> None:
             st.info("Run the MPC tab to populate the simulation results.")
         else:
             result_df = result["history"]
-            tracking_df = result.get("tracking_4s", pd.DataFrame())
+            tracking_df = live_visible_frame(result.get("tracking_4s", pd.DataFrame()), st.session_state.get("live_market_session", {}))
             s = result["summary"]
             ts_left, ts_right = st.columns([1.45, 1.0])
             ts_left.plotly_chart(
@@ -1651,10 +1968,22 @@ def main() -> None:
                     go.Scatter(x=tracking_window.index, y=tracking_window["bess_up_kw"] / 1000.0, name="BESS up", line={"color": RESOURCE_COLORS["BESS"]})
                 )
                 tracking_fig.add_trace(
-                    go.Scatter(x=tracking_window.index, y=-tracking_window["ev_down_kw"] / 1000.0, name="EV down", line={"color": RESOURCE_COLORS["EV"]})
+                    go.Scatter(x=tracking_window.index, y=-tracking_window["bess_down_kw"] / 1000.0, name="BESS down", line={"color": RESOURCE_COLORS["BESS"], "dash": "dot"})
+                )
+                tracking_fig.add_trace(
+                    go.Scatter(x=tracking_window.index, y=tracking_window["ev_up_kw"] / 1000.0, name="EV up", line={"color": RESOURCE_COLORS["EV"]})
+                )
+                tracking_fig.add_trace(
+                    go.Scatter(x=tracking_window.index, y=-tracking_window["ev_down_kw"] / 1000.0, name="EV down", line={"color": RESOURCE_COLORS["EV"], "dash": "dot"})
                 )
                 tracking_fig.add_trace(
                     go.Scatter(x=tracking_window.index, y=tracking_window["hvac_up_kw"] / 1000.0, name="HVAC up", line={"color": RESOURCE_COLORS["HVAC"]})
+                )
+                tracking_fig.add_trace(
+                    go.Scatter(x=tracking_window.index, y=-tracking_window["hvac_down_kw"] / 1000.0, name="HVAC down", line={"color": RESOURCE_COLORS["HVAC"], "dash": "dot"})
+                )
+                tracking_fig.add_trace(
+                    go.Scatter(x=tracking_window.index, y=-tracking_window["pv_down_kw"] / 1000.0, name="PV down", line={"color": RESOURCE_COLORS["PV"], "dash": "dot"})
                 )
                 tracking_fig.update_layout(yaxis_title="MW")
                 st.plotly_chart(apply_chart_style(tracking_fig, template, height=380, title="Lower MPC reserve tracking"), use_container_width=True)
@@ -1670,7 +1999,11 @@ def main() -> None:
                 allocation_fig.update_layout(yaxis_title="MW")
                 lower_left.plotly_chart(apply_chart_style(allocation_fig, template, height=340, title="Lower MPC appliance allocation"), use_container_width=True)
 
-                diagnostic_cols = [col for col in ["tracking_error_kw", "shortfall_kw"] if col in tracking_window.columns]
+                diagnostic_cols = [
+                    col
+                    for col in ["tracking_error_kw", "tracking_tolerance_kw", "shortfall_kw", "buffer_used_kw"]
+                    if col in tracking_window.columns
+                ]
                 if diagnostic_cols:
                     diagnostic_fig = signal_line_figure(tracking_window, diagnostic_cols, "Lower MPC tracking diagnostics", "kW")
                     lower_right.plotly_chart(apply_chart_style(diagnostic_fig, template, height=340), use_container_width=True)
@@ -1688,6 +2021,7 @@ def main() -> None:
                         "household_id",
                         "device_id",
                         "device_type",
+                        "selection_role",
                         "gateway_id",
                         "up_energy_kwh",
                         "down_energy_kwh",
@@ -1755,16 +2089,16 @@ def main() -> None:
                             "departure": departure_w,
                             "risk_quantile": float(mpc_config.get("risk_quantile", 0.80)),
                             "reserve_buffer_pct": float(mpc_config.get("reserve_buffer_pct", 0.08)),
-                            "non_delivery": float(mpc_config.get("non_delivery_penalty", 650.0)),
-                            "activation_uncertainty": float(mpc_config.get("activation_uncertainty_weight", 90.0)),
-                            "asset_fatigue": float(mpc_config.get("asset_fatigue_weight", 30.0)),
+                            "non_delivery": float(mpc_config.get("non_delivery_penalty", 900.0)),
+                            "activation_uncertainty": float(mpc_config.get("activation_uncertainty_weight", 100.0)),
+                            "asset_fatigue": float(mpc_config.get("asset_fatigue_weight", 75.0)),
                         },
                         preview_4s=preview_4s,
                         optimizer=whatif_optimizer,
                         device_roster=device_roster,
                         inner_controller_mode=mpc_config.get("inner_controller_mode", "mpc"),
                         inner_dt_seconds=int(mpc_config.get("inner_dt_seconds", 4)),
-                        inner_mpc_horizon_seconds=int(mpc_config.get("inner_mpc_horizon_seconds", 20)),
+                        inner_mpc_horizon_seconds=int(mpc_config.get("inner_mpc_horizon_seconds", 4)),
                         rotation_strategy=mpc_config.get("rotation_strategy", "usage_aware"),
                         gateway_mode=mpc_config.get("gateway_mode", "simulated_centralized"),
                         execute_lower_mpc=bool(mpc_config.get("execute_lower_mpc", True)),
@@ -1866,7 +2200,7 @@ def main() -> None:
                     resource_mode=config["resource_mode"],
                     horizon_hours=min(config["horizon_hours"], 24),
                     dispatch_hours=min(config["dispatch_hours"], 24),
-                    penalty_weights={"degradation": 18.0, "comfort": 120.0, "departure": 160.0},
+                    penalty_weights={"degradation": 35.0, "comfort": 480.0, "departure": 1000.0},
                     progress_callback=lambda current, total, message: sensitivity_tracker(
                         5 + int(round((current / max(total, 1)) * 90)),
                         100,
@@ -1889,6 +2223,10 @@ def main() -> None:
                 - **Accuracy check**: expected delivery in the {100 * FINGRID_RULES['aFRR']['accuracy_low']:.0f}-{100 * FINGRID_RULES['aFRR']['accuracy_high']:.0f}% band.
                 """
             )
+
+    if live_refresh_requested:
+        time.sleep(1)
+        st.rerun()
 
 
 if __name__ == "__main__":

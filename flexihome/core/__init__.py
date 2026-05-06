@@ -7,6 +7,7 @@ from .engine import (
     ForecastSpec,
     default_hvac_response_seconds,
     generate_synthetic_portfolio,
+    run_lower_mpc_from_upper_result,
     run_mpc_controller,
     train_default_mpc_models,
     train_forecaster,
@@ -48,6 +49,7 @@ __all__ = [
     "generate_household_device_roster",
     "get_global_registry",
     "run_mpc_controller",
+    "run_lower_mpc_from_upper_result",
     "train_default_mpc_models",
     "train_forecaster",
 ]

@@ -444,6 +444,60 @@ def result_summary(result: Dict[str, object] | None) -> Dict[str, object]:
     return summary if isinstance(summary, dict) else {}
 
 
+def upper_socket_metrics(result: Dict[str, object] | None) -> Dict[str, object]:
+    history = result_history(result)
+    summary = result_summary(result)
+    if history.empty:
+        return {
+            "ready": False,
+            "reason": "Run the upper MPC layer first.",
+            "accepted_slots": 0,
+            "max_committed_kw": 0.0,
+            "mean_fcr_bid_kw": 0.0,
+            "mean_afrr_bid_kw": 0.0,
+            "mean_buffer_kw": 0.0,
+        }
+
+    def numeric_column(name: str) -> pd.Series:
+        if name in history:
+            return pd.to_numeric(history[name], errors="coerce").fillna(0.0)
+        return pd.Series(0.0, index=history.index)
+
+    fcr_bid = numeric_column("fcr_bid_kw")
+    afrr_up_bid = numeric_column("afrr_up_bid_kw")
+    afrr_down_bid = numeric_column("afrr_down_bid_kw")
+    buffer_kw = numeric_column("reserve_buffer_kw")
+    committed_kw = pd.concat([fcr_bid, afrr_up_bid, afrr_down_bid], axis=1).max(axis=1)
+    max_committed_kw = float(committed_kw.max()) if not committed_kw.empty else 0.0
+    mean_fcr_bid_kw = float(fcr_bid.mean()) if not fcr_bid.empty else 0.0
+    mean_afrr_bid_kw = float(np.maximum(afrr_up_bid, afrr_down_bid).mean()) if not afrr_up_bid.empty else 0.0
+    mean_buffer_kw = float(buffer_kw.mean()) if not buffer_kw.empty else 0.0
+
+    if "market_gate_status" in history:
+        accepted_slots = int((history["market_gate_status"].astype(str) == "Participate").sum())
+    else:
+        accepted_slots = int(summary.get("market_gate_participation_intervals", 0) or 0)
+
+    has_commitment = max_committed_kw > 1e-3
+    has_accepted_slot = accepted_slots > 0
+    if has_commitment and has_accepted_slot:
+        reason = "Upper MPC cleared an executable reserve socket."
+    elif has_commitment:
+        reason = "Upper MPC produced capacity, but no market interval cleared the participation gate."
+    else:
+        reason = "Upper MPC produced no committed reserve capacity."
+
+    return {
+        "ready": bool(has_commitment and has_accepted_slot),
+        "reason": reason,
+        "accepted_slots": accepted_slots,
+        "max_committed_kw": max_committed_kw,
+        "mean_fcr_bid_kw": mean_fcr_bid_kw,
+        "mean_afrr_bid_kw": mean_afrr_bid_kw,
+        "mean_buffer_kw": mean_buffer_kw,
+    }
+
+
 def build_live_market_feed(
     preview_4s: pd.DataFrame,
     upper_result: Dict[str, object],
@@ -1403,10 +1457,27 @@ def main() -> None:
             and not bool(st.session_state.get("mpc_result_stale", False))
             and st.session_state.get("mpc_phase") in {"upper", "market_scheduled", "market_live", "lower_waiting", "lower_live", "lower"}
         )
+        socket_metrics = upper_socket_metrics(existing_upper_result)
+        upper_socket_ready = bool(upper_market_ready and socket_metrics["ready"])
+        if live_market_session and upper_market_ready and not socket_metrics["ready"]:
+            st.session_state.pop("live_market_session", None)
+            st.session_state.pop("lower_mpc_armed", None)
+            st.session_state.pop("live_lower_result", None)
+            st.session_state["mpc_phase"] = "upper"
+            live_market_session = {}
+            market_status = live_market_status(live_market_session)
+            st.warning("Stopped the live market session because the current upper MPC result has no accepted reserve socket.")
         market_started = bool(live_market_session) and market_status["status"] in {"scheduled", "live", "closed"}
         run_upper_mpc = btn_upper.button("Run Upper MPC Layer", type="primary")
-        start_market_pressure = btn_market.button("Start Market Pressure", disabled=not upper_market_ready or market_status["status"] in {"scheduled", "live"})
-        activate_lower_mpc = btn_lower.button("Activate Lower MPC", disabled=not market_started)
+        start_market_pressure = btn_market.button("Start Market Pressure", disabled=not upper_socket_ready or market_status["status"] in {"scheduled", "live"})
+        activate_lower_mpc = btn_lower.button("Activate Lower MPC", disabled=not market_started or not upper_socket_ready)
+        if upper_market_ready and not socket_metrics["ready"]:
+            st.warning(
+                "No executable market period is available yet: "
+                f"{socket_metrics['reason']} Accepted slots = {int(socket_metrics['accepted_slots'])}, "
+                f"maximum committed reserve = {float(socket_metrics['max_committed_kw']):.1f} kW. "
+                "The market and lower MPC are disabled because there is no cleared upper socket to execute."
+            )
         mpc_progress_bar = st.progress(0.0)
         mpc_progress_text = st.empty()
         base_penalty_weights = {
@@ -1490,6 +1561,12 @@ def main() -> None:
                 st.rerun()
 
         if start_market_pressure:
+            if not upper_socket_ready:
+                st.warning(
+                    "Market Pressure was not started because the upper MPC did not clear a nonzero accepted reserve socket. "
+                    "Run Upper MPC again with settings that produce accepted reserve capacity."
+                )
+                st.stop()
             now_s = time.time()
             st.session_state["live_market_session"] = {
                 "created_at_wall_s": now_s,
@@ -1506,6 +1583,9 @@ def main() -> None:
             st.rerun()
 
         if activate_lower_mpc:
+            if not upper_socket_ready:
+                st.warning("Lower MPC was not armed because the upper socket is empty or did not clear the market gate.")
+                st.stop()
             st.session_state["lower_mpc_armed"] = True
             st.session_state["mpc_phase"] = "lower_waiting" if market_status["status"] == "scheduled" else "market_live"
             st.rerun()
@@ -1515,6 +1595,11 @@ def main() -> None:
         lower_armed = bool(st.session_state.get("lower_mpc_armed", False))
         if live_market_session and market_status["status"] == "live" and st.session_state.get("mpc_phase") in {"market_scheduled", "lower_waiting"}:
             st.session_state["mpc_phase"] = "market_live" if not lower_armed else "lower_waiting"
+        if lower_armed and not upper_socket_ready:
+            st.session_state["lower_mpc_armed"] = False
+            st.session_state.pop("live_lower_result", None)
+            st.warning("Lower MPC was disarmed because the current upper socket has no accepted committed reserve.")
+            lower_armed = False
         if lower_armed and live_market_session and market_status["status"] in {"live", "closed"}:
             fleet_meta = {
                 "bess_energy_cap_mwh": float(df["bess_energy_cap_mwh"].iloc[0]),
@@ -1615,18 +1700,28 @@ def main() -> None:
             m2.metric("Delivered up energy", f"{float(s.get('delivered_up_mwh', 0.0)):.2f} MWh")
             m3.metric("Requirement score", f"{float(s.get('requirement_score_pct', 0.0)):.0f}%")
             m4.metric("Comfort violations", f"{float(s.get('comfort_violations_h', 0.0)):.1f} h")
-            mpc_status_cols = st.columns(4)
+            upper_socket_view_metrics = upper_socket_metrics(upper_view_result)
+            mpc_status_cols = st.columns(5)
             solver_mode = result_df["solver_status"].mode().iloc[0] if "solver_status" in result_df and not result_df["solver_status"].empty else "unknown"
             inner_mode = result_df["inner_solver_status"].mode().iloc[0] if "inner_solver_status" in result_df and not result_df["inner_solver_status"].empty else "unknown"
             mpc_status_cols[0].metric("Upper MPC status", solver_mode)
             mpc_status_cols[1].metric("MPC intervals", f"{len(result_df):,}")
-            mpc_status_cols[2].metric("4-sec MPC status", inner_mode if s.get("execute_lower_mpc") else "Not started")
-            mpc_status_cols[3].metric("Mean shortfall", f"{float(result_df.get('shortfall_kw', pd.Series([0.0])).mean()):.1f} kW")
+            mpc_status_cols[2].metric("Upper socket", "Ready" if upper_socket_view_metrics["ready"] else "Empty")
+            mpc_status_cols[3].metric("4-sec MPC status", inner_mode if s.get("execute_lower_mpc") else "Not started")
+            mpc_status_cols[4].metric("Mean shortfall", f"{float(result_df.get('shortfall_kw', pd.Series([0.0])).mean()):.1f} kW")
             risk_cols = st.columns(4)
             risk_cols[0].metric("Risk policy", st.session_state.get("mpc_config", {}).get("risk_profile", "P80"))
             risk_cols[1].metric("Accepted market slots", f"{int(s.get('market_gate_participation_intervals', 0)):,}")
             risk_cols[2].metric("Risk-adjusted profit", fmt_money(float(s.get("risk_adjusted_profit_eur", 0.0))))
             risk_cols[3].metric("Delivery risk cost", fmt_money(float(s.get("non_delivery_risk_cost_eur", 0.0))))
+            if not upper_socket_view_metrics["ready"]:
+                st.warning(
+                    f"Upper socket is empty: {upper_socket_view_metrics['reason']} "
+                    f"Accepted slots = {int(upper_socket_view_metrics['accepted_slots'])}, "
+                    f"maximum committed reserve = {float(upper_socket_view_metrics['max_committed_kw']):.1f} kW, "
+                    f"mean buffer = {float(upper_socket_view_metrics['mean_buffer_kw']):.1f} kW. "
+                    "A flat lower MPC plot is expected until the upper market decision clears nonzero reserve."
+                )
             st.info(
                 f"MPC workflow: `{st.session_state.get('mpc_config', {}).get('forecaster_plugin', DEFAULT_FORECASTER_PLUGIN)}` forecasts each horizon, "
                 f"`{st.session_state.get('mpc_config', {}).get('optimizer_plugin', DEFAULT_OPTIMIZER_PLUGIN)}` chooses reserve bids and resource dispatch, "

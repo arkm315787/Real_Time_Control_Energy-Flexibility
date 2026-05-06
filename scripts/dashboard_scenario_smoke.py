@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 
 import pandas as pd
 
-from app import default_scenario_inputs, live_market_status, live_visible_frame, portfolio_bundle_is_current, scenario_portfolio_signature
+from app import default_scenario_inputs, live_market_status, live_visible_frame, portfolio_bundle_is_current, scenario_portfolio_signature, upper_socket_metrics
 
 
 def main() -> None:
@@ -54,6 +54,8 @@ def main() -> None:
         'button("Start Market Pressure"',
         'button("Activate Lower MPC"',
         'run_lower_mpc_from_upper_result(',
+        "upper_socket_ready",
+        "upper_socket_metrics(",
     ]
     missing = [fragment for fragment in required_fragments if fragment not in source]
     if missing:
@@ -69,6 +71,38 @@ def main() -> None:
     frame = pd.DataFrame({"signal": range(10)}, index=pd.date_range("2026-01-01", periods=10, freq="4s"))
     if len(live_visible_frame(frame, session, now_s=119.0)) != 3:
         raise SystemExit("Live visible frame should reveal rows according to elapsed market seconds.")
+
+    empty_socket = {
+        "history": pd.DataFrame(
+            {
+                "fcr_bid_kw": [0.0],
+                "afrr_up_bid_kw": [0.0],
+                "afrr_down_bid_kw": [0.0],
+                "market_gate_status": ["Wait"],
+                "reserve_buffer_kw": [0.0],
+            }
+        ),
+        "summary": {"market_gate_participation_intervals": 0},
+    }
+    empty_metrics = upper_socket_metrics(empty_socket)
+    if empty_metrics["ready"] or empty_metrics["accepted_slots"] != 0 or empty_metrics["max_committed_kw"] != 0.0:
+        raise SystemExit("An upper MPC result with zero accepted reserve must not enable the live market.")
+
+    cleared_socket = {
+        "history": pd.DataFrame(
+            {
+                "fcr_bid_kw": [120.0, 140.0],
+                "afrr_up_bid_kw": [0.0, 0.0],
+                "afrr_down_bid_kw": [0.0, 0.0],
+                "market_gate_status": ["Participate", "Wait"],
+                "reserve_buffer_kw": [24.0, 28.0],
+            }
+        ),
+        "summary": {"market_gate_participation_intervals": 1},
+    }
+    cleared_metrics = upper_socket_metrics(cleared_socket)
+    if not cleared_metrics["ready"] or cleared_metrics["accepted_slots"] != 1 or cleared_metrics["max_committed_kw"] <= 0.0:
+        raise SystemExit("A nonzero accepted upper socket should enable the live market and lower MPC.")
 
     print("dashboard scenario apply smoke checks passed")
 

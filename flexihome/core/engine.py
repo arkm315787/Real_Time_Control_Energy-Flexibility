@@ -32,14 +32,29 @@ from .market_data import overlay_real_market_data
 FINGRID_RULES = {
     "FCR-N": {
         "min_bid_kw": 100.0,
+        "bid_granularity_kw": 100.0,
+        "max_bid_kw_per_timeseries": 5000.0,
         "band_hz": 0.1,
-        "response_seconds": 5.0,
-        "description": "Symmetric reserve around 50 Hz, full activation at ±0.1 Hz.",
+        "activation_60_fraction": 0.63,
+        "activation_180_fraction": 0.95,
+        "energy_60_seconds": 24.0,
+        "response_63_seconds": 60.0,
+        "response_95_seconds": 180.0,
+        "storage_endurance_hours": 1.0,
+        "steady_state_under_delivery_tolerance": 0.05,
+        "steady_state_over_delivery_tolerance": 0.20,
+        "market_period_minutes": 60,
+        "control_source": "local_frequency_measurement",
+        "symmetric": True,
+        "description": "Symmetric local frequency response around 50 Hz, with no TSO activation signal.",
     },
     "aFRR": {
         "min_bid_kw": 1000.0,
+        "bid_granularity_kw": 1000.0,
         "start_seconds": 30.0,
         "full_activation_seconds": 300.0,
+        "market_period_minutes": 15,
+        "control_source": "tso_activation_signal",
         "accuracy_low": 0.90,
         "accuracy_high": 1.10,
         "storage_endurance_hours": 1.0,
@@ -53,6 +68,8 @@ RESOURCE_RESPONSE_SECONDS = {
     "HVAC": 20.0,
     "PV": 5.0,
 }
+
+FCR_N_LOCAL_CONTROL_TYPES = {"BESS", "EV", "HVAC"}
 
 RESOURCE_FORECAST_UNCERTAINTY = {
     "BESS": 0.08,
@@ -84,6 +101,14 @@ HVAC_DEFAULT_RESPONSE_S = {
     "Inverter / variable-speed": 20.0,
 }
 
+FCR_N_HVAC_SHARE_CAP = 0.20
+FCR_N_DEFAULT_DELAY_S = {
+    "BESS": 0.0,
+    "EV": 0.0,
+    "HVAC": 4.0,
+    "PV": 0.0,
+}
+
 @dataclass
 class ForecastSpec:
     target: str
@@ -98,6 +123,147 @@ def hvac_fast_fraction(hvac_mode: str) -> float:
 
 def default_hvac_response_seconds(hvac_mode: str) -> float:
     return float(HVAC_DEFAULT_RESPONSE_S.get(hvac_mode, HVAC_DEFAULT_RESPONSE_S[HVAC_MODES[0]]))
+
+def _first_order_step_fraction(response_seconds: float, elapsed_seconds: float, delay_seconds: float = 0.0) -> float:
+    effective_seconds = max(float(elapsed_seconds) - max(float(delay_seconds), 0.0), 0.0)
+    if effective_seconds <= 0.0:
+        return 0.0
+    tau = max(float(response_seconds), 1e-6)
+    return float(np.clip(1.0 - math.exp(-effective_seconds / tau), 0.0, 1.0))
+
+def _first_order_step_energy_seconds(response_seconds: float, elapsed_seconds: float, delay_seconds: float = 0.0) -> float:
+    effective_seconds = max(float(elapsed_seconds) - max(float(delay_seconds), 0.0), 0.0)
+    if effective_seconds <= 0.0:
+        return 0.0
+    tau = max(float(response_seconds), 1e-6)
+    return float(max(effective_seconds - tau * (1.0 - math.exp(-effective_seconds / tau)), 0.0))
+
+def fcr_n_dynamic_deliverable_fraction(response_seconds: float, delay_seconds: float = 0.0) -> float:
+    """Map steady-state FCR-N capacity to dynamically deliverable capacity."""
+
+    rules = FINGRID_RULES["FCR-N"]
+    frac_60 = _first_order_step_fraction(response_seconds, rules["response_63_seconds"], delay_seconds)
+    frac_180 = _first_order_step_fraction(response_seconds, rules["response_95_seconds"], delay_seconds)
+    energy_60_s = _first_order_step_energy_seconds(response_seconds, rules["response_63_seconds"], delay_seconds)
+    caps = [
+        frac_60 / max(float(rules["activation_60_fraction"]), 1e-9),
+        frac_180 / max(float(rules["activation_180_fraction"]), 1e-9),
+        energy_60_s / max(float(rules["energy_60_seconds"]), 1e-9),
+        1.0,
+    ]
+    return float(np.clip(min(caps), 0.0, 1.0))
+
+def fcr_n_dynamic_deliverable_kw(
+    up_kw: float,
+    down_kw: float,
+    response_seconds: float,
+    delay_seconds: float = 0.0,
+) -> float:
+    symmetric_kw = min(max(float(up_kw), 0.0), max(float(down_kw), 0.0))
+    return float(symmetric_kw * fcr_n_dynamic_deliverable_fraction(response_seconds, delay_seconds))
+
+def _fcr_n_resource_response_seconds(resource: str, fleet_meta: Dict[str, Any]) -> float:
+    resource_key = str(resource).upper()
+    if resource_key == "HVAC":
+        return float(fleet_meta.get("hvac_response_s", RESOURCE_RESPONSE_SECONDS["HVAC"]))
+    return float(RESOURCE_RESPONSE_SECONDS.get(resource_key, RESOURCE_RESPONSE_SECONDS["EV"]))
+
+def _fcr_n_resource_delay_seconds(resource: str, fleet_meta: Dict[str, Any]) -> float:
+    resource_key = str(resource).upper()
+    lower = resource_key.lower()
+    return float(
+        fleet_meta.get(
+            f"{lower}_fcr_delay_s",
+            fleet_meta.get(
+                f"{lower}_communication_delay_s",
+                fleet_meta.get("fcr_communication_delay_s", FCR_N_DEFAULT_DELAY_S.get(resource_key, 0.0)),
+            ),
+        )
+    )
+
+def _fcr_n_hvac_share_cap(fleet_meta: Dict[str, Any]) -> float:
+    return float(np.clip(fleet_meta.get("fcr_hvac_share_cap", FCR_N_HVAC_SHARE_CAP), 0.0, 1.0))
+
+def _fcr_n_hvac_share_limit(fast_fcr_kw: float, fleet_meta: Dict[str, Any]) -> float:
+    share_cap = _fcr_n_hvac_share_cap(fleet_meta)
+    if share_cap >= 0.999:
+        return float("inf")
+    if share_cap <= 0.0:
+        return 0.0
+    return float(max(fast_fcr_kw, 0.0) * share_cap / max(1.0 - share_cap, 1e-9))
+
+def _fcr_n_bid_dynamic_metrics(values: Dict[str, float], fleet_meta: Dict[str, Any]) -> Dict[str, float | bool]:
+    bids = {
+        "BESS": max(float(values.get("bess_fcr_kw", 0.0)), 0.0),
+        "EV": max(float(values.get("ev_fcr_kw", 0.0)), 0.0),
+        "HVAC": max(float(values.get("hvac_fcr_kw", 0.0)), 0.0),
+    }
+    total_kw = sum(bids.values())
+    if total_kw <= 1e-9:
+        return {
+            "fcr_response_60_fraction": 1.0,
+            "fcr_response_180_fraction": 1.0,
+            "fcr_energy_60_seconds": 0.0,
+            "fcr_dynamic_response_ok": True,
+        }
+
+    rules = FINGRID_RULES["FCR-N"]
+    response_60_kw = 0.0
+    response_180_kw = 0.0
+    energy_60_kws = 0.0
+    for resource, bid_kw in bids.items():
+        response_s = _fcr_n_resource_response_seconds(resource, fleet_meta)
+        delay_s = _fcr_n_resource_delay_seconds(resource, fleet_meta)
+        response_60_kw += bid_kw * _first_order_step_fraction(response_s, rules["response_63_seconds"], delay_s)
+        response_180_kw += bid_kw * _first_order_step_fraction(response_s, rules["response_95_seconds"], delay_s)
+        energy_60_kws += bid_kw * _first_order_step_energy_seconds(response_s, rules["response_63_seconds"], delay_s)
+
+    response_60_fraction = response_60_kw / total_kw
+    response_180_fraction = response_180_kw / total_kw
+    energy_60_seconds = energy_60_kws / total_kw
+    dynamic_ok = (
+        response_60_fraction + 1e-9 >= float(rules["activation_60_fraction"])
+        and response_180_fraction + 1e-9 >= float(rules["activation_180_fraction"])
+        and energy_60_seconds + 1e-9 >= float(rules["energy_60_seconds"])
+    )
+    return {
+        "fcr_response_60_fraction": float(response_60_fraction),
+        "fcr_response_180_fraction": float(response_180_fraction),
+        "fcr_energy_60_seconds": float(energy_60_seconds),
+        "fcr_dynamic_response_ok": bool(dynamic_ok),
+    }
+
+def fcr_n_local_control_capable(resource: str) -> bool:
+    """Return whether the simulated resource has a local frequency-control path."""
+
+    return str(resource).upper() in FCR_N_LOCAL_CONTROL_TYPES
+
+def _fcr_bid_total(values: Dict[str, float]) -> float:
+    return float(values.get("bess_fcr_kw", 0.0) + values.get("ev_fcr_kw", 0.0) + values.get("hvac_fcr_kw", 0.0))
+
+def _apply_fcr_n_bid_rules(values: Dict[str, float]) -> Dict[str, float]:
+    """Round FCR-N capacity to market granularity while preserving symmetry."""
+
+    payload = dict(values)
+    fcr_total = _fcr_bid_total(payload)
+    min_kw = float(FINGRID_RULES["FCR-N"]["min_bid_kw"])
+    granularity_kw = float(FINGRID_RULES["FCR-N"]["bid_granularity_kw"])
+    max_timeseries_kw = float(FINGRID_RULES["FCR-N"]["max_bid_kw_per_timeseries"])
+    if fcr_total <= 0.0:
+        quantized_kw = 0.0
+    else:
+        quantized_kw = np.floor(fcr_total / max(granularity_kw, 1e-9)) * granularity_kw
+        if quantized_kw < min_kw:
+            quantized_kw = 0.0
+    ratio = quantized_kw / fcr_total if fcr_total > 1e-9 else 0.0
+    for key in ("bess_fcr_kw", "ev_fcr_kw", "hvac_fcr_kw"):
+        payload[key] = float(payload.get(key, 0.0) * ratio)
+    payload["fcr_bid_kw"] = float(quantized_kw)
+    payload["fcr_bid_granularity_kw"] = granularity_kw
+    payload["fcr_bid_segments"] = int(np.ceil(quantized_kw / max(max_timeseries_kw, 1e-9))) if quantized_kw > 0.0 else 0
+    payload["fcr_control_source"] = FINGRID_RULES["FCR-N"]["control_source"]
+    payload["fcr_symmetric"] = True
+    return payload
 
 def serialize_forecast_spec(spec: ForecastSpec) -> bytes:
     payload = {
@@ -445,7 +611,13 @@ def generate_synthetic_portfolio(
     df["hvac_up_kw"] = hvac["hvac_up_kw"]
     df["hvac_down_kw"] = hvac["hvac_down_kw"]
     df["indoor_temp_c_ref"] = hvac["indoor_temp_c_ref"]
-    df["hvac_fast_kw"] = hvac_fast_fraction(hvac_mode) * np.minimum(df["hvac_up_kw"], df["hvac_down_kw"])
+    hvac_fcr_dynamic_fraction = fcr_n_dynamic_deliverable_fraction(
+        hvac_response_s,
+        FCR_N_DEFAULT_DELAY_S["HVAC"],
+    )
+    df["hvac_fcr_dynamic_fraction"] = hvac_fcr_dynamic_fraction
+    df["hvac_fcr_dynamic_cap_kw"] = hvac_fcr_dynamic_fraction * np.minimum(df["hvac_up_kw"], df["hvac_down_kw"])
+    df["hvac_fast_kw"] = df["hvac_fcr_dynamic_cap_kw"]
     df["fast_sym_kw"] = np.minimum(df["bess_up_kw"], df["bess_down_kw"]) + np.minimum(df["ev_up_kw"], df["ev_down_kw"]) + df["hvac_fast_kw"]
     df["hybrid_fcr_kw"] = df["fast_sym_kw"]
     df["flex_up_kw"] = df["bess_up_kw"] + df["ev_up_kw"] + df["hvac_up_kw"]
@@ -472,6 +644,8 @@ def generate_synthetic_portfolio(
         "bess_energy_mwh": bess_energy_cap_mwh,
         "ev_energy_mwh": ev_energy_capacity_mwh,
         "hvac_mode": hvac_mode,
+        "hvac_fcr_dynamic_fraction": hvac_fcr_dynamic_fraction,
+        "fcr_hvac_share_cap": FCR_N_HVAC_SHARE_CAP,
         "device_count": int(len(device_roster)),
         "gateway_count": int(device_roster["gateway_id"].nunique()) if not device_roster.empty else 0,
         "freq_minutes": freq_minutes,
@@ -692,6 +866,9 @@ def heuristic_mpc_step(
     bess_cap = max(float(fleet_meta["bess_energy_cap_mwh"]), 1e-6)
     eta_c = 0.95
     eta_d = 0.95
+    fcr_endurance_h = float(FINGRID_RULES["FCR-N"]["storage_endurance_hours"])
+    hvac_response_s = float(fleet_meta.get("hvac_response_s", RESOURCE_RESPONSE_SECONDS["HVAC"]))
+    hvac_delay_s = _fcr_n_resource_delay_seconds("HVAC", fleet_meta)
 
     for _, row in forecast_df.iterrows():
         fcr_on = market_mode in {"FCR-N", "Combined"}
@@ -700,9 +877,15 @@ def heuristic_mpc_step(
 
         bess_fcr = ev_fcr = hvac_fcr = 0.0
         if fcr_on:
-            bess_fcr = float(min(row["bess_up_kw"], row["bess_down_kw"]))
-            ev_fcr = float(min(row["ev_up_kw"], row["ev_down_kw"]))
-            hvac_fcr = float(enable_hvac * min(row["hvac_up_kw"], row["hvac_down_kw"], row.get("hvac_fast_kw", 0.0)))
+            bess_up_energy_kw = max((bess_soc - 0.10 * bess_cap) * 1000.0 * eta_d / max(fcr_endurance_h, 1e-6), 0.0)
+            bess_down_energy_kw = max((0.95 * bess_cap - bess_soc) * 1000.0 / (max(fcr_endurance_h, 1e-6) * eta_c), 0.0)
+            bess_fcr = float(min(row["bess_up_kw"], row["bess_down_kw"], bess_up_energy_kw, bess_down_energy_kw))
+            ev_actual_soc = float(row["ev_soc_ref_mwh"]) + ev_delta
+            ev_up_energy_kw = max((ev_actual_soc - float(row["ev_soc_min_mwh"])) * 1000.0 * eta_d / max(fcr_endurance_h, 1e-6), 0.0)
+            ev_down_energy_kw = max((float(row["ev_soc_max_mwh"]) - ev_actual_soc) * 1000.0 / (max(fcr_endurance_h, 1e-6) * eta_c), 0.0)
+            ev_fcr = float(min(row["ev_up_kw"], row["ev_down_kw"], ev_up_energy_kw, ev_down_energy_kw))
+            hvac_fcr_cap = enable_hvac * fcr_n_dynamic_deliverable_kw(row["hvac_up_kw"], row["hvac_down_kw"], hvac_response_s, hvac_delay_s)
+            hvac_fcr = float(min(hvac_fcr_cap, _fcr_n_hvac_share_limit(bess_fcr + ev_fcr, fleet_meta)))
 
         bess_up_av = max(float(row["bess_up_kw"]) - bess_fcr, 0.0)
         bess_down_av = max(float(row["bess_down_kw"]) - bess_fcr, 0.0)
@@ -738,7 +921,7 @@ def heuristic_mpc_step(
             / max(float(fleet_meta["n_hvac"]), 1.0)
         )
 
-        rows.append(
+        values = _apply_fcr_n_bid_rules(
             {
                 "bess_fcr_kw": bess_fcr,
                 "ev_fcr_kw": ev_fcr,
@@ -753,8 +936,13 @@ def heuristic_mpc_step(
                 "bess_soc_mwh_plan": bess_soc,
                 "ev_delta_mwh_plan": ev_delta,
                 "temp_delta_c_plan": temp_delta,
+                "hvac_fcr_dynamic_cap_kw": hvac_fcr_cap if fcr_on else 0.0,
+                "hvac_fcr_dynamic_fraction": fcr_n_dynamic_deliverable_fraction(hvac_response_s, hvac_delay_s),
+                "fcr_hvac_share_cap": _fcr_n_hvac_share_cap(fleet_meta),
             }
         )
+        values.update(_fcr_n_bid_dynamic_metrics(values, fleet_meta))
+        rows.append(values)
 
     schedule = pd.DataFrame(rows, index=forecast_df.index)
     schedule["fcr_bid_kw"] = schedule["bess_fcr_kw"] + schedule["ev_fcr_kw"] + schedule["hvac_fcr_kw"]
@@ -842,10 +1030,13 @@ def solve_mpc_step(
     enable_hvac = 0.0 if only_fast else 1.0
     enable_pv = 0.0 if only_fast else 1.0
     hvac_response_s = float(fleet_meta.get("hvac_response_s", RESOURCE_RESPONSE_SECONDS["HVAC"]))
+    hvac_delay_s = _fcr_n_resource_delay_seconds("HVAC", fleet_meta)
+    hvac_fcr_dynamic_fraction = fcr_n_dynamic_deliverable_fraction(hvac_response_s, hvac_delay_s)
+    fcr_endurance_h = float(FINGRID_RULES["FCR-N"]["storage_endurance_hours"])
     fcr_eligible = {
-        "BESS": 1.0 if RESOURCE_RESPONSE_SECONDS["BESS"] <= FINGRID_RULES["FCR-N"]["response_seconds"] else 0.0,
-        "EV": 1.0 if RESOURCE_RESPONSE_SECONDS["EV"] <= FINGRID_RULES["FCR-N"]["response_seconds"] else 0.0,
-        "HVAC": 1.0 if hvac_response_s <= FINGRID_RULES["FCR-N"]["response_seconds"] else 0.0,
+        "BESS": 1.0 if fcr_n_local_control_capable("BESS") else 0.0,
+        "EV": 1.0 if fcr_n_local_control_capable("EV") else 0.0,
+        "HVAC": 1.0 if fcr_n_local_control_capable("HVAC") and hvac_fcr_dynamic_fraction > 1e-6 else 0.0,
     }
     afrr_eligible = {
         "BESS": 1.0 if RESOURCE_RESPONSE_SECONDS["BESS"] <= FINGRID_RULES["aFRR"]["full_activation_seconds"] else 0.0,
@@ -891,9 +1082,9 @@ def solve_mpc_step(
         bess_down_cap = float(row["bess_down_kw"]) * risk_factors["BESS"]
         ev_up_cap = float(row["ev_up_kw"]) * risk_factors["EV"]
         ev_down_cap = float(row["ev_down_kw"]) * risk_factors["EV"]
-        hvac_up_cap = enable_hvac * afrr_eligible["HVAC"] * float(row["hvac_up_kw"]) * risk_factors["HVAC"]
-        hvac_down_cap = enable_hvac * afrr_eligible["HVAC"] * float(row["hvac_down_kw"]) * risk_factors["HVAC"]
-        hvac_fcr_cap = enable_hvac * fcr_eligible["HVAC"] * float(row.get("hvac_fast_kw", 0.0)) * risk_factors["HVAC"]
+        hvac_up_cap = enable_hvac * float(row["hvac_up_kw"]) * risk_factors["HVAC"]
+        hvac_down_cap = enable_hvac * float(row["hvac_down_kw"]) * risk_factors["HVAC"]
+        hvac_fcr_cap = enable_hvac * min(float(row["hvac_up_kw"]), float(row["hvac_down_kw"])) * risk_factors["HVAC"] * hvac_fcr_dynamic_fraction * fcr_eligible["HVAC"]
         pv_down_cap = enable_pv * afrr_eligible["PV"] * float(row["pv_down_kw"]) * risk_factors["PV"]
 
         problem += bess_fcr[k] <= min(bess_up_cap, bess_down_cap) * fcr_eligible["BESS"]
@@ -905,9 +1096,15 @@ def solve_mpc_step(
         problem += ev_fcr[k] + ev_down[k] <= ev_down_cap
         problem += hvac_fcr[k] + hvac_up[k] <= hvac_up_cap
         problem += hvac_fcr[k] + hvac_down[k] <= hvac_down_cap
+        problem += hvac_up[k] <= hvac_up_cap * afrr_eligible["HVAC"]
+        problem += hvac_down[k] <= hvac_down_cap * afrr_eligible["HVAC"]
+        if _fcr_n_hvac_share_cap(fleet_meta) < 0.999:
+            problem += (1.0 - _fcr_n_hvac_share_cap(fleet_meta)) * hvac_fcr[k] <= _fcr_n_hvac_share_cap(fleet_meta) * (bess_fcr[k] + ev_fcr[k])
         problem += pv_down[k] <= pv_down_cap
         problem += bess_fcr[k] + bess_up[k] <= (soc_b[k] - 0.10 * bess_cap) * 1000.0 * eta_d / max(dt_h, 1e-6)
         problem += bess_fcr[k] + bess_down[k] <= (0.95 * bess_cap - soc_b[k]) * 1000.0 / (max(dt_h, 1e-6) * eta_c)
+        problem += bess_fcr[k] <= (soc_b[k] - 0.10 * bess_cap) * 1000.0 * eta_d / max(fcr_endurance_h, 1e-6)
+        problem += bess_fcr[k] <= (0.95 * bess_cap - soc_b[k]) * 1000.0 / (max(fcr_endurance_h, 1e-6) * eta_c)
 
         if fcr_on < 0.5:
             problem += bess_fcr[k] == 0
@@ -940,6 +1137,8 @@ def solve_mpc_step(
         ev_actual = ev_ref + ev_delta[k]
         problem += ev_fcr[k] + ev_up[k] <= (ev_actual - ev_min) * 1000.0 * eta_d / max(dt_h, 1e-6)
         problem += ev_fcr[k] + ev_down[k] <= (ev_max - ev_actual) * 1000.0 / (max(dt_h, 1e-6) * eta_c)
+        problem += ev_fcr[k] <= (ev_actual - ev_min) * 1000.0 * eta_d / max(fcr_endurance_h, 1e-6)
+        problem += ev_fcr[k] <= (ev_max - ev_actual) * 1000.0 / (max(fcr_endurance_h, 1e-6) * eta_c)
         problem += ev_delta[k + 1] == ev_delta[k] + dt_h / 1000.0 * (
             eta_c * (afrr_down_frac * ev_down[k] + fcr_down_frac * ev_fcr[k])
             - (afrr_up_frac * ev_up[k] + fcr_up_frac * ev_fcr[k]) / eta_d
@@ -1024,7 +1223,7 @@ def solve_mpc_step(
     rows = []
     for k in idxs:
         row = forecast_df.iloc[k]
-        values = {
+        values = _apply_fcr_n_bid_rules({
             "bess_fcr_kw": float(bess_fcr[k].value() or 0.0),
             "ev_fcr_kw": float(ev_fcr[k].value() or 0.0),
             "hvac_fcr_kw": float(hvac_fcr[k].value() or 0.0),
@@ -1035,7 +1234,16 @@ def solve_mpc_step(
             "hvac_afrr_up_kw": float(hvac_up[k].value() or 0.0),
             "hvac_afrr_down_kw": float(hvac_down[k].value() or 0.0),
             "pv_afrr_down_kw": float(pv_down[k].value() or 0.0),
-        }
+        })
+        hvac_fcr_cap_val = enable_hvac * min(float(row["hvac_up_kw"]), float(row["hvac_down_kw"])) * risk_factors["HVAC"] * hvac_fcr_dynamic_fraction * fcr_eligible["HVAC"]
+        values.update(
+            {
+                "hvac_fcr_dynamic_cap_kw": float(hvac_fcr_cap_val),
+                "hvac_fcr_dynamic_fraction": float(hvac_fcr_dynamic_fraction),
+                "fcr_hvac_share_cap": _fcr_n_hvac_share_cap(fleet_meta),
+            }
+        )
+        values.update(_fcr_n_bid_dynamic_metrics(values, fleet_meta))
         fcr_bid_val = values["bess_fcr_kw"] + values["ev_fcr_kw"] + values["hvac_fcr_kw"]
         afrr_up_bid_val = values["bess_afrr_up_kw"] + values["ev_afrr_up_kw"] + values["hvac_afrr_up_kw"]
         afrr_down_bid_val = values["bess_afrr_down_kw"] + values["ev_afrr_down_kw"] + values["hvac_afrr_down_kw"] + values["pv_afrr_down_kw"]
@@ -1115,7 +1323,13 @@ def _available_up_down(
     comfort_factor_down = float(np.clip((temp_hi - temp_actual) / max(fleet_meta["comfort_band_c"], 0.2), 0, 1))
     hvac_up_av = row["hvac_up_kw"] * comfort_factor_up
     hvac_down_av = row["hvac_down_kw"] * comfort_factor_down
-    hvac_fast_av = min(hvac_up_av, hvac_down_av) * hvac_fast_fraction(str(fleet_meta.get("hvac_mode", HVAC_MODES[0])))
+    hvac_response_s = float(fleet_meta.get("hvac_response_s", default_hvac_response_seconds(str(fleet_meta.get("hvac_mode", HVAC_MODES[0])))))
+    hvac_fast_av = fcr_n_dynamic_deliverable_kw(
+        hvac_up_av,
+        hvac_down_av,
+        hvac_response_s,
+        _fcr_n_resource_delay_seconds("HVAC", fleet_meta),
+    )
 
     return {
         "bess_up_av": bess_up_av,
@@ -1130,7 +1344,10 @@ def _available_up_down(
 
 
 def _market_gate_decision(plan: Dict[str, float], market_mode: str) -> Dict[str, object]:
-    fcr_bid = float(plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0) + plan.get("hvac_fcr_kw", 0.0))
+    bess_fcr = float(plan.get("bess_fcr_kw", 0.0))
+    ev_fcr = float(plan.get("ev_fcr_kw", 0.0))
+    hvac_fcr = float(plan.get("hvac_fcr_kw", 0.0))
+    fcr_bid = float(bess_fcr + ev_fcr + hvac_fcr)
     afrr_up = float(plan.get("bess_afrr_up_kw", 0.0) + plan.get("ev_afrr_up_kw", 0.0) + plan.get("hvac_afrr_up_kw", 0.0))
     afrr_down = float(
         plan.get("bess_afrr_down_kw", 0.0)
@@ -1144,15 +1361,31 @@ def _market_gate_decision(plan: Dict[str, float], market_mode: str) -> Dict[str,
     afrr_enabled = market_mode in {"aFRR", "Combined"}
     fcr_ok = fcr_bid >= FINGRID_RULES["FCR-N"]["min_bid_kw"] if fcr_enabled else False
     afrr_ok = afrr_bid >= FINGRID_RULES["aFRR"]["min_bid_kw"] if afrr_enabled else False
+    fcr_local_ok = str(plan.get("fcr_control_source", FINGRID_RULES["FCR-N"]["control_source"])) == FINGRID_RULES["FCR-N"]["control_source"]
+    hvac_dynamic_cap = plan.get("hvac_fcr_dynamic_cap_kw")
+    fcr_dynamic_cap_ok = True if hvac_dynamic_cap is None else hvac_fcr <= float(hvac_dynamic_cap) + 1e-6
+    fcr_dynamic_response_ok = bool(plan.get("fcr_dynamic_response_ok", True))
+    hvac_share_cap = float(np.clip(plan.get("fcr_hvac_share_cap", FCR_N_HVAC_SHARE_CAP), 0.0, 1.0))
+    fcr_hvac_share_ok = (
+        True
+        if hvac_share_cap >= 0.999
+        else (1.0 - hvac_share_cap) * hvac_fcr <= hvac_share_cap * (bess_fcr + ev_fcr) + 1e-6
+    )
+    fcr_granularity_kw = float(FINGRID_RULES["FCR-N"]["bid_granularity_kw"])
+    fcr_granularity_ok = (
+        True
+        if not fcr_enabled or fcr_bid <= 1e-6
+        else abs((fcr_bid / max(fcr_granularity_kw, 1e-9)) - round(fcr_bid / max(fcr_granularity_kw, 1e-9))) <= 1e-6
+    )
     profitable = risk_profit >= 0.0
     if market_mode == "FCR-N":
-        product_ok = fcr_ok
+        product_ok = fcr_ok and fcr_local_ok and fcr_granularity_ok and fcr_dynamic_cap_ok and fcr_dynamic_response_ok and fcr_hvac_share_ok
         size_reason = "Reliable FCR-N bid is below the selected market minimum size."
     elif market_mode == "aFRR":
         product_ok = afrr_ok
         size_reason = "Reliable aFRR bid is below the selected market minimum size."
     else:
-        product_ok = fcr_ok or afrr_ok
+        product_ok = (fcr_ok and fcr_local_ok and fcr_granularity_ok and fcr_dynamic_cap_ok and fcr_dynamic_response_ok and fcr_hvac_share_ok) or afrr_ok
         size_reason = "Reliable FCR-N and aFRR bids are both below their market minimum sizes."
 
     if product_ok and profitable and (fcr_bid + afrr_bid > 1.0):
@@ -1161,6 +1394,21 @@ def _market_gate_decision(plan: Dict[str, float], market_mode: str) -> Dict[str,
     elif not profitable:
         status = "Wait"
         reason = "Expected revenue is lower than risk, fatigue, and delivery-cost allowance."
+    elif fcr_enabled and fcr_ok and not fcr_local_ok and not afrr_ok:
+        status = "Wait"
+        reason = "FCR-N requires locally measured symmetric frequency response; this slot includes centrally dispatched FCR capacity."
+    elif fcr_enabled and fcr_ok and not fcr_granularity_ok and not afrr_ok:
+        status = "Wait"
+        reason = "FCR-N bid is not aligned to the 0.1 MW market granularity."
+    elif fcr_enabled and fcr_ok and not fcr_dynamic_cap_ok and not afrr_ok:
+        status = "Wait"
+        reason = "FCR-N HVAC contribution exceeds the dynamically deliverable capacity for the selected response speed."
+    elif fcr_enabled and fcr_ok and not fcr_dynamic_response_ok and not afrr_ok:
+        status = "Wait"
+        reason = "FCR-N aggregate droop response does not satisfy the 60 s, 180 s, and 60 s energy checks."
+    elif fcr_enabled and fcr_ok and not fcr_hvac_share_ok and not afrr_ok:
+        status = "Wait"
+        reason = "FCR-N HVAC contribution exceeds the configured comfort-disturbance share cap."
     elif not product_ok:
         status = "Wait"
         reason = size_reason
@@ -1172,6 +1420,12 @@ def _market_gate_decision(plan: Dict[str, float], market_mode: str) -> Dict[str,
         "market_gate_reason": reason,
         "risk_adjusted_profit_eur": risk_profit,
         "reserve_buffer_kw": float(plan.get("reserve_buffer_kw", 0.0)),
+        "fcr_local_control_ok": bool(fcr_local_ok),
+        "fcr_bid_granularity_ok": bool(fcr_granularity_ok),
+        "fcr_dynamic_cap_ok": bool(fcr_dynamic_cap_ok),
+        "fcr_dynamic_response_ok": bool(fcr_dynamic_response_ok),
+        "fcr_hvac_share_ok": bool(fcr_hvac_share_ok),
+        "fcr_bid_segments": int(plan.get("fcr_bid_segments", 0) or 0),
     }
 
 
@@ -1191,8 +1445,8 @@ def _socket_limits_from_plan(plan: Dict[str, float], market_mode: str) -> tuple[
         up_limit = afrr_up
         down_limit = afrr_down
     else:
-        up_limit = max(fcr_bid, afrr_up)
-        down_limit = max(fcr_bid, afrr_down)
+        up_limit = fcr_bid + afrr_up
+        down_limit = fcr_bid + afrr_down
     return float(max(up_limit, 0.0)), float(max(down_limit, 0.0))
 
 
@@ -1745,6 +1999,16 @@ def run_mpc_controller(
                 "reserve_buffer_kw": float(plan.get("reserve_buffer_kw", 0.0)),
                 "risk_quantile": float(plan.get("risk_quantile", penalty_weights.get("risk_quantile", 0.80))),
                 "reserve_buffer_pct": float(plan.get("reserve_buffer_pct", penalty_weights.get("reserve_buffer_pct", 0.08))),
+                "hvac_fcr_dynamic_cap_kw": float(plan.get("hvac_fcr_dynamic_cap_kw", 0.0)),
+                "hvac_fcr_dynamic_fraction": float(plan.get("hvac_fcr_dynamic_fraction", 0.0)),
+                "fcr_control_source": str(plan.get("fcr_control_source", FINGRID_RULES["FCR-N"]["control_source"])),
+                "fcr_symmetric": bool(plan.get("fcr_symmetric", True)),
+                "fcr_response_60_fraction": float(plan.get("fcr_response_60_fraction", 1.0)),
+                "fcr_response_180_fraction": float(plan.get("fcr_response_180_fraction", 1.0)),
+                "fcr_energy_60_seconds": float(plan.get("fcr_energy_60_seconds", 0.0)),
+                "fcr_dynamic_response_ok": bool(plan.get("fcr_dynamic_response_ok", True)),
+                "fcr_dynamic_cap_ok": gate["fcr_dynamic_cap_ok"],
+                "fcr_hvac_share_ok": gate["fcr_hvac_share_ok"],
                 "risk_adjusted_profit_eur": gate["risk_adjusted_profit_eur"],
                 "market_gate_status": gate["market_gate_status"],
                 "market_gate_reason": gate["market_gate_reason"],
@@ -1810,11 +2074,41 @@ def run_mpc_controller(
     avg_fcr_bid = float(result_df["fcr_bid_kw"].mean())
     avg_afrr_bid = float(np.maximum(result_df["afrr_up_bid_kw"], result_df["afrr_down_bid_kw"]).mean())
     hvac_response_s = float(fleet_meta.get("hvac_response_s", default_hvac_response_seconds(str(fleet_meta.get("hvac_mode", HVAC_MODES[0])))))
-    fcr_response_s = (
-        2.0 * result_df["bess_up_kw"].sum()
-        + 4.0 * result_df["ev_up_kw"].sum()
-        + hvac_response_s * result_df["hvac_fcr_up_kw"].sum()
-    ) / max(result_df["bess_up_kw"].sum() + result_df["ev_up_kw"].sum() + result_df["hvac_fcr_up_kw"].sum(), 1.0)
+    rules_fcr = FINGRID_RULES["FCR-N"]
+    fcr_response_60_fraction = float(result_df.get("fcr_response_60_fraction", pd.Series([1.0] * len(result_df), index=result_df.index)).min())
+    fcr_response_180_fraction = float(result_df.get("fcr_response_180_fraction", pd.Series([1.0] * len(result_df), index=result_df.index)).min())
+    fcr_energy_60_seconds = float(result_df.get("fcr_energy_60_seconds", pd.Series([0.0] * len(result_df), index=result_df.index)).replace([np.inf, -np.inf], np.nan).min())
+    if avg_fcr_bid <= 1.0:
+        fcr_response_60_fraction = 1.0
+        fcr_response_180_fraction = 1.0
+        fcr_energy_60_seconds = 0.0
+    fcr_response_ok = (
+        fcr_response_60_fraction + 1e-9 >= float(rules_fcr["activation_60_fraction"])
+        and fcr_response_180_fraction + 1e-9 >= float(rules_fcr["activation_180_fraction"])
+        and (fcr_energy_60_seconds + 1e-9 >= float(rules_fcr["energy_60_seconds"]) if avg_fcr_bid > 1.0 else True)
+    )
+    fcr_response_63_s = float(rules_fcr["response_63_seconds"]) if fcr_response_ok and avg_fcr_bid > 1.0 else 0.0
+    fcr_response_95_s = float(rules_fcr["response_95_seconds"]) if fcr_response_ok and avg_fcr_bid > 1.0 else 0.0
+    fcr_local_control_ok = bool(
+        (
+            result_df.get(
+                "fcr_control_source",
+                pd.Series([rules_fcr["control_source"]] * len(result_df), index=result_df.index),
+            )
+            == rules_fcr["control_source"]
+        ).all()
+    )
+    fcr_dynamic_cap_ok = bool(result_df.get("fcr_dynamic_cap_ok", pd.Series([True] * len(result_df), index=result_df.index)).all())
+    fcr_dynamic_response_ok = bool(result_df.get("fcr_dynamic_response_ok", pd.Series([True] * len(result_df), index=result_df.index)).all())
+    fcr_hvac_share_ok = bool(result_df.get("fcr_hvac_share_ok", pd.Series([True] * len(result_df), index=result_df.index)).all())
+    fcr_granularity_kw = float(FINGRID_RULES["FCR-N"]["bid_granularity_kw"])
+    fcr_bid_granularity_ok = bool(
+        all(
+            abs((bid / max(fcr_granularity_kw, 1e-9)) - round(bid / max(fcr_granularity_kw, 1e-9))) <= 1e-6
+            for bid in result_df["fcr_bid_kw"].dropna()
+            if abs(float(bid)) > 1e-6
+        )
+    )
     afrr_response_s = (
         2.0 * (result_df["bess_up_kw"].sum() + result_df["bess_down_kw"].sum())
         + 4.0 * (result_df["ev_up_kw"].sum() + result_df["ev_down_kw"].sum())
@@ -1836,11 +2130,26 @@ def run_mpc_controller(
     storage_down_energy_mwh = float(max(0.95 * max(fleet_meta["bess_energy_cap_mwh"], 0.0) - result_df["bess_soc_mwh"].mean(), 0))
     storage_up_bid_mw = float((result_df["bess_up_kw"] + result_df["ev_up_kw"]).mean() / 1000.0)
     storage_down_bid_mw = float((result_df["bess_down_kw"] + result_df["ev_down_kw"]).mean() / 1000.0)
+    fcr_storage_bid_mw = float((result_df["bess_fcr_kw"] + result_df["ev_fcr_kw"]).mean() / 1000.0)
+    fcr_storage_endurance_ok = (
+        storage_up_energy_mwh >= fcr_storage_bid_mw * FINGRID_RULES["FCR-N"]["storage_endurance_hours"]
+        and storage_down_energy_mwh >= fcr_storage_bid_mw * FINGRID_RULES["FCR-N"]["storage_endurance_hours"]
+    )
+    afrr_storage_endurance_ok = (
+        storage_up_energy_mwh >= storage_up_bid_mw * FINGRID_RULES["aFRR"]["storage_endurance_hours"]
+        and storage_down_energy_mwh >= storage_down_bid_mw * FINGRID_RULES["aFRR"]["storage_endurance_hours"]
+    )
 
     compliance = {
         "fcr_min_bid_ok": avg_fcr_bid >= FINGRID_RULES["FCR-N"]["min_bid_kw"] if market_mode in {"FCR-N", "Combined"} else True,
+        "fcr_symmetric_bid_ok": True if market_mode not in {"FCR-N", "Combined"} else bool(result_df["fcr_bid_kw"].ge(0.0).all()),
+        "fcr_local_control_ok": True if market_mode not in {"FCR-N", "Combined"} else fcr_local_control_ok,
+        "fcr_bid_granularity_ok": True if market_mode not in {"FCR-N", "Combined"} else fcr_bid_granularity_ok,
+        "fcr_dynamic_cap_ok": True if market_mode not in {"FCR-N", "Combined"} else fcr_dynamic_cap_ok,
+        "fcr_dynamic_response_ok": True if market_mode not in {"FCR-N", "Combined"} else fcr_dynamic_response_ok,
+        "fcr_hvac_share_ok": True if market_mode not in {"FCR-N", "Combined"} else fcr_hvac_share_ok,
         "afrr_min_bid_ok": avg_afrr_bid >= FINGRID_RULES["aFRR"]["min_bid_kw"] if market_mode in {"aFRR", "Combined"} else True,
-        "fcr_response_ok": fcr_response_s <= FINGRID_RULES["FCR-N"]["response_seconds"] if market_mode in {"FCR-N", "Combined"} else True,
+        "fcr_response_ok": fcr_response_ok if market_mode in {"FCR-N", "Combined"} else True,
         "afrr_response_ok": afrr_response_s <= FINGRID_RULES["aFRR"]["full_activation_seconds"] if market_mode in {"aFRR", "Combined"} else True,
         "accuracy_ok": (
             FINGRID_RULES["aFRR"]["accuracy_low"] <= mean_accuracy <= FINGRID_RULES["aFRR"]["accuracy_high"]
@@ -1848,14 +2157,18 @@ def run_mpc_controller(
             else True
         ),
         "storage_endurance_ok": (
-            storage_up_energy_mwh >= storage_up_bid_mw * FINGRID_RULES["aFRR"]["storage_endurance_hours"]
-            and storage_down_energy_mwh >= storage_down_bid_mw * FINGRID_RULES["aFRR"]["storage_endurance_hours"]
-            if market_mode in {"aFRR", "Combined"}
+            afrr_storage_endurance_ok and (fcr_storage_endurance_ok if market_mode in {"FCR-N", "Combined"} else True)
+            if market_mode in {"aFRR", "Combined", "FCR-N"}
             else True
         ),
         "baseline_method_ok": {"net_load_baseline_kw", "indoor_temp_c_ref", "ev_soc_ref_mwh"}.issubset(result_df.columns.union(df.columns)),
         "mean_accuracy": mean_accuracy,
-        "fcr_response_s": fcr_response_s,
+        "fcr_response_s": fcr_response_95_s,
+        "fcr_response_63_s": fcr_response_63_s,
+        "fcr_response_95_s": fcr_response_95_s,
+        "fcr_response_60_fraction": fcr_response_60_fraction,
+        "fcr_response_180_fraction": fcr_response_180_fraction,
+        "fcr_energy_60_seconds": fcr_energy_60_seconds,
         "afrr_response_s": afrr_response_s,
     }
     passed = sum(bool(v) for k, v in compliance.items() if k.endswith("_ok"))

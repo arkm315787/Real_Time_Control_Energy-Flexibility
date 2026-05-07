@@ -14,6 +14,7 @@ from flexihome.core.engine import (
     SUPPORTED_MPC_TARGETS,
     _available_up_down,
     _market_gate_decision,
+    fcr_n_dynamic_deliverable_fraction,
     generate_synthetic_portfolio,
     run_lower_mpc_from_upper_result,
     run_mpc_controller,
@@ -98,6 +99,13 @@ def main() -> None:
     required_cols = {"risk_adjusted_profit_eur", "non_delivery_risk_cost_eur", "market_gate_status", "reserve_buffer_kw"}
     if not required_cols.issubset(history.columns):
         raise SystemExit(f"Missing risk-aware upper MPC columns: {sorted(required_cols - set(history.columns))}")
+    dynamic_cols = {"hvac_fcr_dynamic_cap_kw", "fcr_response_60_fraction", "fcr_response_180_fraction", "fcr_energy_60_seconds", "fcr_dynamic_response_ok"}
+    if not dynamic_cols.issubset(history.columns):
+        raise SystemExit(f"Missing FCR-N dynamic deliverability columns: {sorted(dynamic_cols - set(history.columns))}")
+    if (history["hvac_fcr_kw"] > history["hvac_fcr_dynamic_cap_kw"] + 1e-6).any():
+        raise SystemExit("HVAC FCR-N schedule must stay inside the dynamically deliverable cap.")
+    if not history["fcr_dynamic_response_ok"].all():
+        raise SystemExit("FCR-N aggregate droop schedule must pass dynamic response checks.")
 
     lower_from_socket = run_lower_mpc_from_upper_result(
         df=df,
@@ -156,6 +164,10 @@ def main() -> None:
     p90_bid = float((p90["history"]["fcr_bid_kw"] + p90["history"]["afrr_up_bid_kw"] + p90["history"]["afrr_down_bid_kw"]).mean())
     if p90_bid > p50_bid + 1e-6:
         raise SystemExit(f"P90 reliable bid should not exceed P50 mean-style bid: P50={p50_bid}, P90={p90_bid}")
+    fast_hvac_fraction = fcr_n_dynamic_deliverable_fraction(20.0, 4.0)
+    slow_hvac_fraction = fcr_n_dynamic_deliverable_fraction(180.0, 4.0)
+    if not (0.0 < slow_hvac_fraction < fast_hvac_fraction <= 1.0):
+        raise SystemExit("FCR-N dynamic deliverability should derate slow HVAC more than fast inverter HVAC.")
 
     state = {"bess_soc_mwh": float(df["bess_energy_cap_mwh"].iloc[0]) * 0.95, "ev_soc_delta_mwh": 0.0, "temp_delta_c": 0.0}
     avail = _available_up_down(
@@ -176,9 +188,24 @@ def main() -> None:
     afrr_only_gate = _market_gate_decision({"bess_afrr_up_kw": 1200.0, "risk_adjusted_profit_eur": 5.0}, "Combined")
     if afrr_only_gate["market_gate_status"] != "Participate":
         raise SystemExit("Combined market mode must allow an aFRR-only bid that clears the aFRR minimum.")
-    fcr_only_gate = _market_gate_decision({"bess_fcr_kw": 120.0, "risk_adjusted_profit_eur": 1.0}, "Combined")
+    fcr_only_gate = _market_gate_decision({"bess_fcr_kw": 200.0, "risk_adjusted_profit_eur": 1.0}, "Combined")
     if fcr_only_gate["market_gate_status"] != "Participate":
         raise SystemExit("Combined market mode must allow an FCR-only bid that clears the FCR-N minimum.")
+    misaligned_fcr_gate = _market_gate_decision({"bess_fcr_kw": 120.0, "risk_adjusted_profit_eur": 1.0}, "Combined")
+    if misaligned_fcr_gate["market_gate_status"] != "Wait":
+        raise SystemExit("Combined market mode must reject FCR-N bids that miss the 0.1 MW granularity.")
+    hvac_share_gate = _market_gate_decision(
+        {
+            "bess_fcr_kw": 100.0,
+            "hvac_fcr_kw": 100.0,
+            "hvac_fcr_dynamic_cap_kw": 200.0,
+            "fcr_dynamic_response_ok": True,
+            "risk_adjusted_profit_eur": 1.0,
+        },
+        "FCR-N",
+    )
+    if hvac_share_gate["market_gate_status"] != "Wait":
+        raise SystemExit("FCR-N gate must reject HVAC bids that exceed the configured comfort share cap.")
     tiny_gate = _market_gate_decision({"bess_fcr_kw": 20.0, "bess_afrr_up_kw": 200.0, "risk_adjusted_profit_eur": 5.0}, "Combined")
     if tiny_gate["market_gate_status"] != "Wait":
         raise SystemExit("Combined market mode must still reject bids below both product minimum sizes.")

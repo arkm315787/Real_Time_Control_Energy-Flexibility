@@ -10,7 +10,9 @@ import numpy as np
 import pandas as pd
 
 DEVICE_ORDER = ["BESS", "EV", "HVAC", "PV"]
-RECOVERY_PRIORITY = ["BESS", "EV", "PV", "HVAC"]
+RECOVERY_PRIORITY = ["BESS", "EV", "HVAC", "PV"]
+FCR_N_RESPONSE_63_SECONDS = 60.0
+FCR_N_RESPONSE_95_SECONDS = 180.0
 
 DEVICE_DEFAULTS = {
     "BESS": {
@@ -203,6 +205,8 @@ class CentralizedVPPController:
         self.devices = self.devices.set_index("device_id", drop=False)
         self.previous_pool_dispatch = {device_type: 0.0 for device_type in DEVICE_ORDER}
         self.pool_actual_dispatch = {device_type: 0.0 for device_type in DEVICE_ORDER}
+        self.pool_actual_dispatch_fcr = {device_type: 0.0 for device_type in DEVICE_ORDER}
+        self.pool_actual_dispatch_afrr = {device_type: 0.0 for device_type in DEVICE_ORDER}
         self.last_abs_tracking_error_kw = 0.0
 
     def execute_interval(
@@ -237,10 +241,19 @@ class CentralizedVPPController:
                 recovery_mode=False,
                 apply_state=False,
             )
-            normal_error = float(normal_solution.get("predicted_power_kw", 0.0)) - request_now
+            recovery_request_kw = float(normal_solution.get("afrr_request_kw", 0.0))
+            recovery_predicted_kw = float(normal_solution.get("afrr_predicted_power_kw", 0.0))
+            if abs(recovery_request_kw) <= 0.001:
+                recovery_request_kw = request_now
+                recovery_predicted_kw = float(normal_solution.get("predicted_power_kw", 0.0))
+            normal_error = recovery_predicted_kw - recovery_request_kw
             tolerance_kw = max(abs(request_now) * float(self.config.tracking_tolerance_pct), 1.0)
             error_rising = abs(normal_error) >= self.last_abs_tracking_error_kw + 0.5
-            recovery_mode = abs(normal_error) > tolerance_kw and (error_rising or self.last_abs_tracking_error_kw > tolerance_kw)
+            recovery_mode = (
+                abs(recovery_request_kw) > 0.001
+                and abs(normal_error) > tolerance_kw
+                and (error_rising or self.last_abs_tracking_error_kw > tolerance_kw)
+            )
             solution = (
                 self._allocate_tracking_delta(signal_row, plan, active_caps, buffer_caps, market_mode, recovery_mode=True, apply_state=True)
                 if recovery_mode
@@ -279,6 +292,8 @@ class CentralizedVPPController:
                     "inner_solver_status": solution["status"],
                     "inner_controller_mode": self.config.mode,
                     "lower_tracking_mode": "proportional_buffer_tracker",
+                    "fcr_control_source": "local_frequency_measurement",
+                    "afrr_control_source": "tso_activation_signal",
                     "gateway_mode": self.config.gateway_mode,
                     "frequency_hz": float(signal_row["frequency_hz"]),
                     "fcr_signal_norm": float(signal_row["fcr_signal_norm"]),
@@ -286,6 +301,8 @@ class CentralizedVPPController:
                     "committed_up_kw": committed_up_kw,
                     "committed_down_kw": committed_down_kw,
                     "raw_request_kw": float(request_context["raw_request_kw"]),
+                    "fcr_local_request_kw": float(request_context["fcr_request_kw"]),
+                    "afrr_signal_request_kw": float(request_context["afrr_request_kw"]),
                     "product_clamped_request_kw": float(request_context["product_clamped_request_kw"]),
                     "socket_up_kw": float(request_context["socket_up_kw"]),
                     "socket_down_kw": float(request_context["socket_down_kw"]),
@@ -300,6 +317,8 @@ class CentralizedVPPController:
                     "fleet_power_before_kw": float(solution.get("actual_before_kw", 0.0)),
                     "fleet_power_after_kw": delivered,
                     "ideal_delivered_kw": ideal_delivered,
+                    "fcr_delivered_kw": float(solution.get("fcr_predicted_power_kw", 0.0)),
+                    "afrr_delivered_kw": float(solution.get("afrr_predicted_power_kw", 0.0)),
                     "telemetry_error_kw": delivered - ideal_delivered,
                     "target_command_kw": float(solution.get("target_command_kw", 0.0)),
                     "optimized_net_load_kw": float(row["net_load_baseline_kw"] - max(delivered, 0.0) + max(-delivered, 0.0)),
@@ -658,15 +677,24 @@ class CentralizedVPPController:
         fcr_signal = float(signal_row["fcr_signal_norm"]) if market_mode in {"FCR-N", "Combined"} else 0.0
         afrr_signal = float(signal_row["afrr_signal_norm"]) if market_mode in {"aFRR", "Combined"} else 0.0
         up_limit, down_limit = self._commitment_limits(plan, market_mode)
-        raw_request = fcr_signal * self._fcr_bid_kw(plan) + max(afrr_signal, 0.0) * self._afrr_up_bid_kw(plan) - max(-afrr_signal, 0.0) * self._afrr_down_bid_kw(plan)
+        raw_fcr_request = fcr_signal * self._fcr_bid_kw(plan)
+        raw_afrr_request = max(afrr_signal, 0.0) * self._afrr_up_bid_kw(plan) - max(-afrr_signal, 0.0) * self._afrr_down_bid_kw(plan)
+        raw_request = raw_fcr_request + raw_afrr_request
         clamped = float(np.clip(raw_request, -max(down_limit, 0.0), max(up_limit, 0.0)))
         socket_up = max(float(plan.get("socket_up_kw", up_limit)), 0.0)
         socket_down = max(float(plan.get("socket_down_kw", down_limit)), 0.0)
         request = float(np.clip(clamped, -socket_down, socket_up))
+        split_scale = request / raw_request if abs(raw_request) > 1e-9 else 0.0
+        fcr_request = raw_fcr_request * split_scale
+        afrr_request = raw_afrr_request * split_scale
         return {
             "raw_request_kw": float(raw_request),
+            "raw_fcr_request_kw": float(raw_fcr_request),
+            "raw_afrr_request_kw": float(raw_afrr_request),
             "product_clamped_request_kw": clamped,
             "request_kw": request,
+            "fcr_request_kw": float(fcr_request),
+            "afrr_request_kw": float(afrr_request),
             "socket_up_kw": socket_up,
             "socket_down_kw": socket_down,
             "socket_violation_up_kw": max(clamped - socket_up, 0.0),
@@ -831,17 +859,30 @@ class CentralizedVPPController:
         apply_state: bool = False,
     ) -> Dict[str, object]:
         actual_before_by_type = {device_type: float(self.pool_actual_dispatch.get(device_type, 0.0)) for device_type in DEVICE_ORDER}
-        request_now = self._request_kw(signal_row, plan, market_mode)
+        request_context = self._request_context(signal_row, plan, market_mode)
+        request_now = float(request_context["request_kw"])
+        fcr_request_kw = float(request_context["fcr_request_kw"])
+        afrr_request_kw = float(request_context["afrr_request_kw"])
         direction = "up" if request_now >= 0.0 else "down"
         sign = 1.0 if direction == "up" else -1.0
         request_abs = abs(request_now)
         plan_weights = self._plan_requirement_weights(plan, market_mode, direction)
+
+        def split_predicted(predicted_kw: float) -> tuple[float, float]:
+            request_total = fcr_request_kw + afrr_request_kw
+            if abs(request_total) <= 1e-9:
+                return 0.0, 0.0
+            return (
+                float(predicted_kw * fcr_request_kw / request_total),
+                float(predicted_kw * afrr_request_kw / request_total),
+            )
 
         active_abs = self._proportional_commands(request_abs, active_caps, direction, plan_weights)
         buffer_abs = {device_type: 0.0 for device_type in DEVICE_ORDER}
         command_by_type = {device_type: sign * active_abs[device_type] for device_type in DEVICE_ORDER}
         delivered_by_type = self._delivered_from_commands(command_by_type, actual_before_by_type)
         predicted_power_kw = sum(delivered_by_type.values())
+        fcr_predicted_power_kw, afrr_predicted_power_kw = split_predicted(predicted_power_kw)
 
         residual_kw = request_now - predicted_power_kw
         if recovery_mode and abs(residual_kw) > 0.001 and np.sign(residual_kw) == sign:
@@ -860,6 +901,7 @@ class CentralizedVPPController:
                 command_by_type[device_type] += sign * buffer_abs[device_type]
             delivered_by_type = self._delivered_from_commands(command_by_type, actual_before_by_type)
             predicted_power_kw = sum(delivered_by_type.values())
+            fcr_predicted_power_kw, afrr_predicted_power_kw = split_predicted(predicted_power_kw)
 
         if apply_state:
             for device_type in DEVICE_ORDER:
@@ -872,6 +914,10 @@ class CentralizedVPPController:
             "delivered_by_type": delivered_by_type,
             "actual_before_kw": sum(actual_before_by_type.values()),
             "predicted_power_kw": predicted_power_kw,
+            "fcr_request_kw": fcr_request_kw,
+            "afrr_request_kw": afrr_request_kw,
+            "fcr_predicted_power_kw": fcr_predicted_power_kw,
+            "afrr_predicted_power_kw": afrr_predicted_power_kw,
             "target_command_kw": target_command_kw,
             "tracking_delta_kw": request_now - sum(actual_before_by_type.values()),
             "buffer_used_kw": sum(buffer_abs.values()),

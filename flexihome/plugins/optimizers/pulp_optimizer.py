@@ -49,6 +49,8 @@ class PuLPOptimizer(BaseOptimizer):
             "EV energy window and departure slack",
             "HVAC comfort band slack",
             "FCR-N and aFRR market enablement",
+            "FCR-N dynamic deliverability caps for local droop resources",
+            "FCR-N BESS/EV endurance and HVAC comfort-share limits",
             "Response-time eligibility for market products",
             "Risk quantile derating and reserve buffer",
             "Resource-mode gating for fast-only portfolios",

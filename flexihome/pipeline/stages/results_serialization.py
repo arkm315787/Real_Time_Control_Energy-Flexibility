@@ -84,6 +84,7 @@ class ResultsSerializationStage(BasePipelineStage):
             "inner_mpc_trace",
             "gateway_commands",
             "usage_fatigue_summary",
+            "afrr_energy_audit",
         ):
             frame = result.get(name)
             if isinstance(frame, pd.DataFrame):

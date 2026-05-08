@@ -17,6 +17,8 @@ FlexiHome is moving from a research dashboard toward a startup-grade VPP softwar
 
 The current version is still a simulation and development environment. It does not implement physical device adapters, residential local controllers, metering certification, market prequalification, settlement, or production cybersecurity controls.
 
+The compliance layer is therefore a prequalification-prep screen, not a certification claim. It now audits aFRR 30-second start, 5-minute activation, 90-110% tracking envelope, 15-minute delivered-energy reconciliation, FCR-N 60/180-second step response, and a simulated FCR stability margin screen. Formal Fingrid prequalification still requires approved measurement data, TSO-reviewed test reports, telemetry, and settlement processes.
+
 ## Current Control Architecture
 
 FlexiHome uses a centralized two-layer control structure.
@@ -74,6 +76,7 @@ The lower layer is implemented as a one-step proportional tracking allocator, no
 | Dashboard MPC visualizations | Implemented | Upper selection, appliance mix, fatigue, lower reserve tracking, allocation, diagnostics, and gateway command tables are available. |
 | Risk-aware market bidding | Implemented for MVP | Upper MPC derates availability by bid quantile and buffer, prices non-delivery risk, activation uncertainty, and fatigue, and marks market slots as Participate/Wait. |
 | Decoupled market and lower execution | Implemented | Dashboard upper decisions create a socket, Market Pressure runs on a wall-clock countdown, and the lower MPC attaches after the market starts. |
+| Product technical audit | Implemented for simulation | 4-second traces are audited for aFRR timing, aFRR 90-110% envelope, settlement-period energy difference, FCR-N 60/180-second response, and FCR stability screening. |
 | CI smoke coverage | Implemented | CI runs API, plugin, pipeline, Airflow, forecasting, optimization, centralized MPC, and dashboard scenario-apply smoke tests. |
 
 ## Key Modules
@@ -115,6 +118,7 @@ Optimization runs produce the established aggregate outputs plus the new traceab
 - `inner_mpc_trace.csv`
 - `gateway_commands.csv`
 - `usage_fatigue_summary.csv`
+- `afrr_energy_audit.csv`
 - `optimization_summary.json`
 
 The API result payload includes the same data families:
@@ -128,6 +132,7 @@ The API result payload includes the same data families:
 - `inner_mpc_trace`
 - `gateway_commands`
 - `usage_fatigue_summary`
+- `afrr_energy_audit`
 - `summary`
 - `compliance`
 
@@ -259,6 +264,7 @@ Core local checks:
 python -m py_compile app.py flexihome/core/engine.py flexihome/core/centralized_controller.py flexihome/api/services.py
 python scripts\centralized_mpc_smoke.py
 python scripts\risk_aware_mpc_smoke.py
+python scripts\vpp_technical_compliance_smoke.py
 python scripts\dashboard_scenario_smoke.py
 python scripts\api_smoke.py
 python scripts\plugin_smoke.py
@@ -273,6 +279,7 @@ GitHub CI also runs:
 - plugin smoke test
 - centralized 4-second MPC smoke test
 - risk-aware upper MPC smoke test
+- five-context technical compliance smoke test
 - dashboard scenario apply smoke test
 - pipeline smoke test
 - Airflow DAG smoke test

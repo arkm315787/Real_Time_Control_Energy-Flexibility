@@ -60,6 +60,7 @@ def serialize_optimization_result(result: Dict[str, Any]) -> Dict[str, Any]:
     inner_mpc_trace = result.get("inner_mpc_trace", tracking)
     gateway_commands = result.get("gateway_commands", pd.DataFrame())
     usage_fatigue_summary = result.get("usage_fatigue_summary", pd.DataFrame())
+    afrr_energy_audit = result.get("afrr_energy_audit", pd.DataFrame())
     return {
         "summary": json_safe(result.get("summary", {})),
         "market_data_status": json_safe(result.get("market_data_status", {})),
@@ -73,6 +74,7 @@ def serialize_optimization_result(result: Dict[str, Any]) -> Dict[str, Any]:
         "inner_mpc_trace": dataframe_to_records(inner_mpc_trace),
         "gateway_commands": dataframe_to_records(gateway_commands),
         "usage_fatigue_summary": dataframe_to_records(usage_fatigue_summary),
+        "afrr_energy_audit": dataframe_to_records(afrr_energy_audit),
         "row_counts": {
             "history": int(len(history)) if history is not None else 0,
             "tracking_4s": int(len(tracking)) if tracking is not None else 0,
@@ -83,5 +85,6 @@ def serialize_optimization_result(result: Dict[str, Any]) -> Dict[str, Any]:
             "inner_mpc_trace": int(len(inner_mpc_trace)) if inner_mpc_trace is not None else 0,
             "gateway_commands": int(len(gateway_commands)) if gateway_commands is not None else 0,
             "usage_fatigue_summary": int(len(usage_fatigue_summary)) if usage_fatigue_summary is not None else 0,
+            "afrr_energy_audit": int(len(afrr_energy_audit)) if afrr_energy_audit is not None else 0,
         },
     }

@@ -51,6 +51,7 @@ FINGRID_RULES = {
     "aFRR": {
         "min_bid_kw": 1000.0,
         "bid_granularity_kw": 1000.0,
+        "signal_interval_seconds": 4.0,
         "start_seconds": 30.0,
         "full_activation_seconds": 300.0,
         "market_period_minutes": 15,
@@ -102,6 +103,10 @@ HVAC_DEFAULT_RESPONSE_S = {
 }
 
 SIMULATION_ONLY_NOTICE = "Simulation and prequalification-prep output only; not a live Fingrid BSP bid, dispatch instruction, or settlement record."
+PREQUALIFICATION_PREP_NOTICE = (
+    "Simulation screening only; formal Fingrid prequalification still requires approved test data, "
+    "measurement evidence, telemetry, baseline validation, settlement setup, and TSO review."
+)
 
 RISK_POLICY_PRESETS = {
     "investor_balanced": {
@@ -291,6 +296,431 @@ def _granularity_ok(total_kw: float, granularity_kw: float) -> bool:
         return True
     scaled = float(total_kw) / max(float(granularity_kw), 1e-9)
     return bool(abs(scaled - round(scaled)) <= 1e-5)
+
+def _series_or_default(frame: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    if frame.empty:
+        return pd.Series(dtype=float)
+    if column in frame:
+        return frame[column].astype(float)
+    return pd.Series([float(default)] * len(frame), index=frame.index, dtype=float)
+
+def _tracking_step_seconds(frame: pd.DataFrame, fallback_seconds: float = 4.0) -> float:
+    if frame is None or len(frame.index) < 2:
+        return float(fallback_seconds)
+    index = pd.to_datetime(frame.index)
+    diffs = index.to_series().diff().dt.total_seconds().dropna()
+    if diffs.empty:
+        return float(fallback_seconds)
+    return float(max(diffs.median(), 1.0))
+
+def _active_episodes(mask: pd.Series) -> List[tuple[int, int]]:
+    if mask.empty:
+        return []
+    positions = np.flatnonzero(mask.fillna(False).to_numpy(dtype=bool))
+    if len(positions) == 0:
+        return []
+    episodes: List[tuple[int, int]] = []
+    start = int(positions[0])
+    previous = int(positions[0])
+    for raw_pos in positions[1:]:
+        pos = int(raw_pos)
+        if pos != previous + 1:
+            episodes.append((start, previous))
+            start = pos
+        previous = pos
+    episodes.append((start, previous))
+    return episodes
+
+def _enrich_tracking_for_market_audit(tracking_df: pd.DataFrame) -> pd.DataFrame:
+    """Add product-specific audit columns used by compliance views and plots."""
+
+    if tracking_df is None or tracking_df.empty:
+        return pd.DataFrame()
+    frame = tracking_df.copy()
+    signed_request = (
+        _series_or_default(frame, "requested_signed_kw")
+        if "requested_signed_kw" in frame
+        else _series_or_default(frame, "requested_up_kw") - _series_or_default(frame, "requested_down_kw")
+    )
+    signed_delivery = (
+        _series_or_default(frame, "delivered_signed_kw")
+        if "delivered_signed_kw" in frame
+        else _series_or_default(frame, "delivered_up_kw") - _series_or_default(frame, "delivered_down_kw")
+    )
+    fcr_request = _series_or_default(frame, "fcr_local_request_kw")
+    afrr_request = _series_or_default(frame, "afrr_signal_request_kw")
+    fcr_delivered = _series_or_default(frame, "fcr_delivered_kw")
+    afrr_delivered = _series_or_default(frame, "afrr_delivered_kw")
+    if afrr_delivered.abs().sum() <= 1e-9 and (signed_delivery - fcr_delivered).abs().sum() > 1e-9:
+        afrr_delivered = signed_delivery - fcr_delivered
+
+    frame["audit_signed_request_kw"] = signed_request
+    frame["audit_signed_delivered_kw"] = signed_delivery
+    frame["afrr_audit_request_kw"] = afrr_request
+    frame["afrr_audit_delivered_kw"] = afrr_delivered
+    frame["fcr_audit_request_kw"] = fcr_request
+    frame["fcr_audit_delivered_kw"] = fcr_delivered
+
+    afrr_active = afrr_request.abs() > 1.0
+    fcr_active = fcr_request.abs() > 1.0
+    frame["afrr_accuracy_ratio"] = np.where(afrr_active, afrr_delivered.abs() / afrr_request.abs().replace(0.0, np.nan), np.nan)
+    frame["afrr_accuracy_low"] = float(FINGRID_RULES["aFRR"]["accuracy_low"])
+    frame["afrr_accuracy_high"] = float(FINGRID_RULES["aFRR"]["accuracy_high"])
+    frame["afrr_accuracy_ok_tick"] = (
+        frame["afrr_accuracy_ratio"].between(frame["afrr_accuracy_low"], frame["afrr_accuracy_high"])
+        & (np.sign(afrr_delivered.fillna(0.0)) == np.sign(afrr_request.fillna(0.0)))
+    )
+    frame.loc[~afrr_active, "afrr_accuracy_ok_tick"] = True
+    frame["fcr_response_ratio"] = np.where(fcr_active, fcr_delivered.abs() / fcr_request.abs().replace(0.0, np.nan), np.nan)
+    frame["afrr_reported_power_kw"] = afrr_delivered
+    frame["afrr_fingrid_calculated_power_kw"] = signed_delivery - fcr_delivered
+    frame["afrr_reporting_error_kw"] = frame["afrr_reported_power_kw"] - frame["afrr_fingrid_calculated_power_kw"]
+    return frame
+
+def _audit_afrr_tracking(tracking_df: pd.DataFrame, dt_seconds: float, market_mode: str) -> Dict[str, object]:
+    rules = FINGRID_RULES["aFRR"]
+    if market_mode not in {"aFRR", "Combined"}:
+        return {
+            "afrr_tracking_audit_required": False,
+            "afrr_tracking_audit_evaluated": True,
+            "afrr_start_within_30s_ok": True,
+            "afrr_full_activation_5min_ok": True,
+            "afrr_power_accuracy_ok": True,
+            "afrr_response_ok": True,
+            "accuracy_ok": True,
+            "afrr_activation_episodes": 0,
+            "afrr_full_activation_evaluated_episodes": 0,
+            "afrr_accuracy_evaluated_ticks": 0,
+            "afrr_min_accuracy_ratio": np.nan,
+            "afrr_max_accuracy_ratio": np.nan,
+            "afrr_max_start_delay_s": 0.0,
+        }
+    if tracking_df is None or tracking_df.empty or "afrr_audit_request_kw" not in tracking_df:
+        return {
+            "afrr_tracking_audit_required": True,
+            "afrr_tracking_audit_evaluated": False,
+            "afrr_start_within_30s_ok": False,
+            "afrr_full_activation_5min_ok": False,
+            "afrr_power_accuracy_ok": False,
+            "afrr_response_ok": False,
+            "accuracy_ok": False,
+            "afrr_activation_episodes": 0,
+            "afrr_full_activation_evaluated_episodes": 0,
+            "afrr_accuracy_evaluated_ticks": 0,
+            "afrr_min_accuracy_ratio": np.nan,
+            "afrr_max_accuracy_ratio": np.nan,
+            "afrr_max_start_delay_s": np.nan,
+        }
+
+    request = tracking_df["afrr_audit_request_kw"].astype(float)
+    delivered = tracking_df["afrr_audit_delivered_kw"].astype(float)
+    threshold_kw = max(5.0, 0.01 * float(request.abs().max()))
+    active = request.abs() > threshold_kw
+    episodes = _active_episodes(active)
+    if not episodes:
+        return {
+            "afrr_tracking_audit_required": True,
+            "afrr_tracking_audit_evaluated": True,
+            "afrr_start_within_30s_ok": True,
+            "afrr_full_activation_5min_ok": True,
+            "afrr_power_accuracy_ok": True,
+            "afrr_response_ok": True,
+            "accuracy_ok": True,
+            "afrr_activation_episodes": 0,
+            "afrr_full_activation_evaluated_episodes": 0,
+            "afrr_accuracy_evaluated_ticks": 0,
+            "afrr_min_accuracy_ratio": np.nan,
+            "afrr_max_accuracy_ratio": np.nan,
+            "afrr_max_start_delay_s": 0.0,
+        }
+
+    start_limit_s = float(rules["start_seconds"])
+    full_limit_s = float(rules["full_activation_seconds"])
+    low = float(rules["accuracy_low"])
+    high = float(rules["accuracy_high"])
+    ratios: List[float] = []
+    start_ok = True
+    full_ok = True
+    ramp_accuracy_ok = True
+    max_start_delay = 0.0
+    full_evaluated = 0
+    accuracy_ticks = 0
+    req_values = request.to_numpy(dtype=float)
+    del_values = delivered.to_numpy(dtype=float)
+
+    for start, end in episodes:
+        start_delay = np.nan
+        episode_full_evaluated = False
+        for pos in range(start, end + 1):
+            if np.sign(del_values[pos]) == np.sign(req_values[pos]) and abs(del_values[pos]) > max(1.0, 0.01 * abs(req_values[pos])):
+                start_delay = (pos - start) * dt_seconds
+                break
+        if np.isnan(start_delay):
+            start_ok = False
+        else:
+            max_start_delay = max(max_start_delay, float(start_delay))
+            if start_delay - 1e-9 > start_limit_s:
+                start_ok = False
+
+        for pos in range(start, end + 1):
+            req_abs = abs(req_values[pos])
+            if req_abs <= threshold_kw:
+                continue
+            elapsed = (pos - start) * dt_seconds
+            ratio = abs(del_values[pos]) / max(req_abs, 1e-9)
+            ratios.append(float(ratio))
+            sign_ok = np.sign(del_values[pos]) == np.sign(req_values[pos])
+            if elapsed < start_limit_s:
+                min_allowed = 0.0
+            elif elapsed < full_limit_s:
+                min_allowed = low * (elapsed - start_limit_s) / max(full_limit_s - start_limit_s, 1e-9)
+            else:
+                min_allowed = low
+                episode_full_evaluated = True
+            if elapsed >= start_limit_s:
+                accuracy_ticks += 1
+                if ratio + 1e-9 < min_allowed or ratio - 1e-9 > high or not sign_ok:
+                    ramp_accuracy_ok = False
+            if elapsed >= full_limit_s and (ratio + 1e-9 < low or ratio - 1e-9 > high or not sign_ok):
+                full_ok = False
+        if episode_full_evaluated:
+            full_evaluated += 1
+
+    if full_evaluated == 0:
+        full_ok = False
+    min_ratio = float(min(ratios)) if ratios else np.nan
+    max_ratio = float(max(ratios)) if ratios else np.nan
+    response_ok = bool(start_ok and full_ok)
+    return {
+        "afrr_tracking_audit_required": True,
+        "afrr_tracking_audit_evaluated": True,
+        "afrr_start_within_30s_ok": bool(start_ok),
+        "afrr_full_activation_5min_ok": bool(full_ok),
+        "afrr_power_accuracy_ok": bool(ramp_accuracy_ok and full_ok),
+        "afrr_response_ok": response_ok,
+        "accuracy_ok": bool(ramp_accuracy_ok and full_ok),
+        "afrr_activation_episodes": int(len(episodes)),
+        "afrr_full_activation_evaluated_episodes": int(full_evaluated),
+        "afrr_accuracy_evaluated_ticks": int(accuracy_ticks),
+        "afrr_min_accuracy_ratio": min_ratio,
+        "afrr_max_accuracy_ratio": max_ratio,
+        "afrr_max_start_delay_s": float(max_start_delay),
+    }
+
+def _afrr_energy_reporting_audit(tracking_df: pd.DataFrame, dt_seconds: float, market_mode: str) -> tuple[pd.DataFrame, Dict[str, object]]:
+    if market_mode not in {"aFRR", "Combined"}:
+        return pd.DataFrame(), {
+            "afrr_energy_reporting_required": False,
+            "afrr_energy_reporting_evaluated": True,
+            "afrr_energy_reporting_ok": True,
+            "afrr_energy_reporting_max_diff_pct": 0.0,
+            "afrr_energy_reporting_periods": 0,
+        }
+    if tracking_df is None or tracking_df.empty or "afrr_reported_power_kw" not in tracking_df:
+        return pd.DataFrame(), {
+            "afrr_energy_reporting_required": True,
+            "afrr_energy_reporting_evaluated": False,
+            "afrr_energy_reporting_ok": False,
+            "afrr_energy_reporting_max_diff_pct": np.nan,
+            "afrr_energy_reporting_periods": 0,
+        }
+
+    dt_h = float(dt_seconds) / 3600.0
+    rows = []
+    frame = tracking_df.copy()
+    frame["_isp_start"] = pd.to_datetime(frame.index).floor(f"{int(FINGRID_RULES['aFRR']['market_period_minutes'])}min")
+    for isp_start, group in frame.groupby("_isp_start"):
+        reported_mwh = float(group["afrr_reported_power_kw"].sum() * dt_h / 1000.0)
+        calculated_mwh = float(group["afrr_fingrid_calculated_power_kw"].sum() * dt_h / 1000.0)
+        denominator = max(abs(reported_mwh), 1e-6)
+        diff_pct = abs(reported_mwh - calculated_mwh) / denominator
+        active = max(abs(reported_mwh), abs(calculated_mwh)) > 1e-6
+        rows.append(
+            {
+                "isp_start": pd.Timestamp(isp_start),
+                "isp_end": pd.Timestamp(isp_start) + pd.Timedelta(minutes=int(FINGRID_RULES["aFRR"]["market_period_minutes"])),
+                "afrr_reported_energy_mwh": reported_mwh,
+                "afrr_fingrid_calculated_energy_mwh": calculated_mwh,
+                "afrr_energy_reporting_diff_pct": float(diff_pct) if active else 0.0,
+                "afrr_energy_reporting_ok": bool((diff_pct <= 0.10) if active else True),
+                "active": bool(active),
+            }
+        )
+    audit_df = pd.DataFrame(rows)
+    active_df = audit_df[audit_df["active"]] if not audit_df.empty else audit_df
+    if active_df.empty:
+        return audit_df, {
+            "afrr_energy_reporting_required": True,
+            "afrr_energy_reporting_evaluated": True,
+            "afrr_energy_reporting_ok": True,
+            "afrr_energy_reporting_max_diff_pct": 0.0,
+            "afrr_energy_reporting_periods": 0,
+        }
+    return audit_df, {
+        "afrr_energy_reporting_required": True,
+        "afrr_energy_reporting_evaluated": True,
+        "afrr_energy_reporting_ok": bool(active_df["afrr_energy_reporting_ok"].all()),
+        "afrr_energy_reporting_max_diff_pct": float(active_df["afrr_energy_reporting_diff_pct"].max()),
+        "afrr_energy_reporting_periods": int(len(active_df)),
+    }
+
+def _audit_fcr_tracking(tracking_df: pd.DataFrame, dt_seconds: float, market_mode: str) -> Dict[str, object]:
+    rules = FINGRID_RULES["FCR-N"]
+    if market_mode not in {"FCR-N", "Combined"}:
+        return {
+            "fcr_tracking_response_required": False,
+            "fcr_tracking_response_evaluated": True,
+            "fcr_tracking_response_ok": True,
+            "fcr_tracking_60_fraction": np.nan,
+            "fcr_tracking_180_fraction": np.nan,
+            "fcr_tracking_evaluated_episodes": 0,
+        }
+    if tracking_df is None or tracking_df.empty or "fcr_audit_request_kw" not in tracking_df:
+        return {
+            "fcr_tracking_response_required": True,
+            "fcr_tracking_response_evaluated": False,
+            "fcr_tracking_response_ok": False,
+            "fcr_tracking_60_fraction": np.nan,
+            "fcr_tracking_180_fraction": np.nan,
+            "fcr_tracking_evaluated_episodes": 0,
+        }
+    request = tracking_df["fcr_audit_request_kw"].astype(float)
+    delivered = tracking_df["fcr_audit_delivered_kw"].astype(float)
+    threshold_kw = max(5.0, 0.01 * float(request.abs().max()))
+    episodes = _active_episodes(request.abs() > threshold_kw)
+    fractions_60: List[float] = []
+    fractions_180: List[float] = []
+    req_values = request.to_numpy(dtype=float)
+    del_values = delivered.to_numpy(dtype=float)
+    for start, end in episodes:
+        pos60 = start + int(math.ceil(float(rules["response_63_seconds"]) / max(dt_seconds, 1e-9)))
+        pos180 = start + int(math.ceil(float(rules["response_95_seconds"]) / max(dt_seconds, 1e-9)))
+        if pos60 <= end and abs(req_values[pos60]) > threshold_kw:
+            sign_ok = np.sign(del_values[pos60]) == np.sign(req_values[pos60])
+            fractions_60.append(float(abs(del_values[pos60]) / max(abs(req_values[pos60]), 1e-9)) if sign_ok else 0.0)
+        if pos180 <= end and abs(req_values[pos180]) > threshold_kw:
+            sign_ok = np.sign(del_values[pos180]) == np.sign(req_values[pos180])
+            fractions_180.append(float(abs(del_values[pos180]) / max(abs(req_values[pos180]), 1e-9)) if sign_ok else 0.0)
+    evaluated = bool(fractions_60 and fractions_180)
+    fraction_60 = float(min(fractions_60)) if fractions_60 else np.nan
+    fraction_180 = float(min(fractions_180)) if fractions_180 else np.nan
+    ok = bool(
+        evaluated
+        and fraction_60 + 1e-9 >= float(rules["activation_60_fraction"])
+        and fraction_180 + 1e-9 >= float(rules["activation_180_fraction"])
+    )
+    return {
+        "fcr_tracking_response_required": True,
+        "fcr_tracking_response_evaluated": evaluated,
+        "fcr_tracking_response_ok": ok if evaluated else False,
+        "fcr_tracking_60_fraction": fraction_60,
+        "fcr_tracking_180_fraction": fraction_180,
+        "fcr_tracking_evaluated_episodes": int(min(len(fractions_60), len(fractions_180))),
+    }
+
+def _fcr_stability_screen(result_df: pd.DataFrame, fleet_meta: Dict[str, Any], market_mode: str) -> Dict[str, object]:
+    if market_mode not in {"FCR-N", "Combined"} or result_df is None or result_df.empty:
+        return {
+            "fcr_stability_margin_ok": True,
+            "fcr_stability_screen_evaluated": True,
+            "fcr_stability_margin_pct": np.nan,
+            "fcr_stability_exemption_candidate": False,
+            "fcr_prequalification_evidence_ok": True,
+            "fcr_prequalification_evidence_level": "not_required_for_selected_market",
+            "prequalification_prep_notice": PREQUALIFICATION_PREP_NOTICE,
+        }
+    margins = []
+    for _, row in result_df.iterrows():
+        bids = {
+            "BESS": float(row.get("bess_fcr_kw", 0.0)),
+            "EV": float(row.get("ev_fcr_kw", 0.0)),
+            "HVAC": float(row.get("hvac_fcr_kw", 0.0)),
+        }
+        total = sum(max(value, 0.0) for value in bids.values())
+        if total <= 1e-9:
+            continue
+        response_60 = float(row.get("fcr_response_60_fraction", 1.0))
+        response_180 = float(row.get("fcr_response_180_fraction", 1.0))
+        hvac_share = max(bids["HVAC"], 0.0) / max(total, 1e-9)
+        weighted_delay = sum(
+            max(bid, 0.0) * _fcr_n_resource_delay_seconds(resource, fleet_meta)
+            for resource, bid in bids.items()
+        ) / max(total, 1e-9)
+        dynamic_score = 0.5 * min(response_60 / max(float(FINGRID_RULES["FCR-N"]["activation_60_fraction"]), 1e-9), 1.0)
+        dynamic_score += 0.5 * min(response_180 / max(float(FINGRID_RULES["FCR-N"]["activation_180_fraction"]), 1e-9), 1.0)
+        margin = 0.78 + 0.28 * dynamic_score - 0.10 * hvac_share - 0.004 * weighted_delay
+        margins.append(float(np.clip(margin, 0.0, 1.20)))
+    if not margins:
+        return {
+            "fcr_stability_margin_ok": True,
+            "fcr_stability_screen_evaluated": True,
+            "fcr_stability_margin_pct": np.nan,
+            "fcr_stability_exemption_candidate": False,
+            "fcr_prequalification_evidence_ok": True,
+            "fcr_prequalification_evidence_level": "no_fcr_bid",
+            "prequalification_prep_notice": PREQUALIFICATION_PREP_NOTICE,
+        }
+    margin = min(margins)
+    margin_ok = margin + 1e-9 >= 0.95
+    exemption_candidate = 0.75 <= margin < 0.95
+    return {
+        "fcr_stability_margin_ok": bool(margin_ok),
+        "fcr_stability_screen_evaluated": True,
+        "fcr_stability_margin_pct": float(100.0 * margin),
+        "fcr_stability_exemption_candidate": bool(exemption_candidate),
+        "fcr_prequalification_evidence_ok": bool(margin_ok),
+        "fcr_prequalification_evidence_level": "simulation_screening_only",
+        "prequalification_prep_notice": PREQUALIFICATION_PREP_NOTICE,
+    }
+
+def _market_technical_audit(
+    result_df: pd.DataFrame,
+    tracking_df: pd.DataFrame,
+    fleet_meta: Dict[str, Any],
+    market_mode: str,
+    inner_dt_seconds: int,
+) -> tuple[Dict[str, object], Dict[str, object], pd.DataFrame]:
+    dt_seconds = _tracking_step_seconds(tracking_df, float(inner_dt_seconds))
+    afrr_tracking = _audit_afrr_tracking(tracking_df, dt_seconds, market_mode)
+    afrr_energy_df, afrr_energy = _afrr_energy_reporting_audit(tracking_df, dt_seconds, market_mode)
+    fcr_tracking = _audit_fcr_tracking(tracking_df, dt_seconds, market_mode)
+    fcr_stability = _fcr_stability_screen(result_df, fleet_meta, market_mode)
+    compliance_updates: Dict[str, object] = {}
+    compliance_updates.update(afrr_tracking)
+    compliance_updates.update(afrr_energy)
+    compliance_updates.update(fcr_tracking)
+    compliance_updates.update(fcr_stability)
+    if market_mode in {"FCR-N", "Combined"}:
+        tracking_ok = bool(fcr_tracking["fcr_tracking_response_ok"]) if fcr_tracking["fcr_tracking_response_evaluated"] else True
+        compliance_updates["fcr_actual_dynamic_response_ok"] = bool(tracking_ok)
+    else:
+        compliance_updates["fcr_actual_dynamic_response_ok"] = True
+    if market_mode in {"aFRR", "Combined"}:
+        compliance_updates["afrr_settlement_reconciliation_ok"] = bool(afrr_energy["afrr_energy_reporting_ok"])
+    else:
+        compliance_updates["afrr_settlement_reconciliation_ok"] = True
+    summary_updates = {
+        key: value
+        for key, value in compliance_updates.items()
+        if key
+        in {
+            "afrr_activation_episodes",
+            "afrr_full_activation_evaluated_episodes",
+            "afrr_accuracy_evaluated_ticks",
+            "afrr_min_accuracy_ratio",
+            "afrr_max_accuracy_ratio",
+            "afrr_max_start_delay_s",
+            "afrr_energy_reporting_max_diff_pct",
+            "afrr_energy_reporting_periods",
+            "fcr_tracking_60_fraction",
+            "fcr_tracking_180_fraction",
+            "fcr_tracking_evaluated_episodes",
+            "fcr_stability_margin_pct",
+            "fcr_prequalification_evidence_level",
+            "prequalification_prep_notice",
+        }
+    }
+    return compliance_updates, summary_updates, afrr_energy_df
 
 def _bid_block_bounds(timestamp: pd.Timestamp, market_mode: str) -> tuple[pd.Timestamp, pd.Timestamp]:
     ts = pd.Timestamp(timestamp)
@@ -2256,9 +2686,20 @@ def run_mpc_controller(
             "household_contributions": pd.DataFrame(),
             "appliance_contributions": pd.DataFrame(),
             "usage_fatigue_summary": pd.DataFrame(),
+            "afrr_energy_audit": pd.DataFrame(),
         }
     if progress_callback:
         progress_callback(total_work, total_work, "Simulation finished")
+
+    tracking_df = pd.concat(tracking_history) if tracking_history else pd.DataFrame()
+    tracking_df = _enrich_tracking_for_market_audit(tracking_df)
+    technical_compliance, technical_summary, afrr_energy_audit = _market_technical_audit(
+        result_df=result_df,
+        tracking_df=tracking_df,
+        fleet_meta=fleet_meta,
+        market_mode=market_mode,
+        inner_dt_seconds=inner_dt_seconds,
+    )
 
     dt_h_result = float(df["dt_h"].iloc[0])
     resource_capacity_revenue = {
@@ -2400,15 +2841,25 @@ def run_mpc_controller(
         and storage_down_energy_mwh >= storage_down_bid_mw * FINGRID_RULES["aFRR"]["storage_endurance_hours"]
     )
 
+    fcr_min_bid_ok = (
+        avg_fcr_bid >= FINGRID_RULES["FCR-N"]["min_bid_kw"]
+        if market_mode == "FCR-N"
+        else (avg_fcr_bid <= 1.0 or avg_fcr_bid >= FINGRID_RULES["FCR-N"]["min_bid_kw"]) if market_mode == "Combined" else True
+    )
+    afrr_min_bid_ok = (
+        avg_afrr_bid >= FINGRID_RULES["aFRR"]["min_bid_kw"]
+        if market_mode == "aFRR"
+        else (avg_afrr_bid <= 1.0 or avg_afrr_bid >= FINGRID_RULES["aFRR"]["min_bid_kw"]) if market_mode == "Combined" else True
+    )
     compliance = {
-        "fcr_min_bid_ok": avg_fcr_bid >= FINGRID_RULES["FCR-N"]["min_bid_kw"] if market_mode in {"FCR-N", "Combined"} else True,
+        "fcr_min_bid_ok": fcr_min_bid_ok,
         "fcr_symmetric_bid_ok": True if market_mode not in {"FCR-N", "Combined"} else bool(result_df["fcr_bid_kw"].ge(0.0).all()),
         "fcr_local_control_ok": True if market_mode not in {"FCR-N", "Combined"} else fcr_local_control_ok,
         "fcr_bid_granularity_ok": True if market_mode not in {"FCR-N", "Combined"} else fcr_bid_granularity_ok,
         "fcr_dynamic_cap_ok": True if market_mode not in {"FCR-N", "Combined"} else fcr_dynamic_cap_ok,
         "fcr_dynamic_response_ok": True if market_mode not in {"FCR-N", "Combined"} else fcr_dynamic_response_ok,
         "fcr_hvac_share_ok": True if market_mode not in {"FCR-N", "Combined"} else fcr_hvac_share_ok,
-        "afrr_min_bid_ok": avg_afrr_bid >= FINGRID_RULES["aFRR"]["min_bid_kw"] if market_mode in {"aFRR", "Combined"} else True,
+        "afrr_min_bid_ok": afrr_min_bid_ok,
         "fcr_response_ok": fcr_response_ok if market_mode in {"FCR-N", "Combined"} else True,
         "afrr_response_ok": afrr_response_s <= FINGRID_RULES["aFRR"]["full_activation_seconds"] if market_mode in {"aFRR", "Combined"} else True,
         "accuracy_ok": (
@@ -2431,6 +2882,27 @@ def run_mpc_controller(
         "fcr_energy_60_seconds": fcr_energy_60_seconds,
         "afrr_response_s": afrr_response_s,
     }
+    compliance.update(technical_compliance)
+    if market_mode in {"FCR-N", "Combined"}:
+        fcr_tracking_required_ok = (
+            bool(compliance.get("fcr_actual_dynamic_response_ok", True))
+            if bool(compliance.get("fcr_tracking_response_evaluated", False))
+            else True
+        )
+        compliance["fcr_response_ok"] = bool(
+            compliance["fcr_response_ok"]
+            and fcr_tracking_required_ok
+            and compliance.get("fcr_stability_margin_ok", True)
+        )
+        compliance["fcr_prequalification_evidence_ok"] = bool(
+            compliance.get("fcr_prequalification_evidence_ok", True)
+            and compliance["fcr_response_ok"]
+            and compliance.get("fcr_local_control_ok", True)
+            and compliance.get("fcr_bid_granularity_ok", True)
+        )
+    if market_mode in {"aFRR", "Combined"}:
+        compliance["afrr_response_ok"] = bool(compliance.get("afrr_response_ok", False))
+        compliance["accuracy_ok"] = bool(compliance.get("accuracy_ok", False))
     passed = sum(bool(v) for k, v in compliance.items() if k.endswith("_ok"))
     total_checks = len([k for k in compliance if k.endswith("_ok")])
     eligible_rows = result_df[result_df.get("market_gate_status", pd.Series(index=result_df.index, dtype=object)) == "Participate"]
@@ -2480,12 +2952,13 @@ def run_mpc_controller(
         "socket_violation_down_kw": float(result_df.get("socket_violation_down_kw", pd.Series([0.0])).sum()),
         "mean_shortfall_kw": float(result_df["shortfall_kw"].mean()) if "shortfall_kw" in result_df else 0.0,
     }
+    summary.update(technical_summary)
     gateway_commands = pd.concat(gateway_command_summaries, ignore_index=True) if gateway_command_summaries else pd.DataFrame()
     household_contrib, appliance_contrib, usage_fatigue = centralized_controller.contribution_frames(gateway_commands)
     return {
         "history": result_df,
-        "tracking_4s": pd.concat(tracking_history) if tracking_history else pd.DataFrame(),
-        "inner_mpc_trace": pd.concat(tracking_history) if tracking_history else pd.DataFrame(),
+        "tracking_4s": tracking_df,
+        "inner_mpc_trace": tracking_df,
         "summary": summary,
         "compliance": compliance,
         "first_schedule": schedule_snapshots[0] if schedule_snapshots else pd.DataFrame(),
@@ -2494,6 +2967,7 @@ def run_mpc_controller(
         "household_contributions": household_contrib,
         "appliance_contributions": appliance_contrib,
         "usage_fatigue_summary": usage_fatigue,
+        "afrr_energy_audit": afrr_energy_audit,
     }
 
 def run_lower_mpc_from_upper_result(
@@ -2534,6 +3008,7 @@ def run_lower_mpc_from_upper_result(
             "household_contributions": empty,
             "appliance_contributions": empty,
             "usage_fatigue_summary": empty,
+            "afrr_energy_audit": empty,
         }
 
     plan_columns = [
@@ -2621,6 +3096,28 @@ def run_lower_mpc_from_upper_result(
         actual_hvac_up = interval_summary["hvac_up_kw"]
         actual_hvac_down = interval_summary["hvac_down_kw"]
         actual_pv_down = interval_summary["pv_down_kw"]
+        afrr_up_share = float(
+            np.clip(
+                abs(interval_tracking.get("afrr_signal_request_kw", pd.Series([0.0])).clip(lower=0.0).mean())
+                / max(interval_summary["requested_up_kw"], 1e-9),
+                0.0,
+                1.0,
+            )
+        )
+        afrr_down_share = float(
+            np.clip(
+                abs((-interval_tracking.get("afrr_signal_request_kw", pd.Series([0.0])).clip(upper=0.0)).mean())
+                / max(interval_summary["requested_down_kw"], 1e-9),
+                0.0,
+                1.0,
+            )
+        )
+        actual_bess_afrr_up = actual_bess_up * afrr_up_share
+        actual_ev_afrr_up = actual_ev_up * afrr_up_share
+        actual_hvac_afrr_up = actual_hvac_up * afrr_up_share
+        actual_bess_afrr_down = actual_bess_down * afrr_down_share
+        actual_ev_afrr_down = actual_ev_down * afrr_down_share
+        actual_hvac_afrr_down = actual_hvac_down * afrr_down_share
         fcr_bid_kw = plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0) + plan.get("hvac_fcr_kw", 0.0)
         afrr_up_bid_kw = plan.get("bess_afrr_up_kw", 0.0) + plan.get("ev_afrr_up_kw", 0.0) + plan.get("hvac_afrr_up_kw", 0.0)
         afrr_down_bid_kw = (
@@ -2635,8 +3132,8 @@ def run_lower_mpc_from_upper_result(
             + row["afrr_down_capacity_eur_per_mw_h"] * afrr_down_bid_kw
         )
         activation_revenue = effective_dt_h / 1000.0 * (
-            row["afrr_up_energy_eur_per_mwh"] * (actual_bess_up + actual_ev_up + actual_hvac_up)
-            + row["afrr_down_energy_eur_per_mwh"] * (actual_bess_down + actual_ev_down + actual_hvac_down + actual_pv_down)
+            row["afrr_up_energy_eur_per_mwh"] * (actual_bess_afrr_up + actual_ev_afrr_up + actual_hvac_afrr_up)
+            + row["afrr_down_energy_eur_per_mwh"] * (actual_bess_afrr_down + actual_ev_afrr_down + actual_hvac_afrr_down + actual_pv_down)
         )
         degradation_cost = float(upper_row.get("degradation_cost_eur", 0.0)) * interval_fraction
         comfort_penalty = float(upper_row.get("comfort_penalty_eur", 0.0)) * interval_fraction
@@ -2662,6 +3159,12 @@ def run_lower_mpc_from_upper_result(
                 "ev_down_kw": actual_ev_down,
                 "hvac_up_kw": actual_hvac_up,
                 "hvac_down_kw": actual_hvac_down,
+                "bess_afrr_up_delivered_kw": actual_bess_afrr_up,
+                "bess_afrr_down_delivered_kw": actual_bess_afrr_down,
+                "ev_afrr_up_delivered_kw": actual_ev_afrr_up,
+                "ev_afrr_down_delivered_kw": actual_ev_afrr_down,
+                "hvac_afrr_up_delivered_kw": actual_hvac_afrr_up,
+                "hvac_afrr_down_delivered_kw": actual_hvac_afrr_down,
                 "pv_down_kw": actual_pv_down,
                 "capacity_revenue_eur": capacity_revenue,
                 "activation_revenue_eur": activation_revenue,
@@ -2701,10 +3204,19 @@ def run_lower_mpc_from_upper_result(
             "household_contributions": empty,
             "appliance_contributions": empty,
             "usage_fatigue_summary": empty,
+            "afrr_energy_audit": empty,
         }
 
     result_df = pd.DataFrame(history).set_index("timestamp")
     tracking_df = pd.concat(tracking_history) if tracking_history else pd.DataFrame()
+    tracking_df = _enrich_tracking_for_market_audit(tracking_df)
+    technical_compliance, technical_summary, afrr_energy_audit = _market_technical_audit(
+        result_df=result_df,
+        tracking_df=tracking_df,
+        fleet_meta=fleet_meta,
+        market_mode=market_mode,
+        inner_dt_seconds=inner_dt_seconds,
+    )
     gateway_commands = pd.concat(gateway_command_summaries, ignore_index=True) if gateway_command_summaries else pd.DataFrame()
     household_contrib, appliance_contrib, usage_fatigue = centralized_controller.contribution_frames(gateway_commands)
     summary = dict(upper_result.get("summary", {})) if isinstance(upper_result, dict) else {}
@@ -2758,7 +3270,26 @@ def run_lower_mpc_from_upper_result(
             "mean_shortfall_kw": float(tracking_df["shortfall_kw"].mean()) if "shortfall_kw" in tracking_df else 0.0,
         }
     )
+    summary.update(technical_summary)
     compliance = dict(upper_result.get("compliance", {})) if isinstance(upper_result, dict) else {}
+    compliance.update(technical_compliance)
+    if market_mode in {"FCR-N", "Combined"}:
+        fcr_tracking_required_ok = (
+            bool(compliance.get("fcr_actual_dynamic_response_ok", True))
+            if bool(compliance.get("fcr_tracking_response_evaluated", False))
+            else True
+        )
+        compliance["fcr_response_ok"] = bool(
+            compliance.get("fcr_response_ok", True)
+            and fcr_tracking_required_ok
+            and compliance.get("fcr_stability_margin_ok", True)
+        )
+        compliance["fcr_prequalification_evidence_ok"] = bool(
+            compliance.get("fcr_prequalification_evidence_ok", True)
+            and compliance.get("fcr_response_ok", True)
+            and compliance.get("fcr_local_control_ok", True)
+            and compliance.get("fcr_bid_granularity_ok", True)
+        )
     return {
         "history": result_df,
         "tracking_4s": tracking_df,
@@ -2771,6 +3302,7 @@ def run_lower_mpc_from_upper_result(
         "household_contributions": household_contrib,
         "appliance_contributions": appliance_contrib,
         "usage_fatigue_summary": usage_fatigue,
+        "afrr_energy_audit": afrr_energy_audit,
     }
 
 def make_pdf_summary(summary: Dict[str, float], compliance: Dict[str, float], config: Dict[str, object]) -> bytes:

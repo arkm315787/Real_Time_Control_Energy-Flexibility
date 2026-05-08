@@ -156,6 +156,7 @@ def main() -> None:
         "inner_mpc_trace",
         "gateway_commands",
         "usage_fatigue_summary",
+        "afrr_energy_audit",
     ):
         write_frame(run_dir / f"{name}.csv", result.get(name))
     serialized = serialize_optimization_result(result)
@@ -199,6 +200,7 @@ def main() -> None:
                 "inner_mpc_trace": "inner_mpc_trace.csv",
                 "gateway_commands": "gateway_commands.csv",
                 "usage_fatigue_summary": "usage_fatigue_summary.csv",
+                "afrr_energy_audit": "afrr_energy_audit.csv",
             },
         },
     )

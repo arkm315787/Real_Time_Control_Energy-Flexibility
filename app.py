@@ -1924,7 +1924,8 @@ def main() -> None:
                         <p class="small-note">
                             FCR response estimate: <b>{float(c.get('fcr_response_s', 0.0)):.1f} s</b><br/>
                             aFRR response estimate: <b>{float(c.get('afrr_response_s', 0.0)):.0f} s</b><br/>
-                            Mean delivered/requested ratio: <b>{float(c.get('mean_accuracy', 0.0)):.2f}</b>
+                            aFRR min/max ratio: <b>{float(c.get('afrr_min_accuracy_ratio', 0.0)):.2f} / {float(c.get('afrr_max_accuracy_ratio', 0.0)):.2f}</b><br/>
+                            FCR stability screen: <b>{float(c.get('fcr_stability_margin_pct', 0.0)):.1f}%</b>
                         </p>
                     </div>
                     """,
@@ -1950,8 +1951,13 @@ def main() -> None:
                 ("FCR-N minimum 0.1 MW", c.get("fcr_min_bid_ok", False)),
                 ("aFRR minimum 1 MW", c.get("afrr_min_bid_ok", False)),
                 ("FCR-N fast response", c.get("fcr_response_ok", False)),
-                ("aFRR 5-minute full activation", c.get("afrr_response_ok", False)),
-                ("aFRR 90-110% accuracy", c.get("accuracy_ok", False)),
+                ("FCR-N 4-sec trace response", c.get("fcr_actual_dynamic_response_ok", False)),
+                ("FCR-N stability screen", c.get("fcr_stability_margin_ok", False)),
+                ("FCR-N prequalification evidence pack", c.get("fcr_prequalification_evidence_ok", False)),
+                ("aFRR starts within 30 s", c.get("afrr_start_within_30s_ok", False)),
+                ("aFRR full activation within 5 min", c.get("afrr_full_activation_5min_ok", False)),
+                ("aFRR 90-110% tracking envelope", c.get("accuracy_ok", False)),
+                ("aFRR energy reporting +/-10% per ISP", c.get("afrr_energy_reporting_ok", False)),
                 ("Storage 1 h endurance per direction", c.get("storage_endurance_ok", False)),
                 ("Baseline methodology available", c.get("baseline_method_ok", False)),
             ]
@@ -2087,6 +2093,38 @@ def main() -> None:
                     latency_fig = signal_line_figure(lower_visible, ["control_latency_ms", "control_deadline_ms"], "4-second control deadline check", "ms")
                     lower_diag_right.plotly_chart(apply_chart_style(latency_fig, template, height=320), use_container_width=True)
 
+                if {"afrr_accuracy_ratio", "afrr_accuracy_low", "afrr_accuracy_high"}.issubset(lower_visible.columns):
+                    accuracy_fig = go.Figure()
+                    accuracy_fig.add_trace(go.Scatter(x=lower_visible.index, y=lower_visible["afrr_accuracy_ratio"], name="aFRR delivered/requested", line={"color": RESOURCE_COLORS["Net"], "width": 3}))
+                    accuracy_fig.add_trace(go.Scatter(x=lower_visible.index, y=lower_visible["afrr_accuracy_low"], name="90% floor", line={"color": "#6b7280", "dash": "dash"}))
+                    accuracy_fig.add_trace(go.Scatter(x=lower_visible.index, y=lower_visible["afrr_accuracy_high"], name="110% ceiling", line={"color": "#6b7280", "dash": "dash"}))
+                    accuracy_fig.update_layout(yaxis_title="ratio")
+                    st.plotly_chart(apply_chart_style(accuracy_fig, template, height=300, title="aFRR 90-110% tracking audit"), use_container_width=True)
+
+                afrr_energy_audit = result_frame(lower_view_result, "afrr_energy_audit")
+                if afrr_energy_audit.empty:
+                    afrr_energy_audit = result_frame(result, "afrr_energy_audit")
+                if not afrr_energy_audit.empty:
+                    st.markdown("### aFRR settlement-period energy audit")
+                    energy_audit_fig = go.Figure()
+                    energy_audit_fig.add_trace(go.Bar(x=afrr_energy_audit["isp_start"], y=afrr_energy_audit["afrr_reported_energy_mwh"], name="BSP reported aFRR energy"))
+                    energy_audit_fig.add_trace(go.Bar(x=afrr_energy_audit["isp_start"], y=afrr_energy_audit["afrr_fingrid_calculated_energy_mwh"], name="Fingrid-calculated proxy"))
+                    energy_audit_fig.add_trace(
+                        go.Scatter(
+                            x=afrr_energy_audit["isp_start"],
+                            y=afrr_energy_audit["afrr_energy_reporting_diff_pct"],
+                            name="absolute diff %",
+                            yaxis="y2",
+                            line={"color": RESOURCE_COLORS["Frequency"], "width": 3},
+                        )
+                    )
+                    energy_audit_fig.update_layout(
+                        barmode="group",
+                        yaxis_title="MWh",
+                        yaxis2={"title": "diff ratio", "overlaying": "y", "side": "right", "range": [0, max(0.12, float(afrr_energy_audit["afrr_energy_reporting_diff_pct"].max()) * 1.2)]},
+                    )
+                    st.plotly_chart(apply_chart_style(energy_audit_fig, template, height=320, title="aFRR delivered energy reconciliation"), use_container_width=True)
+
                 lower_cols = [
                     "inner_solver_status",
                     "optimization_strategy",
@@ -2109,6 +2147,9 @@ def main() -> None:
                     "buffer_capacity_kw",
                     "buffer_used_kw",
                     "fast_bridge_used_kw",
+                    "afrr_accuracy_ratio",
+                    "afrr_reporting_error_kw",
+                    "fcr_response_ratio",
                     "recovery_mode",
                     "error_rising",
                     "control_latency_ms",
@@ -2240,12 +2281,27 @@ def main() -> None:
 
                 diagnostic_cols = [
                     col
-                    for col in ["tracking_error_kw", "tracking_tolerance_kw", "shortfall_kw", "buffer_used_kw", "fast_bridge_used_kw"]
+                    for col in [
+                        "tracking_error_kw",
+                        "tracking_tolerance_kw",
+                        "shortfall_kw",
+                        "buffer_used_kw",
+                        "fast_bridge_used_kw",
+                        "afrr_reporting_error_kw",
+                    ]
                     if col in tracking_window.columns
                 ]
                 if diagnostic_cols:
                     diagnostic_fig = signal_line_figure(tracking_window, diagnostic_cols, "Lower MPC tracking diagnostics", "kW")
                     lower_right.plotly_chart(apply_chart_style(diagnostic_fig, template, height=340), use_container_width=True)
+
+                if {"afrr_accuracy_ratio", "afrr_accuracy_low", "afrr_accuracy_high"}.issubset(tracking_window.columns):
+                    accuracy_fig = go.Figure()
+                    accuracy_fig.add_trace(go.Scatter(x=tracking_window.index, y=tracking_window["afrr_accuracy_ratio"], name="aFRR ratio", line={"color": RESOURCE_COLORS["Net"], "width": 3}))
+                    accuracy_fig.add_trace(go.Scatter(x=tracking_window.index, y=tracking_window["afrr_accuracy_low"], name="90%", line={"color": "#6b7280", "dash": "dash"}))
+                    accuracy_fig.add_trace(go.Scatter(x=tracking_window.index, y=tracking_window["afrr_accuracy_high"], name="110%", line={"color": "#6b7280", "dash": "dash"}))
+                    accuracy_fig.update_layout(yaxis_title="delivered/requested")
+                    st.plotly_chart(apply_chart_style(accuracy_fig, template, height=300, title="aFRR tracking ratio in plotted data"), use_container_width=True)
 
                 gateway_commands = result.get("gateway_commands", pd.DataFrame())
                 if not gateway_commands.empty:

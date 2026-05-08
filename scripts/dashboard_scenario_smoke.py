@@ -16,7 +16,16 @@ sys.path.insert(0, str(ROOT))
 
 import pandas as pd
 
-from app import default_scenario_inputs, live_market_status, live_visible_frame, portfolio_bundle_is_current, scenario_portfolio_signature, upper_socket_metrics
+from app import (
+    build_live_market_feed,
+    default_scenario_inputs,
+    live_market_status,
+    live_visible_frame,
+    portfolio_bundle_is_current,
+    scenario_portfolio_signature,
+    upper_socket_metrics,
+)
+from flexihome.core.market_simulator import MarketSimulator, MarketSimulatorConfig
 
 
 def main() -> None:
@@ -74,6 +83,30 @@ def main() -> None:
     frame = pd.DataFrame({"signal": range(10)}, index=pd.date_range("2026-01-01", periods=10, freq="4s"))
     if len(live_visible_frame(frame, session, now_s=119.0)) != 3:
         raise SystemExit("Live visible frame should reveal rows according to elapsed market seconds.")
+
+    preview_index = pd.date_range("2026-01-15 00:00:00", periods=260, freq="4s")
+    preview = pd.DataFrame(
+        {
+            "frequency_hz": [50.0 - 0.001 * i for i in range(len(preview_index))],
+            "fcr_signal_norm": [0.001 * i for i in range(len(preview_index))],
+            "afrr_signal_norm": [-0.001 * i for i in range(len(preview_index))],
+        },
+        index=preview_index,
+    )
+    socket_start = pd.Timestamp("2026-01-15 00:15:00")
+    upper_result = {"history": pd.DataFrame({"fcr_bid_kw": [100.0]}, index=[socket_start])}
+    aligned_feed = build_live_market_feed(preview, upper_result, duration_seconds=16, dt_seconds=4)
+    if aligned_feed.index[0] != socket_start:
+        raise SystemExit("Live market feed should start at the first accepted upper-MPC interval timestamp.")
+    expected_first = preview.loc[socket_start]
+    if float(aligned_feed.iloc[0]["fcr_signal_norm"]) != float(expected_first["fcr_signal_norm"]):
+        raise SystemExit("Live market feed must use the preview signal aligned to the upper-MPC socket, not preview tick zero.")
+    simulator = MarketSimulator(aligned_feed, MarketSimulatorConfig(dt_seconds=4), start_wall_time_s=200.0)
+    first_signal = simulator.get_current_signal(200.0)
+    if first_signal is None:
+        raise SystemExit("Market simulator should emit the first tick when the market starts.")
+    if abs(float(first_signal["frequency_hz"]) - float(expected_first["frequency_hz"])) > 1e-12:
+        raise SystemExit("Market simulator must preserve the aligned preview frequency instead of forcing 50 Hz.")
 
     empty_socket = {
         "history": pd.DataFrame(

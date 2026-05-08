@@ -43,6 +43,7 @@ class MarketSimulator:
         self.last_tick_index = -1
         self.last_fcr_signal = 0.0
         self.last_afrr_signal = 0.0
+        self.last_frequency_hz = 50.0
         self.tick_count = 0
         self.rng = np.random.default_rng(seed=42)
 
@@ -79,6 +80,7 @@ class MarketSimulator:
                 row = self.preview_signals.iloc[tick_index]
                 fcr_signal = float(row.get("fcr_signal_norm", 0.0))
                 afrr_signal = float(row.get("afrr_signal_norm", 0.0))
+                frequency_hz = float(row.get("frequency_hz", 50.0 - 0.1 * fcr_signal))
             else:
                 # Synthetic generation for ticks beyond preview
                 fcr_noise = float(self.rng.normal(0, self.config.fcr_volatility))
@@ -97,15 +99,17 @@ class MarketSimulator:
                         1.0,
                     )
                 )
+                frequency_hz = 50.0 - 0.1 * fcr_signal
 
             self.last_fcr_signal = fcr_signal
             self.last_afrr_signal = afrr_signal
+            self.last_frequency_hz = frequency_hz
             self.tick_count += 1
 
             return {
                 "fcr_signal_norm": fcr_signal,
                 "afrr_signal_norm": afrr_signal,
-                "frequency_hz": 50.0,
+                "frequency_hz": frequency_hz,
                 "tick_index": tick_index,
                 "timestamp": pd.Timestamp.now(),
                 "wall_elapsed_seconds": elapsed_s,
@@ -115,7 +119,7 @@ class MarketSimulator:
         return {
             "fcr_signal_norm": self.last_fcr_signal,
             "afrr_signal_norm": self.last_afrr_signal,
-            "frequency_hz": 50.0,
+            "frequency_hz": self.last_frequency_hz,
             "tick_index": tick_index,
             "timestamp": pd.Timestamp.now(),
             "wall_elapsed_seconds": elapsed_s,
@@ -132,4 +136,5 @@ class MarketSimulator:
         self.last_tick_index = -1
         self.last_fcr_signal = 0.0
         self.last_afrr_signal = 0.0
+        self.last_frequency_hz = 50.0
         self.tick_count = 0

@@ -543,9 +543,14 @@ def sync_market_simulator_feed(
 
     start_at = float(session.get("start_at_wall_s", 0.0))
     simulator = st.session_state.get("market_simulator")
-    if not isinstance(simulator, MarketSimulator) or float(getattr(simulator, "start_wall_time_s", 0.0) or 0.0) != start_at:
+    simulator_feed_len = len(getattr(simulator, "preview_signals", pd.DataFrame())) if isinstance(simulator, MarketSimulator) else -1
+    if (
+        not isinstance(simulator, MarketSimulator)
+        or float(getattr(simulator, "start_wall_time_s", 0.0) or 0.0) != start_at
+        or simulator_feed_len != len(feed)
+    ):
         simulator = MarketSimulator(
-            preview_signals=preview_4s,
+            preview_signals=feed,
             config=MarketSimulatorConfig(dt_seconds=int(dt_seconds)),
             start_wall_time_s=start_at,
         )
@@ -1637,8 +1642,14 @@ def main() -> None:
                 "market_mode": market_mode,
                 "resource_mode": resource_mode,
             }
+            market_feed_for_simulator = build_live_market_feed(
+                preview_4s,
+                st.session_state.get("upper_mpc_result", st.session_state.get("mpc_result", {})),
+                int(dispatch_minutes * 60),
+                dt_seconds=4,
+            )
             st.session_state["market_simulator"] = MarketSimulator(
-                preview_signals=preview_4s,
+                preview_signals=market_feed_for_simulator,
                 config=MarketSimulatorConfig(dt_seconds=4),
                 start_wall_time_s=now_s + float(market_delay_seconds),
             )

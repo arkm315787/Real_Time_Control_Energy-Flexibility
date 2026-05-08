@@ -79,6 +79,9 @@ RESOURCE_FORECAST_UNCERTAINTY = {
     "PV": 0.20,
 }
 
+COMBINED_STACKING_SPLIT_MODEL = "co_optimized_split_capacity"
+COMBINED_STACKING_SHARED_MODEL = "shared_capacity_max_socket"
+
 SUPPORTED_MPC_TARGETS = [
     "net_load_baseline_kw",
     "pv_available_kw",
@@ -1959,6 +1962,7 @@ def _market_gate_decision(plan: Dict[str, float], market_mode: str) -> Dict[str,
         else abs((afrr_down / max(afrr_granularity_kw, 1e-9)) - round(afrr_down / max(afrr_granularity_kw, 1e-9))) <= 1e-6
     )
     afrr_granularity_ok = afrr_up_granularity_ok and afrr_down_granularity_ok
+    combined_stack_ok = True if market_mode != "Combined" else _truthy(plan.get("combined_shared_capacity_ok", True), default=True)
     fcr_product_ok = fcr_ok and fcr_local_ok and fcr_granularity_ok and fcr_dynamic_cap_ok and fcr_dynamic_response_ok and fcr_hvac_share_ok
     afrr_product_ok = afrr_ok and afrr_granularity_ok
     profitable = risk_profit >= 0.0
@@ -1969,7 +1973,12 @@ def _market_gate_decision(plan: Dict[str, float], market_mode: str) -> Dict[str,
         product_ok = afrr_product_ok
         size_reason = "Reliable aFRR bid is below the selected market minimum size."
     else:
-        product_ok = (fcr_product_ok or afrr_product_ok) and (not fcr_present or fcr_product_ok) and (not afrr_present or afrr_product_ok)
+        product_ok = (
+            combined_stack_ok
+            and (fcr_product_ok or afrr_product_ok)
+            and (not fcr_present or fcr_product_ok)
+            and (not afrr_present or afrr_product_ok)
+        )
         size_reason = "Reliable FCR-N and aFRR bids are both below their market minimum sizes."
 
     if product_ok and profitable and (fcr_bid + afrr_bid > 1.0):
@@ -2002,6 +2011,9 @@ def _market_gate_decision(plan: Dict[str, float], market_mode: str) -> Dict[str,
     elif fcr_enabled and fcr_ok and not fcr_hvac_share_ok:
         status = "Wait"
         reason = "FCR-N HVAC contribution exceeds the configured comfort-disturbance share cap."
+    elif market_mode == "Combined" and not combined_stack_ok:
+        status = "Wait"
+        reason = "Combined FCR-N+aFRR bid is not backed by a split-capacity stacking audit."
     elif not product_ok:
         status = "Wait"
         reason = size_reason
@@ -2019,13 +2031,86 @@ def _market_gate_decision(plan: Dict[str, float], market_mode: str) -> Dict[str,
         "fcr_dynamic_cap_ok": bool(fcr_dynamic_cap_ok),
         "fcr_dynamic_response_ok": bool(fcr_dynamic_response_ok),
         "fcr_hvac_share_ok": bool(fcr_hvac_share_ok),
+        "combined_shared_capacity_ok": bool(combined_stack_ok),
         "fcr_bid_segments": int(plan.get("fcr_bid_segments", 0) or 0),
         "afrr_up_segments": int(plan.get("afrr_up_segments", 0) or 0),
         "afrr_down_segments": int(plan.get("afrr_down_segments", 0) or 0),
     }
 
 
-def _socket_limits_from_plan(plan: Dict[str, float], market_mode: str) -> tuple[float, float]:
+def _truthy(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "ok"}
+    if isinstance(value, (float, np.floating)) and np.isnan(value):
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        pass
+    return bool(value)
+
+
+def _combined_split_capacity_enabled(plan: Dict[str, Any]) -> bool:
+    return (
+        str(plan.get("combined_stacking_model", "")).strip() == COMBINED_STACKING_SPLIT_MODEL
+        and _truthy(plan.get("combined_shared_capacity_ok", plan.get("combined_split_capacity_ok", True)), default=True)
+    )
+
+
+def _combined_stack_audit(
+    plan: Dict[str, Any],
+    row: pd.Series | None,
+    market_mode: str,
+) -> Dict[str, Any]:
+    """Explain whether Combined same-direction socket summing is backed by split capacity."""
+
+    fcr_active = market_mode in {"FCR-N", "Combined"}
+    afrr_active = market_mode in {"aFRR", "Combined"}
+    resources = {
+        "bess": ("bess_fcr_kw", "bess_afrr_up_kw", "bess_afrr_down_kw", "bess_up_kw", "bess_down_kw"),
+        "ev": ("ev_fcr_kw", "ev_afrr_up_kw", "ev_afrr_down_kw", "ev_up_kw", "ev_down_kw"),
+        "hvac": ("hvac_fcr_kw", "hvac_afrr_up_kw", "hvac_afrr_down_kw", "hvac_up_kw", "hvac_down_kw"),
+        "pv": ("", "", "pv_afrr_down_kw", "", "pv_down_kw"),
+    }
+    audit: Dict[str, Any] = {}
+    ok = True
+    violations: List[str] = []
+
+    for resource, (fcr_col, afrr_up_col, afrr_down_col, up_cap_col, down_cap_col) in resources.items():
+        fcr_kw = float(plan.get(fcr_col, 0.0) or 0.0) if fcr_col and fcr_active else 0.0
+        up_kw = fcr_kw + (float(plan.get(afrr_up_col, 0.0) or 0.0) if afrr_up_col and afrr_active else 0.0)
+        down_kw = fcr_kw + (float(plan.get(afrr_down_col, 0.0) or 0.0) if afrr_down_col and afrr_active else 0.0)
+        audit[f"{resource}_combined_up_stack_kw"] = float(max(up_kw, 0.0))
+        audit[f"{resource}_combined_down_stack_kw"] = float(max(down_kw, 0.0))
+
+        if row is None or market_mode != "Combined":
+            continue
+        for direction, value, cap_col in (("up", up_kw, up_cap_col), ("down", down_kw, down_cap_col)):
+            if not cap_col or cap_col not in row:
+                continue
+            cap = float(row.get(cap_col, np.nan))
+            if np.isnan(cap):
+                continue
+            tolerance = max(1e-6, 0.001 * max(abs(cap), 1.0))
+            if value > cap + tolerance:
+                ok = False
+                violations.append(f"{resource}_{direction}: {value:.1f} kW > {cap:.1f} kW")
+
+    if market_mode == "Combined":
+        audit["combined_stacking_model"] = COMBINED_STACKING_SPLIT_MODEL if ok else COMBINED_STACKING_SHARED_MODEL
+    else:
+        audit["combined_stacking_model"] = "single_product_socket"
+    audit["combined_shared_capacity_ok"] = bool(ok)
+    audit["combined_split_capacity_ok"] = bool(ok)
+    audit["combined_stack_violation_reason"] = "; ".join(violations)
+    audit["combined_socket_rule"] = "sum_fcr_plus_afrr_when_split_capacity_proven" if market_mode == "Combined" and ok else "single_or_max_shared_capacity"
+    return audit
+
+
+def _socket_limits_from_plan(plan: Dict[str, Any], market_mode: str) -> tuple[float, float]:
     fcr_bid = float(plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0) + plan.get("hvac_fcr_kw", 0.0))
     afrr_up = float(plan.get("bess_afrr_up_kw", 0.0) + plan.get("ev_afrr_up_kw", 0.0) + plan.get("hvac_afrr_up_kw", 0.0))
     afrr_down = float(
@@ -2041,8 +2126,12 @@ def _socket_limits_from_plan(plan: Dict[str, float], market_mode: str) -> tuple[
         up_limit = afrr_up
         down_limit = afrr_down
     else:
-        up_limit = fcr_bid + afrr_up
-        down_limit = fcr_bid + afrr_down
+        if _combined_split_capacity_enabled(plan):
+            up_limit = fcr_bid + afrr_up
+            down_limit = fcr_bid + afrr_down
+        else:
+            up_limit = max(fcr_bid, afrr_up)
+            down_limit = max(fcr_bid, afrr_down)
     return float(max(up_limit, 0.0)), float(max(down_limit, 0.0))
 
 
@@ -2461,6 +2550,7 @@ def run_mpc_controller(
         execution_row_idx = min(t + 1, len(df) - 1)
         row = df.iloc[execution_row_idx]
         dt_h = row["dt_h"]
+        plan.update(_combined_stack_audit(plan, row, market_mode))
         if execute_lower_mpc:
             fine_signals = build_inner_tracking_window(df, preview_4s, execution_row_idx, dt_seconds=int(inner_dt_seconds))
             if progress_callback:
@@ -2533,6 +2623,8 @@ def run_mpc_controller(
             + plan.get("hvac_afrr_down_kw", 0.0)
             + plan.get("pv_afrr_down_kw", 0.0)
         )
+        stack_audit = _combined_stack_audit(plan, row, market_mode)
+        plan.update(stack_audit)
         socket_up_kw, socket_down_kw = _socket_limits_from_plan(plan, market_mode)
         plan["socket_up_kw"] = socket_up_kw
         plan["socket_down_kw"] = socket_down_kw
@@ -2540,7 +2632,9 @@ def run_mpc_controller(
         stacking_ok = (
             True
             if market_mode != "Combined"
-            else socket_up_kw + 1e-6 >= fcr_bid_kw + afrr_up_bid_kw and socket_down_kw + 1e-6 >= fcr_bid_kw + afrr_down_bid_kw
+            else bool(stack_audit["combined_shared_capacity_ok"])
+            and socket_up_kw + 1e-6 >= fcr_bid_kw + afrr_up_bid_kw
+            and socket_down_kw + 1e-6 >= fcr_bid_kw + afrr_down_bid_kw
         )
         capacity_revenue = dt_h / 1000.0 * (
             row["fcrn_capacity_eur_per_mw_h"] * fcr_bid_kw
@@ -2590,6 +2684,7 @@ def run_mpc_controller(
                 "afrr_up_segments": int(plan.get("afrr_up_segments", 0) or 0),
                 "afrr_down_segments": int(plan.get("afrr_down_segments", 0) or 0),
                 "stacking_ok": bool(stacking_ok),
+                **stack_audit,
                 "energy_endurance_ok": bool(plan.get("energy_endurance_ok", True)),
                 "granularity_ok": bool(granularity_ok),
                 "socket_up_kw": socket_up_kw,
@@ -3011,7 +3106,7 @@ def run_lower_mpc_from_upper_result(
             "afrr_energy_audit": empty,
         }
 
-    plan_columns = [
+    numeric_plan_columns = [
         "bess_fcr_kw",
         "ev_fcr_kw",
         "hvac_fcr_kw",
@@ -3030,6 +3125,13 @@ def run_lower_mpc_from_upper_result(
         "reserve_buffer_pct",
         "socket_up_kw",
         "socket_down_kw",
+    ]
+    passthrough_plan_columns = [
+        "combined_stacking_model",
+        "combined_shared_capacity_ok",
+        "combined_split_capacity_ok",
+        "combined_stack_violation_reason",
+        "combined_socket_rule",
     ]
     controller_config = InnerControllerConfig(
         mode=inner_controller_mode,
@@ -3061,7 +3163,11 @@ def run_lower_mpc_from_upper_result(
         except KeyError:
             row_idx = min(t + 1, len(df) - 1)
         row = df.iloc[row_idx]
-        plan = {key: float(upper_row.get(key, 0.0)) for key in plan_columns}
+        plan = {key: float(upper_row.get(key, 0.0)) for key in numeric_plan_columns}
+        for key in passthrough_plan_columns:
+            if key in upper_row:
+                plan[key] = upper_row.get(key)
+        plan.update(_combined_stack_audit(plan, row, market_mode))
         if plan["socket_up_kw"] <= 0.0 and plan["socket_down_kw"] <= 0.0:
             plan["socket_up_kw"], plan["socket_down_kw"] = _socket_limits_from_plan(plan, market_mode)
         fine_signals = build_inner_tracking_window(df, preview_4s, row_idx, dt_seconds=int(inner_dt_seconds))
@@ -3126,6 +3232,16 @@ def run_lower_mpc_from_upper_result(
             + plan.get("hvac_afrr_down_kw", 0.0)
             + plan.get("pv_afrr_down_kw", 0.0)
         )
+        stack_audit = _combined_stack_audit(plan, row, market_mode)
+        plan.update(stack_audit)
+        plan["socket_up_kw"], plan["socket_down_kw"] = _socket_limits_from_plan(plan, market_mode)
+        stacking_ok = (
+            True
+            if market_mode != "Combined"
+            else bool(stack_audit["combined_shared_capacity_ok"])
+            and float(plan["socket_up_kw"]) + 1e-6 >= fcr_bid_kw + afrr_up_bid_kw
+            and float(plan["socket_down_kw"]) + 1e-6 >= fcr_bid_kw + afrr_down_bid_kw
+        )
         capacity_revenue = effective_dt_h / 1000.0 * (
             row["fcrn_capacity_eur_per_mw_h"] * fcr_bid_kw
             + row["afrr_up_capacity_eur_per_mw_h"] * afrr_up_bid_kw
@@ -3149,6 +3265,8 @@ def run_lower_mpc_from_upper_result(
                 "afrr_down_bid_kw": afrr_down_bid_kw,
                 "socket_up_kw": float(plan.get("socket_up_kw", 0.0)),
                 "socket_down_kw": float(plan.get("socket_down_kw", 0.0)),
+                "stacking_ok": bool(stacking_ok),
+                **stack_audit,
                 "requested_up_kw": interval_summary["requested_up_kw"],
                 "requested_down_kw": interval_summary["requested_down_kw"],
                 "delivered_up_kw": interval_summary["delivered_up_kw"],

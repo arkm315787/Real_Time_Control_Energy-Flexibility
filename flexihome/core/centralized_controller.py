@@ -18,6 +18,8 @@ AFRR_BID_GRANULARITY_KW = 1000.0
 RECOVERY_PRIORITY = ["BESS", "EV", "HVAC", "PV"]
 FCR_N_RESPONSE_63_SECONDS = 60.0
 FCR_N_RESPONSE_95_SECONDS = 180.0
+COMBINED_STACKING_SPLIT_MODEL = "co_optimized_split_capacity"
+COMBINED_STACKING_SHARED_MODEL = "shared_capacity_max_socket"
 
 DEVICE_DEFAULTS = {
     "BESS": {
@@ -783,6 +785,24 @@ class CentralizedVPPController:
             + plan.get("pv_afrr_down_kw", 0.0)
         )
 
+    def _truthy(self, value: object, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "ok"}
+        try:
+            if pd.isna(value):
+                return default
+        except (TypeError, ValueError):
+            pass
+        return bool(value)
+
+    def _combined_split_capacity_enabled(self, plan: Dict[str, float]) -> bool:
+        return (
+            str(plan.get("combined_stacking_model", "")).strip() == COMBINED_STACKING_SPLIT_MODEL
+            and self._truthy(plan.get("combined_shared_capacity_ok", plan.get("combined_split_capacity_ok", True)), default=True)
+        )
+
     def _commitment_limits(self, plan: Dict[str, float], market_mode: str) -> tuple[float, float]:
         fcr_bid = float(plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0) + plan.get("hvac_fcr_kw", 0.0))
         afrr_up = float(plan.get("bess_afrr_up_kw", 0.0) + plan.get("ev_afrr_up_kw", 0.0) + plan.get("hvac_afrr_up_kw", 0.0))
@@ -799,8 +819,12 @@ class CentralizedVPPController:
             up_limit = afrr_up
             down_limit = afrr_down
         else:
-            up_limit = fcr_bid + afrr_up
-            down_limit = fcr_bid + afrr_down
+            if self._combined_split_capacity_enabled(plan):
+                up_limit = fcr_bid + afrr_up
+                down_limit = fcr_bid + afrr_down
+            else:
+                up_limit = max(fcr_bid, afrr_up)
+                down_limit = max(fcr_bid, afrr_down)
         return float(max(up_limit, 0.0)), float(max(down_limit, 0.0))
 
     def _response_alpha(self, device_type: str) -> float:

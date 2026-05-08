@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from flexihome.core.centralized_controller import CentralizedVPPController, InnerControllerConfig
+from flexihome.core.centralized_controller import COMBINED_STACKING_SPLIT_MODEL, CentralizedVPPController, InnerControllerConfig
 from flexihome.core.data import generate_synthetic_portfolio
 
 
@@ -246,21 +246,54 @@ def main() -> None:
             "ev_afrr_up_kw": 0.0,
         }
     )
-    combined_summary, combined_tracking, _, _ = controller.execute_interval(
+    unsafe_controller = CentralizedVPPController(
+        roster,
+        fleet_meta,
+        InnerControllerConfig(max_devices_per_type=8, horizon_seconds=4),
+    )
+    unsafe_combined_plan = dict(combined_plan)
+    _, unsafe_combined_tracking, _, _ = unsafe_controller.execute_interval(
         row=df.iloc[1],
         fine_signals=combined_up_signal(df.index[1]),
-        plan=combined_plan,
+        plan=unsafe_combined_plan,
         interval_index=3,
         market_mode="Combined",
         resource_mode="Fast only",
     )
-    expected_combined_socket_kw = combined_plan["bess_fcr_kw"] + combined_plan["bess_afrr_up_kw"]
+    expected_shared_socket_kw = max(unsafe_combined_plan["bess_fcr_kw"], unsafe_combined_plan["bess_afrr_up_kw"])
+    if abs(float(unsafe_combined_tracking["committed_up_kw"].max()) - expected_shared_socket_kw) > 1e-6:
+        raise SystemExit("Unproven Combined shared-capacity plan must be capped at max(FCR, aFRR), not summed.")
+    if unsafe_combined_tracking["requested_up_kw"].max() > expected_shared_socket_kw + 1e-6:
+        raise SystemExit("Unproven Combined request should be clipped to the conservative shared-capacity socket.")
+
+    split_combined_plan = dict(combined_plan)
+    split_combined_plan.update(
+        {
+            "combined_stacking_model": COMBINED_STACKING_SPLIT_MODEL,
+            "combined_shared_capacity_ok": True,
+            "combined_split_capacity_ok": True,
+        }
+    )
+    split_controller = CentralizedVPPController(
+        roster,
+        fleet_meta,
+        InnerControllerConfig(max_devices_per_type=8, horizon_seconds=4),
+    )
+    _, combined_tracking, _, _ = split_controller.execute_interval(
+        row=df.iloc[1],
+        fine_signals=combined_up_signal(df.index[1]),
+        plan=split_combined_plan,
+        interval_index=3,
+        market_mode="Combined",
+        resource_mode="Fast only",
+    )
+    expected_combined_socket_kw = split_combined_plan["bess_fcr_kw"] + split_combined_plan["bess_afrr_up_kw"]
     if abs(float(combined_tracking["committed_up_kw"].max()) - expected_combined_socket_kw) > 1e-6:
-        raise SystemExit("Combined product socket must equal FCR plus aFRR in the same direction.")
+        raise SystemExit("Proven split-capacity Combined socket must equal FCR plus aFRR in the same direction.")
     if combined_tracking["requested_up_kw"].max() < expected_combined_socket_kw - 1e-6:
-        raise SystemExit("Combined product request should not be silently shrunk to max(FCR, aFRR).")
+        raise SystemExit("Proven split-capacity Combined request should not be silently shrunk to max(FCR, aFRR).")
     if combined_tracking["requested_up_kw"].max() > combined_tracking["committed_up_kw"].max() + 1e-6:
-        raise SystemExit("Combined product request should be clipped to the summed committed reserve.")
+        raise SystemExit("Proven split-capacity Combined request should be clipped to the summed committed reserve.")
 
     rotation_bundle = make_bundle(n_homes=12)
     rotation_roster = rotation_bundle["device_roster"].copy()

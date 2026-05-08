@@ -155,6 +155,10 @@ def assert_market_granularity(name: str, accepted: pd.DataFrame) -> None:
 
 def assert_combined_socket(name: str, accepted: pd.DataFrame) -> None:
     for _, row in accepted.iterrows():
+        if str(row.get("combined_stacking_model", "")) != "co_optimized_split_capacity":
+            raise SystemExit(f"{name}: accepted Combined interval is missing co-optimized split-capacity proof.")
+        if not bool(row.get("combined_shared_capacity_ok", False)):
+            raise SystemExit(f"{name}: accepted Combined interval failed the shared-capacity stacking audit.")
         up_required = float(row["fcr_bid_kw"] + row["afrr_up_bid_kw"])
         down_required = float(row["fcr_bid_kw"] + row["afrr_down_bid_kw"])
         if float(row["socket_up_kw"]) + 1e-6 < up_required:

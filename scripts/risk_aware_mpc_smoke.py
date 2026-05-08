@@ -110,6 +110,16 @@ def main() -> None:
         "afrr_up_segments",
         "afrr_down_segments",
         "stacking_ok",
+        "combined_stacking_model",
+        "combined_shared_capacity_ok",
+        "combined_split_capacity_ok",
+        "combined_socket_rule",
+        "bess_combined_up_stack_kw",
+        "bess_combined_down_stack_kw",
+        "ev_combined_up_stack_kw",
+        "ev_combined_down_stack_kw",
+        "hvac_combined_up_stack_kw",
+        "hvac_combined_down_stack_kw",
         "energy_endurance_ok",
         "granularity_ok",
         "simulation_only_notice",
@@ -123,6 +133,14 @@ def main() -> None:
         raise SystemExit("HVAC FCR-N schedule must stay inside the dynamically deliverable cap.")
     if not history["fcr_dynamic_response_ok"].all():
         raise SystemExit("FCR-N aggregate droop schedule must pass dynamic response checks.")
+    if not history["combined_shared_capacity_ok"].all() or not history["combined_split_capacity_ok"].all():
+        raise SystemExit("Combined socket summing must be backed by explicit split-capacity audit flags.")
+    if (history["combined_stacking_model"] != "co_optimized_split_capacity").any():
+        raise SystemExit("Combined optimizer output must label its FCR+aFRR socket as co-optimized split capacity.")
+    if (history["socket_up_kw"] + 1e-6 < history["fcr_bid_kw"] + history["afrr_up_bid_kw"]).any():
+        raise SystemExit("Audited Combined up socket must cover FCR plus aFRR up.")
+    if (history["socket_down_kw"] + 1e-6 < history["fcr_bid_kw"] + history["afrr_down_bid_kw"]).any():
+        raise SystemExit("Audited Combined down socket must cover FCR plus aFRR down.")
 
     lower_from_socket = run_lower_mpc_from_upper_result(
         df=df,
@@ -220,6 +238,17 @@ def main() -> None:
     mixed_invalid_gate = _market_gate_decision({"bess_fcr_kw": 100.0, "bess_afrr_up_kw": 1200.0, "risk_adjusted_profit_eur": 5.0}, "Combined")
     if mixed_invalid_gate["market_gate_status"] != "Wait":
         raise SystemExit("Combined market mode must not accept a valid FCR-N bid while a nonzero aFRR bid is misaligned.")
+    unsafe_combined_gate = _market_gate_decision(
+        {
+            "bess_fcr_kw": 100.0,
+            "bess_afrr_up_kw": 1000.0,
+            "combined_shared_capacity_ok": False,
+            "risk_adjusted_profit_eur": 5.0,
+        },
+        "Combined",
+    )
+    if unsafe_combined_gate["market_gate_status"] != "Wait":
+        raise SystemExit("Combined market gate must reject FCR+aFRR bids that fail the split-capacity stacking audit.")
     afrr_below_min_gate = _market_gate_decision({"bess_afrr_up_kw": 900.0, "risk_adjusted_profit_eur": 5.0}, "Combined")
     if afrr_below_min_gate["market_gate_status"] != "Wait":
         raise SystemExit("Combined market mode must reject aFRR bids below the 1 MW minimum.")

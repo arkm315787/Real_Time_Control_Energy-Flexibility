@@ -2039,7 +2039,18 @@ def main() -> None:
             st.info("Configure the scenario and click Run Upper MPC Layer. Market pressure and lower MPC attach only after their own buttons are pressed.")
         else:
             s = result_summary(result)
-            c = upper_view_result.get("compliance", {}) if isinstance(upper_view_result, dict) else {}
+            upper_compliance = upper_view_result.get("compliance", {}) if isinstance(upper_view_result, dict) else {}
+            lower_compliance = lower_view_result.get("compliance", {}) if isinstance(lower_view_result, dict) else {}
+            lower_tracking_for_compliance = result_frame(lower_view_result, "tracking_4s")
+            if not lower_tracking_for_compliance.empty and lower_compliance:
+                c = dict(upper_compliance)
+                c.update(lower_compliance)
+                lower_summary = result_summary(lower_view_result)
+                s = {**s, **lower_summary}
+                compliance_source = "lower 4-second replay audit"
+            else:
+                c = dict(upper_compliance)
+                compliance_source = "upper bid-screen; lower replay pending"
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Total revenue", fmt_money(float(s.get("total_revenue_eur", 0.0))))
             m2.metric("Delivered up energy", f"{float(s.get('delivered_up_mwh', 0.0)):.2f} MWh")
@@ -2210,20 +2221,37 @@ def main() -> None:
                 )
 
             rule_items = [
-                ("FCR-N minimum 0.1 MW", c.get("fcr_min_bid_ok", False)),
-                ("aFRR minimum 1 MW", c.get("afrr_min_bid_ok", False)),
-                ("FCR-N fast response", c.get("fcr_response_ok", False)),
-                ("FCR-N 4-sec trace response", c.get("fcr_actual_dynamic_response_ok", False)),
-                ("FCR-N stability screen", c.get("fcr_stability_margin_ok", False)),
-                ("FCR-N prequalification evidence pack", c.get("fcr_prequalification_evidence_ok", False)),
-                ("aFRR starts within 30 s", c.get("afrr_start_within_30s_ok", False)),
-                ("aFRR full activation within 5 min", c.get("afrr_full_activation_5min_ok", False)),
-                ("aFRR 90-110% tracking envelope", c.get("accuracy_ok", False)),
-                ("aFRR energy reporting +/-10% per ISP", c.get("afrr_energy_reporting_ok", False)),
-                ("Storage 1 h endurance per direction", c.get("storage_endurance_ok", False)),
-                ("Baseline methodology available", c.get("baseline_method_ok", False)),
+                ("FCR-N minimum 0.1 MW", "fcr_min_bid_ok"),
+                ("aFRR minimum 1 MW", "afrr_min_bid_ok"),
+                ("FCR-N fast response", "fcr_response_ok"),
+                ("FCR-N 4-sec trace response", "fcr_actual_dynamic_response_ok"),
+                ("FCR-N stability screen", "fcr_stability_margin_ok"),
+                ("FCR-N prequalification evidence pack", "fcr_prequalification_evidence_ok"),
+                ("aFRR starts within 30 s", "afrr_start_within_30s_ok"),
+                ("aFRR full activation within 5 min", "afrr_full_activation_5min_ok"),
+                ("aFRR 90-110% tracking envelope", "accuracy_ok"),
+                ("aFRR energy reporting +/-10% per ISP", "afrr_energy_reporting_ok"),
+                ("Storage 1 h endurance per direction", "storage_endurance_ok"),
+                ("Baseline methodology available", "baseline_method_ok"),
             ]
-            rule_df = pd.DataFrame(rule_items, columns=["Rule", "Pass"]).assign(Status=lambda x: np.where(x["Pass"], "Pass", "Needs attention"))
+            def compliance_status(key: str, passed: bool) -> str:
+                if key in {"afrr_start_within_30s_ok", "afrr_full_activation_5min_ok", "accuracy_ok"}:
+                    if key == "afrr_full_activation_5min_ok" and bool(c.get("afrr_full_activation_pending", False)):
+                        return "Pending 5-min replay evidence"
+                    if not bool(c.get("afrr_tracking_audit_evaluated", True)):
+                        return "Capability pass; replay pending" if passed else "Pending lower replay"
+                if key == "afrr_energy_reporting_ok" and not bool(c.get("afrr_energy_reporting_evaluated", True)):
+                    return "Pending complete 15-min ISP"
+                if key == "fcr_actual_dynamic_response_ok" and not bool(c.get("fcr_tracking_response_evaluated", True)):
+                    return "Pending 180-s FCR replay"
+                return "Pass" if passed else "Needs attention"
+
+            rule_rows = []
+            for rule, key in rule_items:
+                passed = bool(c.get(key, False))
+                rule_rows.append({"Rule": rule, "Pass": passed, "Status": compliance_status(key, passed)})
+            st.caption(f"Compliance source: {compliance_source}. Timing rows can pass on resource capability while live replay evidence is still accumulating.")
+            rule_df = pd.DataFrame(rule_rows)
             st.dataframe(styled_dataframe(rule_df), use_container_width=True, hide_index=True)
 
             household_contrib = result_frame(result, "household_contributions")

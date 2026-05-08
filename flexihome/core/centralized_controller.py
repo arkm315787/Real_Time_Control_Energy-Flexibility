@@ -12,6 +12,7 @@ import pandas as pd
 DEVICE_ORDER = ["BESS", "EV", "HVAC", "PV"]
 FCR_N_MIN_BID_KW = 100.0
 FCR_N_BID_GRANULARITY_KW = 100.0
+FCR_N_HVAC_SHARE_CAP = 0.20
 AFRR_MIN_BID_KW = 1000.0
 AFRR_BID_GRANULARITY_KW = 1000.0
 RECOVERY_PRIORITY = ["BESS", "EV", "HVAC", "PV"]
@@ -335,6 +336,7 @@ class CentralizedVPPController:
                     "recovery_mode": bool(recovery_mode),
                     "shortfall_kw": max(abs(request_now) - abs(delivered), 0.0),
                     "reserve_buffer_kw": float(plan.get("reserve_buffer_kw", 0.0)),
+                    "fast_bridge_used_kw": float(solution.get("fast_bridge_used_kw", 0.0)),
                     "buffer_used_kw": float(solution.get("buffer_used_kw", 0.0)),
                     "active_capacity_kw": float(solution.get("active_capacity_kw", 0.0)),
                     "buffer_capacity_kw": float(solution.get("buffer_capacity_kw", 0.0)),
@@ -557,6 +559,14 @@ class CentralizedVPPController:
         for key in keys:
             plan[key] = float(plan.get(key, 0.0)) * ratio
 
+    def _enforce_fcr_hvac_share_policy(self, plan: Dict[str, float]) -> None:
+        share_cap = float(np.clip(plan.get("fcr_hvac_share_cap", FCR_N_HVAC_SHARE_CAP), 0.0, 1.0))
+        if share_cap >= 0.999:
+            return
+        fast_fcr = float(plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0))
+        max_hvac_fcr = 0.0 if share_cap <= 0.0 else fast_fcr * share_cap / max(1.0 - share_cap, 1e-9)
+        plan["hvac_fcr_kw"] = min(float(plan.get("hvac_fcr_kw", 0.0)), max_hvac_fcr)
+
     def _snap_derated_plan_to_market_segments(self, plan: Dict[str, float]) -> None:
         """Keep selected-roster derating from creating non-biddable aggregates."""
 
@@ -564,6 +574,7 @@ class CentralizedVPPController:
         afrr_up_keys = ["bess_afrr_up_kw", "ev_afrr_up_kw", "hvac_afrr_up_kw"]
         afrr_down_keys = ["bess_afrr_down_kw", "ev_afrr_down_kw", "hvac_afrr_down_kw", "pv_afrr_down_kw"]
 
+        self._enforce_fcr_hvac_share_policy(plan)
         fcr_target = self._floor_market_segment(sum(float(plan.get(key, 0.0)) for key in fcr_keys), FCR_N_MIN_BID_KW, FCR_N_BID_GRANULARITY_KW)
         afrr_up_target = self._floor_market_segment(sum(float(plan.get(key, 0.0)) for key in afrr_up_keys), AFRR_MIN_BID_KW, AFRR_BID_GRANULARITY_KW)
         afrr_down_target = self._floor_market_segment(sum(float(plan.get(key, 0.0)) for key in afrr_down_keys), AFRR_MIN_BID_KW, AFRR_BID_GRANULARITY_KW)
@@ -600,6 +611,14 @@ class CentralizedVPPController:
         if resource_mode == "Fast only":
             requirements["HVAC"] = {"up": 0.0, "down": 0.0}
             requirements["PV"] = {"up": 0.0, "down": 0.0}
+        else:
+            hvac_alpha = self._response_alpha("HVAC")
+            slow_up_bridge = max(requirements["HVAC"]["up"] * (1.0 - hvac_alpha), 0.0)
+            slow_down_bridge = max(requirements["HVAC"]["down"] * (1.0 - hvac_alpha) + requirements["PV"]["down"] * 0.50, 0.0)
+            for device_type, weight in {"BESS": 0.65, "EV": 0.35}.items():
+                requirements[device_type]["up"] += slow_up_bridge * weight
+            for device_type, weight in {"BESS": 0.55, "EV": 0.45}.items():
+                requirements[device_type]["down"] += slow_down_bridge * weight
         return requirements
 
     def _buffer_requirements_by_type(
@@ -929,6 +948,29 @@ class CentralizedVPPController:
         delivered_by_type = self._delivered_from_commands(command_by_type, actual_before_by_type)
         predicted_power_kw = sum(delivered_by_type.values())
         fcr_predicted_power_kw, afrr_predicted_power_kw = split_predicted(predicted_power_kw)
+        fast_bridge_used_kw = 0.0
+
+        if request_abs > 0.001 and np.sign(request_now - predicted_power_kw) == sign:
+            bridge_remaining = abs(request_now - predicted_power_kw)
+            fast_order = ["BESS", "EV"] if direction == "up" else ["BESS", "EV", "PV"]
+            for device_type in fast_order:
+                headroom = max(float(active_caps[device_type][direction]) - active_abs[device_type], 0.0)
+                if headroom <= 0.001:
+                    continue
+                alpha = max(self._response_alpha(device_type), 1e-6)
+                command_kw = min(headroom, bridge_remaining / alpha)
+                if command_kw <= 0.001:
+                    continue
+                active_abs[device_type] += command_kw
+                command_by_type[device_type] += sign * command_kw
+                fast_bridge_used_kw += command_kw
+                bridge_remaining -= alpha * command_kw
+                if bridge_remaining <= 0.001:
+                    break
+            if fast_bridge_used_kw > 0.001:
+                delivered_by_type = self._delivered_from_commands(command_by_type, actual_before_by_type)
+                predicted_power_kw = sum(delivered_by_type.values())
+                fcr_predicted_power_kw, afrr_predicted_power_kw = split_predicted(predicted_power_kw)
 
         residual_kw = request_now - predicted_power_kw
         if recovery_mode and abs(residual_kw) > 0.001 and np.sign(residual_kw) == sign:
@@ -966,6 +1008,7 @@ class CentralizedVPPController:
             "afrr_predicted_power_kw": afrr_predicted_power_kw,
             "target_command_kw": target_command_kw,
             "tracking_delta_kw": request_now - sum(actual_before_by_type.values()),
+            "fast_bridge_used_kw": float(fast_bridge_used_kw),
             "buffer_used_kw": sum(buffer_abs.values()),
             "active_capacity_kw": sum(active_caps[device_type][direction] for device_type in DEVICE_ORDER),
             "buffer_capacity_kw": sum(buffer_caps[device_type][direction] for device_type in DEVICE_ORDER),

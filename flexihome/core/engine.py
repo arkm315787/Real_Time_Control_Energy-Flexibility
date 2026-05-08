@@ -805,14 +805,14 @@ def train_forecaster(
 
 def build_single_feature_row(frame: pd.DataFrame, row_idx: int, predictors: List[str], lags: int) -> pd.DataFrame:
     idx = frame.index[row_idx]
-    tff = time_feature_frame(pd.DatetimeIndex([idx]))
-    row = tff.iloc[[0]].copy()
+    values = time_feature_frame(pd.DatetimeIndex([idx])).iloc[0].to_dict()
+    current = frame.iloc[row_idx]
     for col in predictors:
-        row[col] = frame.iloc[row_idx][col]
+        values[col] = current[col]
         for lag in range(1, lags + 1):
             lag_pos = max(0, row_idx - lag)
-            row[f"{col}_lag{lag}"] = frame.iloc[lag_pos][col]
-    return row
+            values[f"{col}_lag{lag}"] = frame.iloc[lag_pos][col]
+    return pd.DataFrame([values], index=pd.DatetimeIndex([idx]))
 
 def train_default_mpc_models(df: pd.DataFrame, seed: int) -> Dict[str, ForecastSpec]:
     predictors = [
@@ -2086,6 +2086,14 @@ def run_mpc_controller(
         requested_down = interval_summary["requested_down_kw"]
         delivered_up = interval_summary["delivered_up_kw"]
         delivered_down = interval_summary["delivered_down_kw"]
+        fcr_up_frac_actual = float(row["fcr_up_act_frac"]) if market_mode in {"FCR-N", "Combined"} else 0.0
+        fcr_down_frac_actual = float(row["fcr_down_act_frac"]) if market_mode in {"FCR-N", "Combined"} else 0.0
+        actual_bess_afrr_up = max(actual_bess_up - fcr_up_frac_actual * float(plan.get("bess_fcr_kw", 0.0)), 0.0)
+        actual_bess_afrr_down = max(actual_bess_down - fcr_down_frac_actual * float(plan.get("bess_fcr_kw", 0.0)), 0.0)
+        actual_ev_afrr_up = max(actual_ev_up - fcr_up_frac_actual * float(plan.get("ev_fcr_kw", 0.0)), 0.0)
+        actual_ev_afrr_down = max(actual_ev_down - fcr_down_frac_actual * float(plan.get("ev_fcr_kw", 0.0)), 0.0)
+        actual_hvac_afrr_up = max(actual_hvac_up - actual_hvac_fcr_up, 0.0)
+        actual_hvac_afrr_down = max(actual_hvac_down - actual_hvac_fcr_down, 0.0)
 
         fcr_bid_kw = plan.get("bess_fcr_kw", 0.0) + plan.get("ev_fcr_kw", 0.0) + plan.get("hvac_fcr_kw", 0.0)
         afrr_up_bid_kw = plan.get("bess_afrr_up_kw", 0.0) + plan.get("ev_afrr_up_kw", 0.0) + plan.get("hvac_afrr_up_kw", 0.0)
@@ -2110,8 +2118,8 @@ def run_mpc_controller(
             + row["afrr_down_capacity_eur_per_mw_h"] * afrr_down_bid_kw
         )
         activation_revenue = dt_h / 1000.0 * (
-            row["afrr_up_energy_eur_per_mwh"] * (actual_bess_up + actual_ev_up + actual_hvac_up)
-            + row["afrr_down_energy_eur_per_mwh"] * (actual_bess_down + actual_ev_down + actual_hvac_down + actual_pv_down)
+            row["afrr_up_energy_eur_per_mwh"] * (actual_bess_afrr_up + actual_ev_afrr_up + actual_hvac_afrr_up)
+            + row["afrr_down_energy_eur_per_mwh"] * (actual_bess_afrr_down + actual_ev_afrr_down + actual_hvac_afrr_down + actual_pv_down)
         )
         degradation_cost = penalty_weights["degradation"] * dt_h / 1000.0 * (
             actual_bess_up + actual_bess_down + 0.4 * (actual_ev_up + actual_ev_down)
@@ -2183,6 +2191,12 @@ def run_mpc_controller(
                 "hvac_fcr_down_kw": actual_hvac_fcr_down,
                 "hvac_up_kw": actual_hvac_up,
                 "hvac_down_kw": actual_hvac_down,
+                "bess_afrr_up_delivered_kw": actual_bess_afrr_up,
+                "bess_afrr_down_delivered_kw": actual_bess_afrr_down,
+                "ev_afrr_up_delivered_kw": actual_ev_afrr_up,
+                "ev_afrr_down_delivered_kw": actual_ev_afrr_down,
+                "hvac_afrr_up_delivered_kw": actual_hvac_afrr_up,
+                "hvac_afrr_down_delivered_kw": actual_hvac_afrr_down,
                 "pv_down_kw": actual_pv_down,
                 "capacity_revenue_eur": capacity_revenue,
                 "activation_revenue_eur": activation_revenue,
@@ -2246,27 +2260,73 @@ def run_mpc_controller(
     if progress_callback:
         progress_callback(total_work, total_work, "Simulation finished")
 
-    resource_revenue = {
+    dt_h_result = float(df["dt_h"].iloc[0])
+    resource_capacity_revenue = {
         "BESS": float(
-            (result_df["bess_up_kw"] + result_df["bess_down_kw"]).sum() * result_df["activation_revenue_eur"].sum()
-            / max((result_df["delivered_up_kw"] + result_df["delivered_down_kw"]).sum(), 1.0)
-            + result_df["capacity_revenue_eur"].sum() * 0.34
+            (
+                result_df["fcrn_capacity_eur_per_mw_h"] * result_df["bess_fcr_kw"]
+                + result_df["afrr_up_capacity_eur_per_mw_h"] * result_df["bess_afrr_up_kw"]
+                + result_df["afrr_down_capacity_eur_per_mw_h"] * result_df["bess_afrr_down_kw"]
+            ).sum()
+            * dt_h_result
+            / 1000.0
         ),
         "EV": float(
-            (result_df["ev_up_kw"] + result_df["ev_down_kw"]).sum() * result_df["activation_revenue_eur"].sum()
-            / max((result_df["delivered_up_kw"] + result_df["delivered_down_kw"]).sum(), 1.0)
-            + result_df["capacity_revenue_eur"].sum() * 0.28
+            (
+                result_df["fcrn_capacity_eur_per_mw_h"] * result_df["ev_fcr_kw"]
+                + result_df["afrr_up_capacity_eur_per_mw_h"] * result_df["ev_afrr_up_kw"]
+                + result_df["afrr_down_capacity_eur_per_mw_h"] * result_df["ev_afrr_down_kw"]
+            ).sum()
+            * dt_h_result
+            / 1000.0
         ),
         "HVAC": float(
-            (result_df["hvac_up_kw"] + result_df["hvac_down_kw"]).sum() * result_df["activation_revenue_eur"].sum()
-            / max((result_df["delivered_up_kw"] + result_df["delivered_down_kw"]).sum(), 1.0)
-            + result_df["capacity_revenue_eur"].sum() * 0.24
+            (
+                result_df["fcrn_capacity_eur_per_mw_h"] * result_df["hvac_fcr_kw"]
+                + result_df["afrr_up_capacity_eur_per_mw_h"] * result_df["hvac_afrr_up_kw"]
+                + result_df["afrr_down_capacity_eur_per_mw_h"] * result_df["hvac_afrr_down_kw"]
+            ).sum()
+            * dt_h_result
+            / 1000.0
         ),
-        "PV": float(
-            result_df["pv_down_kw"].sum() * result_df["activation_revenue_eur"].sum()
-            / max((result_df["delivered_up_kw"] + result_df["delivered_down_kw"]).sum(), 1.0)
-            + result_df["capacity_revenue_eur"].sum() * 0.14
+        "PV": float((result_df["afrr_down_capacity_eur_per_mw_h"] * result_df["pv_afrr_down_kw"]).sum() * dt_h_result / 1000.0),
+    }
+    resource_activation_revenue = {
+        "BESS": float(
+            (
+                result_df["afrr_up_energy_eur_per_mwh"] * result_df.get("bess_afrr_up_delivered_kw", result_df["bess_up_kw"])
+                + result_df["afrr_down_energy_eur_per_mwh"] * result_df.get("bess_afrr_down_delivered_kw", result_df["bess_down_kw"])
+            ).sum()
+            * dt_h_result
+            / 1000.0
         ),
+        "EV": float(
+            (
+                result_df["afrr_up_energy_eur_per_mwh"] * result_df.get("ev_afrr_up_delivered_kw", result_df["ev_up_kw"])
+                + result_df["afrr_down_energy_eur_per_mwh"] * result_df.get("ev_afrr_down_delivered_kw", result_df["ev_down_kw"])
+            ).sum()
+            * dt_h_result
+            / 1000.0
+        ),
+        "HVAC": float(
+            (
+                result_df["afrr_up_energy_eur_per_mwh"] * result_df.get("hvac_afrr_up_delivered_kw", (result_df["hvac_up_kw"] - result_df["hvac_fcr_up_kw"]).clip(lower=0.0))
+                + result_df["afrr_down_energy_eur_per_mwh"] * result_df.get("hvac_afrr_down_delivered_kw", (result_df["hvac_down_kw"] - result_df["hvac_fcr_down_kw"]).clip(lower=0.0))
+            ).sum()
+            * dt_h_result
+            / 1000.0
+        ),
+        "PV": float((result_df["afrr_down_energy_eur_per_mwh"] * result_df["pv_down_kw"]).sum() * dt_h_result / 1000.0),
+    }
+    resource_revenue = {
+        resource: float(resource_capacity_revenue.get(resource, 0.0) + resource_activation_revenue.get(resource, 0.0))
+        for resource in ["BESS", "EV", "HVAC", "PV"]
+    }
+    resource_energy_kwh = {
+        "BESS": float((result_df["bess_up_kw"] + result_df["bess_down_kw"]).sum() * dt_h_result),
+        "EV": float((result_df["ev_up_kw"] + result_df["ev_down_kw"]).sum() * dt_h_result),
+        "HVAC": float((result_df["hvac_up_kw"] + result_df["hvac_down_kw"]).sum() * dt_h_result),
+        "PV": float(result_df["pv_down_kw"].sum() * dt_h_result),
     }
     accuracy_ratios = pd.concat([result_df["fcr_accuracy_ratio"].dropna(), result_df["down_accuracy_ratio"].dropna()])
     mean_accuracy = float(accuracy_ratios.mean()) if not accuracy_ratios.empty else np.nan
@@ -2387,16 +2447,23 @@ def run_mpc_controller(
         "activation_uncertainty_cost_eur": float(result_df.get("activation_uncertainty_cost_eur", pd.Series([0.0])).sum()),
         "asset_fatigue_cost_eur": float(result_df.get("asset_fatigue_cost_eur", pd.Series([0.0])).sum()),
         "risk_adjusted_profit_eur": float(result_df.get("risk_adjusted_profit_eur", pd.Series([0.0])).sum()),
-        "delivered_up_mwh": float(result_df["delivered_up_kw"].sum() * df["dt_h"].iloc[0] / 1000.0),
-        "delivered_down_mwh": float(result_df["delivered_down_kw"].sum() * df["dt_h"].iloc[0] / 1000.0),
-        "co2_avoided_kg": float(result_df["delivered_up_kw"].sum() * df["dt_h"].iloc[0] / 1000.0 * 140.0),
-        "comfort_violations_h": float((result_df["comfort_penalty_eur"] > 0).sum() * df["dt_h"].iloc[0]),
+        "delivered_up_mwh": float(result_df["delivered_up_kw"].sum() * dt_h_result / 1000.0),
+        "delivered_down_mwh": float(result_df["delivered_down_kw"].sum() * dt_h_result / 1000.0),
+        "co2_avoided_kg": float(result_df["delivered_up_kw"].sum() * dt_h_result / 1000.0 * 140.0),
+        "comfort_violations_h": float((result_df["comfort_penalty_eur"] > 0).sum() * dt_h_result),
         "requirement_score_pct": 100.0 * passed / max(total_checks, 1),
         "resource_revenue": resource_revenue,
+        "resource_capacity_revenue": resource_capacity_revenue,
+        "resource_activation_revenue": resource_activation_revenue,
+        "resource_energy_kwh": resource_energy_kwh,
         "risk_policy": str(penalty_weights.get("risk_policy", "investor_balanced")),
         "fast_vs_slow": {
             "Fast (BESS + EV)": float(resource_revenue["BESS"] + resource_revenue["EV"]),
             "Slow (HVAC + PV)": float(resource_revenue["HVAC"] + resource_revenue["PV"]),
+        },
+        "fast_vs_slow_energy_kwh": {
+            "Fast (BESS + EV)": float(resource_energy_kwh["BESS"] + resource_energy_kwh["EV"]),
+            "Slow (HVAC + PV)": float(resource_energy_kwh["HVAC"] + resource_energy_kwh["PV"]),
         },
         "inner_controller_mode": inner_controller_mode,
         "inner_dt_seconds": int(inner_dt_seconds),

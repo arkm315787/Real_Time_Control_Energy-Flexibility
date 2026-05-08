@@ -2108,6 +2108,7 @@ def main() -> None:
                     "active_capacity_kw",
                     "buffer_capacity_kw",
                     "buffer_used_kw",
+                    "fast_bridge_used_kw",
                     "recovery_mode",
                     "error_rising",
                     "control_latency_ms",
@@ -2163,7 +2164,7 @@ def main() -> None:
 
             charts = st.columns(3)
             revenue_fig = bar_comparison(s["resource_revenue"], "Revenue by resource")
-            fast_slow_fig = bar_comparison(s["fast_vs_slow"], "Fast vs slow contribution")
+            fast_slow_fig = bar_comparison(s["fast_vs_slow"], "Fast vs slow revenue contribution")
             energy_fig = bar_comparison(
                 {
                     "Up energy (MWh)": s["delivered_up_mwh"],
@@ -2239,7 +2240,7 @@ def main() -> None:
 
                 diagnostic_cols = [
                     col
-                    for col in ["tracking_error_kw", "tracking_tolerance_kw", "shortfall_kw", "buffer_used_kw"]
+                    for col in ["tracking_error_kw", "tracking_tolerance_kw", "shortfall_kw", "buffer_used_kw", "fast_bridge_used_kw"]
                     if col in tracking_window.columns
                 ]
                 if diagnostic_cols:

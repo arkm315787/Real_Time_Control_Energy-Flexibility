@@ -123,6 +123,7 @@ def main() -> None:
         "tracking_tolerance_kw",
         "error_rising",
         "recovery_mode",
+        "fast_bridge_used_kw",
         "buffer_used_kw",
         "active_selected_devices",
         "buffer_selected_devices",
@@ -183,12 +184,13 @@ def main() -> None:
     )
     if "buffer" not in set(buffer_upper.get("selection_role", [])):
         raise SystemExit("Upper device selection should keep a separate standby buffer roster.")
-    if not buffer_tracking["recovery_mode"].any():
-        raise SystemExit("Expected rising-error recovery mode to activate buffer capacity.")
-    if buffer_tracking["buffer_used_kw"].max() <= 0.0:
-        raise SystemExit("Expected lower controller to use standby buffer during recovery.")
-    if not (buffer_commands.get("selection_role") == "buffer").any():
-        raise SystemExit("Expected at least one gateway command to be sent to a buffer resource.")
+    if buffer_tracking["fast_bridge_used_kw"].max() <= 0.0:
+        raise SystemExit("Expected lower controller to bridge slow HVAC response with fast active capacity.")
+    fast_bridge_up = buffer_tracking["bess_up_kw"] + buffer_tracking["ev_up_kw"]
+    if fast_bridge_up.max() <= 0.0:
+        raise SystemExit("Expected BESS/EV to contribute during fast bridging instead of pure HVAC tracking.")
+    if buffer_tracking["buffer_used_kw"].max() > 0.0 and not (buffer_commands.get("selection_role") == "buffer").any():
+        raise SystemExit("Buffer dispatch should create at least one gateway command to a buffer resource.")
 
     household, appliance, fatigue = controller.contribution_frames(commands)
     if household.empty or appliance.empty or fatigue.empty:

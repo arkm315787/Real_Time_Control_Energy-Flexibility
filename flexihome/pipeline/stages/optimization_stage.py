@@ -46,6 +46,7 @@ class OptimizationStage(BasePipelineStage):
             "n_hvac": int(summary.get("n_hvac", 0)),
             "hvac_mode": self.config.hvac_mode,
             "hvac_response_s": float(hvac_response_s),
+            "fcr_hvac_share_cap": float(self.config.fcr_hvac_share_cap),
         }
         result = run_mpc_controller(
             df=context.data,

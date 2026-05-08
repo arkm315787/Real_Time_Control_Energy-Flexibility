@@ -33,7 +33,9 @@ Forecasting models
   - aggregate resource allocation
   - revenue, degradation, comfort, and state penalties
   - response-time eligibility for each market product
-  - risk quantile, reserve buffer, non-delivery, activation uncertainty, and asset fatigue costs
+  - risk quantile and reserve buffer for physical derating
+  - degradation, comfort, and asset-fatigue costs in the optimizer
+  - non-delivery and activation-volatility costs reported for audit
         |
         v
 Usage-aware household/appliance selection
@@ -53,7 +55,7 @@ Centralized 4-second lower MPC
   - requested vs delivered reserve trace
 ```
 
-The lower layer is implemented as a one-step proportional tracking allocator, not a second scheduler. The dashboard does not run it automatically: first run the upper MPC layer, start the independent Market Pressure process, and then arm the centralized 4-second tracker. If the lower MPC is armed before the market start timestamp, it waits until the live market clock begins before attaching. The upper layer selects an active resource roster and a standby buffer roster from devices that satisfy availability, response-time, energy, usage, and cooldown limits. The executable plan is derated to the selected active roster when a paper bid exceeds physically selected capacity. Every 4-second tick, the lower layer clips the TSO request to the committed product limit, then distributes the request proportionally across the active BESS, EV, HVAC, and PV pools. If the predicted tracking error exceeds the 10% tolerance and is rising, the lower layer enters recovery mode and allocates the residual error to standby buffer capacity using fast-resource priority: BESS, then EV, then PV, then HVAC.
+The lower layer is implemented as a one-step proportional tracking allocator, not a second scheduler. The dashboard does not run it automatically: first run the upper MPC layer, start the independent Market Pressure process, and then arm the centralized 4-second tracker. If the lower MPC is armed before the market start timestamp, it waits until the live market clock begins before attaching. The upper layer selects an active resource roster and a standby buffer roster from devices that satisfy availability, response-time, energy, usage, and cooldown limits. The executable plan is derated to the selected active roster when a paper bid exceeds physically selected capacity. Every 4-second tick, the lower layer clips the TSO request to the committed product limit, then distributes the request proportionally across the active BESS, EV, HVAC, and PV pools. If the predicted tracking error exceeds the 10% tolerance and is rising, the lower layer enters recovery mode and allocates the residual error to standby buffer capacity using fast-resource priority: BESS, then EV, then HVAC, then PV.
 
 ## Implemented Plan Status
 

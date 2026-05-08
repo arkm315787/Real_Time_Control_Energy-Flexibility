@@ -77,7 +77,7 @@ def portfolio_kwargs(config: PortfolioConfig) -> Dict:
     return payload
 
 
-def fleet_meta_from_bundle(bundle: Dict, config: PortfolioConfig) -> Dict[str, float]:
+def fleet_meta_from_bundle(bundle: Dict, config: PortfolioConfig, fcr_hvac_share_cap: float = 0.20) -> Dict[str, float]:
     df = bundle["data"]
     hvac_response_s = config.hvac_response_s or default_hvac_response_seconds(config.hvac_mode)
     return {
@@ -87,6 +87,7 @@ def fleet_meta_from_bundle(bundle: Dict, config: PortfolioConfig) -> Dict[str, f
         "n_hvac": int(bundle["summary"]["n_hvac"]),
         "hvac_mode": config.hvac_mode,
         "hvac_response_s": float(hvac_response_s),
+        "fcr_hvac_share_cap": float(fcr_hvac_share_cap),
     }
 
 
@@ -107,7 +108,7 @@ def run_optimization_job(
         result = run_mpc_controller(
             df=df,
             models=models,
-            fleet_meta=fleet_meta_from_bundle(bundle, request.portfolio_config),
+            fleet_meta=fleet_meta_from_bundle(bundle, request.portfolio_config, request.fcr_hvac_share_cap),
             market_mode=request.market_mode,
             resource_mode=request.resource_mode,
             horizon_hours=float(request.horizon_hours),
@@ -116,6 +117,7 @@ def run_optimization_job(
                 "degradation": float(request.degradation_weight),
                 "comfort": float(request.comfort_weight),
                 "departure": float(request.departure_weight),
+                "risk_policy": str(request.risk_policy),
                 "risk_quantile": float(request.risk_quantile),
                 "reserve_buffer_pct": float(request.reserve_buffer_pct),
                 "non_delivery": float(request.non_delivery_penalty),

@@ -31,6 +31,13 @@ def constant_signal(start, periods: int = 3) -> pd.DataFrame:
     )
 
 
+def combined_up_signal(start, periods: int = 3) -> pd.DataFrame:
+    signals = constant_signal(start, periods)
+    signals["afrr_signal_norm"] = 1.0
+    signals["afrr_up_act_frac"] = 1.0
+    return signals
+
+
 def make_bundle(n_homes: int = 40):
     return generate_synthetic_portfolio(
         start_date="2026-01-15",
@@ -213,14 +220,19 @@ def main() -> None:
     )
     combined_summary, combined_tracking, _, _ = controller.execute_interval(
         row=df.iloc[1],
-        fine_signals=constant_signal(df.index[1]),
+        fine_signals=combined_up_signal(df.index[1]),
         plan=combined_plan,
         interval_index=3,
         market_mode="Combined",
         resource_mode="Fast only",
     )
+    expected_combined_socket_kw = combined_plan["bess_fcr_kw"] + combined_plan["bess_afrr_up_kw"]
+    if abs(float(combined_tracking["committed_up_kw"].max()) - expected_combined_socket_kw) > 1e-6:
+        raise SystemExit("Combined product socket must equal FCR plus aFRR in the same direction.")
+    if combined_tracking["requested_up_kw"].max() < expected_combined_socket_kw - 1e-6:
+        raise SystemExit("Combined product request should not be silently shrunk to max(FCR, aFRR).")
     if combined_tracking["requested_up_kw"].max() > combined_tracking["committed_up_kw"].max() + 1e-6:
-        raise SystemExit("Combined product request should be clipped to committed reserve, not FCR plus aFRR.")
+        raise SystemExit("Combined product request should be clipped to the summed committed reserve.")
 
     rotation_bundle = make_bundle(n_homes=12)
     rotation_roster = rotation_bundle["device_roster"].copy()

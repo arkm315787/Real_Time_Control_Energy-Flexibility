@@ -96,7 +96,24 @@ def main() -> None:
         raise SystemExit(f"Expected a 30-minute dispatch window to produce 2 intervals, got {len(history)}")
     if not upper_only["tracking_4s"].empty:
         raise SystemExit("Upper-only market decision must not run the lower 4-second MPC.")
-    required_cols = {"risk_adjusted_profit_eur", "non_delivery_risk_cost_eur", "market_gate_status", "reserve_buffer_kw"}
+    required_cols = {
+        "risk_adjusted_profit_eur",
+        "non_delivery_risk_cost_eur",
+        "market_gate_status",
+        "reserve_buffer_kw",
+        "bid_block_start",
+        "bid_block_end",
+        "fcr_bid_mw",
+        "afrr_up_bid_mw",
+        "afrr_down_bid_mw",
+        "fcr_bid_segments",
+        "afrr_up_segments",
+        "afrr_down_segments",
+        "stacking_ok",
+        "energy_endurance_ok",
+        "granularity_ok",
+        "simulation_only_notice",
+    }
     if not required_cols.issubset(history.columns):
         raise SystemExit(f"Missing risk-aware upper MPC columns: {sorted(required_cols - set(history.columns))}")
     dynamic_cols = {"hvac_fcr_dynamic_cap_kw", "fcr_response_60_fraction", "fcr_response_180_fraction", "fcr_energy_60_seconds", "fcr_dynamic_response_ok"}
@@ -185,15 +202,27 @@ def main() -> None:
     if avail["bess_down_av"] > 1e-6:
         raise SystemExit("A full BESS must not provide downward charging headroom.")
 
-    afrr_only_gate = _market_gate_decision({"bess_afrr_up_kw": 1200.0, "risk_adjusted_profit_eur": 5.0}, "Combined")
+    afrr_only_gate = _market_gate_decision({"bess_afrr_up_kw": 1000.0, "risk_adjusted_profit_eur": 5.0}, "Combined")
     if afrr_only_gate["market_gate_status"] != "Participate":
         raise SystemExit("Combined market mode must allow an aFRR-only bid that clears the aFRR minimum.")
+    fcr_min_gate = _market_gate_decision({"bess_fcr_kw": 100.0, "risk_adjusted_profit_eur": 1.0}, "Combined")
+    if fcr_min_gate["market_gate_status"] != "Participate":
+        raise SystemExit("Combined market mode must allow a 0.1 MW FCR-N bid.")
     fcr_only_gate = _market_gate_decision({"bess_fcr_kw": 200.0, "risk_adjusted_profit_eur": 1.0}, "Combined")
     if fcr_only_gate["market_gate_status"] != "Participate":
         raise SystemExit("Combined market mode must allow an FCR-only bid that clears the FCR-N minimum.")
     misaligned_fcr_gate = _market_gate_decision({"bess_fcr_kw": 120.0, "risk_adjusted_profit_eur": 1.0}, "Combined")
     if misaligned_fcr_gate["market_gate_status"] != "Wait":
         raise SystemExit("Combined market mode must reject FCR-N bids that miss the 0.1 MW granularity.")
+    misaligned_afrr_gate = _market_gate_decision({"bess_afrr_up_kw": 1200.0, "risk_adjusted_profit_eur": 5.0}, "Combined")
+    if misaligned_afrr_gate["market_gate_status"] != "Wait":
+        raise SystemExit("Combined market mode must reject aFRR bids that miss the 1 MW granularity.")
+    mixed_invalid_gate = _market_gate_decision({"bess_fcr_kw": 100.0, "bess_afrr_up_kw": 1200.0, "risk_adjusted_profit_eur": 5.0}, "Combined")
+    if mixed_invalid_gate["market_gate_status"] != "Wait":
+        raise SystemExit("Combined market mode must not accept a valid FCR-N bid while a nonzero aFRR bid is misaligned.")
+    afrr_below_min_gate = _market_gate_decision({"bess_afrr_up_kw": 900.0, "risk_adjusted_profit_eur": 5.0}, "Combined")
+    if afrr_below_min_gate["market_gate_status"] != "Wait":
+        raise SystemExit("Combined market mode must reject aFRR bids below the 1 MW minimum.")
     hvac_share_gate = _market_gate_decision(
         {
             "bess_fcr_kw": 100.0,

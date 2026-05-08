@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 MarketMode = Literal["FCR-N", "aFRR", "Combined"]
 ResourceMode = Literal["Fast only", "Hybrid portfolio"]
 HvacMode = Literal["Conventional / thermostat-led", "Inverter / variable-speed"]
+RiskPolicy = Literal["investor_balanced", "technical_conservative", "stress_test"]
 OptimizationStatus = Literal["queued", "running", "completed", "failed"]
 
 
@@ -51,14 +52,16 @@ class OptimizationRequest(BaseModel):
     execute_lower_mpc: bool = True
     horizon_hours: float = Field(2.0, ge=0.25, le=72)
     dispatch_hours: float = Field(4.0, ge=0.25, le=168)
+    risk_policy: RiskPolicy = "investor_balanced"
+    fcr_hvac_share_cap: float = Field(0.20, ge=0.0, le=1.0, description="Comfort-policy cap for HVAC share of FCR-N capacity; not a Fingrid rule.")
     portfolio_config: PortfolioConfig = Field(default_factory=PortfolioConfig)
     degradation_weight: float = Field(35.0, ge=0.0, description="Battery wear cost in EUR/MWh of activated storage throughput.")
     comfort_weight: float = Field(480.0, ge=0.0, description="Indoor comfort violation cost in EUR/degC-hour.")
     departure_weight: float = Field(1000.0, ge=0.0, description="EV missing-energy penalty in EUR/MWh of departure shortfall.")
     risk_quantile: float = Field(0.80, ge=0.50, le=0.95)
     reserve_buffer_pct: float = Field(0.08, ge=0.0, le=0.40)
-    non_delivery_penalty: float = Field(900.0, ge=0.0, description="Expected non-delivery penalty or risk premium in EUR/MWh.")
-    activation_uncertainty_weight: float = Field(100.0, ge=0.0, description="Activation-volatility cost in EUR/MWh-equivalent.")
+    non_delivery_penalty: float = Field(900.0, ge=0.0, description="Audit-only non-delivery exposure in EUR/MWh; not a bid-killing objective term.")
+    activation_uncertainty_weight: float = Field(100.0, ge=0.0, description="Audit-only activation-volatility exposure in EUR/MWh-equivalent.")
     asset_fatigue_weight: float = Field(75.0, ge=0.0, description="Customer/device fatigue cost in EUR/MWh-equivalent.")
 
 

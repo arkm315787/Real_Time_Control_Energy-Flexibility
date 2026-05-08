@@ -34,6 +34,8 @@ from flexihome.core.base.registry import get_global_registry
 from flexihome.core.engine import (
     FINGRID_RULES,
     HVAC_MODES,
+    RISK_POLICY_PRESETS,
+    SIMULATION_ONLY_NOTICE,
     SUPPORTED_MPC_TARGETS,
     bode_points,
     default_hvac_response_seconds,
@@ -842,11 +844,12 @@ def main() -> None:
         )
         hvac_response_default = default_hvac_response_seconds(hvac_mode_input)
         hvac_response_s_input = st.slider(
-            "Inverter HVAC electrical response (s)" if hvac_mode_input == HVAC_MODES[1] else "HVAC electrical response (s)",
-            2.0,
-            180.0,
-            float(scenario_defaults.get("hvac_response_s", hvac_response_default)),
+            "Delivered HVAC response time (s)",
+            20.0,
+            300.0,
+            float(np.clip(float(scenario_defaults.get("hvac_response_s", hvac_response_default)), 20.0, 300.0)),
             1.0,
+            help="Delivered aggregate response used for FCR-N dynamic-cap screening, not just command latency.",
         )
 
         st.header("Synthetic Finland Context")
@@ -1388,6 +1391,7 @@ def main() -> None:
 
     with tabs[4]:
         st.subheader("MPC Optimizer & Market Participation")
+        st.info(SIMULATION_ONLY_NOTICE)
         st.caption(
             f"The outer MPC, synthetic portfolio, and forecasting loop run at a {freq_minutes}-minute interval. "
             "First run the upper MPC socket, then start market pressure, then arm the lower 4-second MPC against the live market clock."
@@ -1434,45 +1438,44 @@ def main() -> None:
             50.0,
             help="Penalty for missing EV required energy. One MWh equals 1000 kWh, so 1000 EUR/MWh is 1 EUR/kWh short.",
         )
-        risk_profiles = {
-            "Balanced P70": {"quantile": 0.70, "buffer": 0.06, "penalty": 500.0},
-            "Conservative P80": {"quantile": 0.80, "buffer": 0.10, "penalty": 900.0},
-            "Defensive P90": {"quantile": 0.90, "buffer": 0.16, "penalty": 1500.0},
-            "Opportunistic P60": {"quantile": 0.60, "buffer": 0.03, "penalty": 300.0},
-        }
-        r1, r2, r3, r4 = st.columns(4)
-        risk_profile = r1.selectbox("Bid risk policy", list(risk_profiles), index=1)
-        risk_defaults = risk_profiles[risk_profile]
-        risk_quantile = r2.slider("Reliable bid quantile", 0.50, 0.95, float(risk_defaults["quantile"]), 0.05)
-        reserve_buffer_pct = r3.slider("Reserve buffer", 0.0, 0.30, float(risk_defaults["buffer"]), 0.01)
-        r4.caption("Delivery failure exposure. Unit: EUR/MWh.")
-        non_delivery_penalty = r4.slider(
-            "Non-delivery cost (EUR/MWh)",
-            0.0,
-            3000.0,
-            float(risk_defaults["penalty"]),
-            50.0,
-            help="Expected market penalty/risk premium for reserve capacity that may not be delivered.",
+        risk_policy_labels = {values["label"]: key for key, values in RISK_POLICY_PRESETS.items()}
+        risk_label = st.selectbox("Bid risk policy", list(risk_policy_labels), index=0)
+        risk_policy = risk_policy_labels[risk_label]
+        risk_defaults = RISK_POLICY_PRESETS[risk_policy]
+        st.caption(
+            f"{risk_label}: P{int(float(risk_defaults['risk_quantile']) * 100)} deliverability, "
+            f"{100 * float(risk_defaults['reserve_buffer_pct']):.0f}% reserve buffer. "
+            "Non-delivery and activation-volatility values are reported as audit exposure, not used to kill bids."
         )
-        rr1, rr2 = st.columns(2)
-        rr1.caption("Activation signal volatility. Unit: EUR/MWh-equivalent.")
-        activation_uncertainty_w = rr1.slider(
-            "Activation volatility cost (EUR/MWh-eq)",
-            0.0,
-            500.0,
-            100.0,
-            10.0,
-            help="Heuristic cost for uncertain activation intensity. Higher values reduce bids during volatile signal periods.",
-        )
-        rr2.caption("Repeated customer/device use. Unit: EUR/MWh-equivalent.")
-        asset_fatigue_w = rr2.slider(
-            "Customer fatigue cost (EUR/MWh-eq)",
-            0.0,
-            500.0,
-            75.0,
-            5.0,
-            help="Heuristic cost for repeated use of customer devices. Resource multipliers are BESS 1.00, EV 0.65, HVAC 0.45, PV 0.20.",
-        )
+        with st.expander("Advanced risk controls"):
+            r2, r3, r4 = st.columns(3)
+            risk_quantile = r2.slider("Reliable bid quantile", 0.50, 0.95, float(risk_defaults["risk_quantile"]), 0.05)
+            reserve_buffer_pct = r3.slider("Reserve buffer", 0.0, 0.30, float(risk_defaults["reserve_buffer_pct"]), 0.01)
+            non_delivery_penalty = r4.slider(
+                "Non-delivery audit cost (EUR/MWh)",
+                0.0,
+                3000.0,
+                float(risk_defaults["non_delivery"]),
+                50.0,
+                help="Audit exposure for reserve capacity that may not be delivered. It is reported, not subtracted inside the bid objective.",
+            )
+            rr1, rr2 = st.columns(2)
+            activation_uncertainty_w = rr1.slider(
+                "Activation volatility audit cost (EUR/MWh-eq)",
+                0.0,
+                500.0,
+                float(risk_defaults["activation_uncertainty"]),
+                10.0,
+                help="Audit exposure for uncertain activation intensity. It is reported, not subtracted inside the bid objective.",
+            )
+            asset_fatigue_w = rr2.slider(
+                "Customer fatigue cost (EUR/MWh-eq)",
+                0.0,
+                500.0,
+                float(risk_defaults["asset_fatigue"]),
+                5.0,
+                help="Objective cost for repeated use of customer devices. Resource multipliers are BESS 1.00, EV 0.65, HVAC 0.45, PV 0.20.",
+            )
         forecaster_plugins = PLUGIN_REGISTRY.list_forecasters()
         optimizer_plugins = PLUGIN_REGISTRY.list_optimizers()
         p1, p2 = st.columns(2)
@@ -1492,7 +1495,7 @@ def main() -> None:
         st.caption(
             f"Upper MPC checks {int(max(round(horizon_hours / (freq_minutes / 60.0)), 1))} forecast/control step(s) per horizon and "
             f"{int(max(round(dispatch_hours / (freq_minutes / 60.0)), 1))} market interval(s) over the selected simulation window. "
-            f"{risk_profile} means the bid is derated toward P{int(risk_quantile * 100)} deliverability before market participation is accepted."
+            f"{risk_label} means the bid is derated toward P{int(risk_quantile * 100)} deliverability before market participation is accepted."
         )
         live_market_session = st.session_state.get("live_market_session", {})
         market_status = live_market_status(live_market_session)
@@ -1536,6 +1539,7 @@ def main() -> None:
             "degradation": degradation_w,
             "comfort": comfort_w,
             "departure": departure_w,
+            "risk_policy": risk_policy,
             "risk_quantile": risk_quantile,
             "reserve_buffer_pct": reserve_buffer_pct,
             "non_delivery": non_delivery_penalty,
@@ -1556,6 +1560,7 @@ def main() -> None:
                     "n_hvac": summary["n_hvac"],
                     "hvac_mode": hvac_mode,
                     "hvac_response_s": hvac_response_s,
+                    "fcr_hvac_share_cap": 0.20,
                 }
                 st.session_state["mpc_config"] = {
                     "market_mode": market_mode,
@@ -1566,7 +1571,8 @@ def main() -> None:
                     "dispatch_minutes": dispatch_minutes,
                     "forecaster_plugin": mpc_forecaster_plugin,
                     "optimizer_plugin": optimizer_plugin,
-                    "risk_profile": risk_profile,
+                    "risk_policy": risk_policy,
+                    "risk_profile": risk_label,
                     "risk_quantile": risk_quantile,
                     "reserve_buffer_pct": reserve_buffer_pct,
                     "non_delivery_penalty": non_delivery_penalty,
@@ -1834,6 +1840,28 @@ def main() -> None:
                 dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=upper_plot_df["afrr_down_bid_kw"] / 1000.0, name="aFRR down bid", stackgroup="two"))
                 dispatch_fig.update_layout(yaxis_title="MW")
                 st.plotly_chart(apply_chart_style(dispatch_fig, template, height=400, title="Upper MPC reserve socket"), use_container_width=True)
+                waterfall_cols = {"raw_fcr_symmetric_kw", "fcr_dynamic_cap_total_kw", "fcr_energy_cap_total_kw", "reserve_buffer_kw", "fcr_bid_kw"}
+                if waterfall_cols.issubset(upper_plot_df.columns):
+                    raw_kw = float(upper_plot_df["raw_fcr_symmetric_kw"].mean())
+                    dynamic_kw = min(raw_kw, float(upper_plot_df["fcr_dynamic_cap_total_kw"].mean()))
+                    energy_kw = min(dynamic_kw, float(upper_plot_df["fcr_energy_cap_total_kw"].mean()))
+                    buffer_kw = float(upper_plot_df["reserve_buffer_kw"].mean())
+                    granular_kw = float(upper_plot_df["fcr_bid_kw"].mean())
+                    bid_waterfall = go.Figure(
+                        go.Waterfall(
+                            measure=["absolute", "relative", "relative", "relative", "absolute"],
+                            x=["Raw symmetric", "Dynamic cap", "Energy cap", "Risk buffer", "Final bid"],
+                            y=[
+                                raw_kw / 1000.0,
+                                (dynamic_kw - raw_kw) / 1000.0,
+                                (energy_kw - dynamic_kw) / 1000.0,
+                                -buffer_kw / 1000.0,
+                                granular_kw / 1000.0,
+                            ],
+                        )
+                    )
+                    bid_waterfall.update_layout(yaxis_title="MW")
+                    st.plotly_chart(apply_chart_style(bid_waterfall, template, height=320, title="Why the FCR-N bid was reduced"), use_container_width=True)
                 bidirectional_rows = []
                 for resource, fcr_col, up_col, down_col in [
                     ("BESS", "bess_fcr_kw", "bess_afrr_up_kw", "bess_afrr_down_kw"),
@@ -2277,6 +2305,7 @@ def main() -> None:
                             "n_hvac": summary["n_hvac"],
                             "hvac_mode": hvac_mode,
                             "hvac_response_s": hvac_response_s,
+                            "fcr_hvac_share_cap": 0.20,
                         },
                         mpc_config["market_mode"],
                         mpc_config["resource_mode"],
@@ -2286,6 +2315,7 @@ def main() -> None:
                             "degradation": degradation_w,
                             "comfort": comfort_w,
                             "departure": departure_w,
+                            "risk_policy": str(mpc_config.get("risk_policy", "investor_balanced")),
                             "risk_quantile": float(mpc_config.get("risk_quantile", 0.80)),
                             "reserve_buffer_pct": float(mpc_config.get("reserve_buffer_pct", 0.08)),
                             "non_delivery": float(mpc_config.get("non_delivery_penalty", 900.0)),

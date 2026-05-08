@@ -165,6 +165,8 @@ class PipelineRunConfig:
     resource_mode: str = "Hybrid portfolio"
     horizon_hours: float = 1
     dispatch_hours: float = 1
+    risk_policy: str = "investor_balanced"
+    fcr_hvac_share_cap: float = 0.20
     degradation_weight: float = 35.0
     comfort_weight: float = 480.0
     departure_weight: float = 1000.0
@@ -208,6 +210,7 @@ class PipelineRunConfig:
             "degradation": float(self.degradation_weight),
             "comfort": float(self.comfort_weight),
             "departure": float(self.departure_weight),
+            "risk_policy": str(self.risk_policy),
             "risk_quantile": float(self.risk_quantile),
             "reserve_buffer_pct": float(self.reserve_buffer_pct),
             "non_delivery": float(self.non_delivery_penalty),

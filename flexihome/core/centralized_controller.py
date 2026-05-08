@@ -734,8 +734,8 @@ class CentralizedVPPController:
             up_limit = afrr_up
             down_limit = afrr_down
         else:
-            up_limit = max(fcr_bid, afrr_up)
-            down_limit = max(fcr_bid, afrr_down)
+            up_limit = fcr_bid + afrr_up
+            down_limit = fcr_bid + afrr_down
         return float(max(up_limit, 0.0)), float(max(down_limit, 0.0))
 
     def _response_alpha(self, device_type: str) -> float:

@@ -20,6 +20,12 @@ from flexihome.core.engine import (
     run_mpc_controller,
 )
 
+PRICE_TARGETS = {
+    "fcrn_capacity_eur_per_mw_h",
+    "afrr_up_capacity_eur_per_mw_h",
+    "afrr_down_capacity_eur_per_mw_h",
+}
+
 
 class PersistenceForecaster:
     def __init__(self, target: str, predictors: list[str]) -> None:
@@ -28,7 +34,22 @@ class PersistenceForecaster:
         self.lags = 1
 
     def predict(self, row: pd.DataFrame, horizon_steps: int = 1):
-        return [float(row[self.target].iloc[0])]
+        prediction = pd.Series([float(row[self.target].iloc[0])], index=row.index, name="prediction")
+        if self.target not in PRICE_TARGETS:
+            return prediction
+        uncertainty = pd.DataFrame(
+            {
+                "p05": prediction * 0.60,
+                "p10": prediction * 0.70,
+                "p20": prediction * 0.80,
+                "p50": prediction,
+                "p80": prediction * 1.10,
+                "p90": prediction * 1.18,
+                "p95": prediction * 1.25,
+            },
+            index=row.index,
+        )
+        return prediction, uncertainty
 
 
 def make_models(df: pd.DataFrame):
@@ -123,6 +144,11 @@ def main() -> None:
         "energy_endurance_ok",
         "granularity_ok",
         "simulation_only_notice",
+        "price_forecast_mode",
+        "price_bid_quantile",
+        "fcrn_capacity_bid_eur_per_mw_h",
+        "afrr_up_capacity_bid_eur_per_mw_h",
+        "afrr_down_capacity_bid_eur_per_mw_h",
     }
     if not required_cols.issubset(history.columns):
         raise SystemExit(f"Missing risk-aware upper MPC columns: {sorted(required_cols - set(history.columns))}")
@@ -141,6 +167,12 @@ def main() -> None:
         raise SystemExit("Audited Combined up socket must cover FCR plus aFRR up.")
     if (history["socket_down_kw"] + 1e-6 < history["fcr_bid_kw"] + history["afrr_down_bid_kw"]).any():
         raise SystemExit("Audited Combined down socket must cover FCR plus aFRR down.")
+    if (history["price_forecast_mode"] != "quantile").any():
+        raise SystemExit("Price-sensitive MPC run must consume quantile price forecasts, not deterministic point prices.")
+    if (abs(history["price_bid_quantile"] - 0.20) > 1e-9).any():
+        raise SystemExit("P80 risk policy must use the conservative P20 price forecast in the optimizer objective.")
+    if (history["fcrn_capacity_bid_eur_per_mw_h"] > history["fcrn_capacity_eur_per_mw_h"] + 1e-6).any():
+        raise SystemExit("Conservative FCR-N bid price forecast must not exceed the point price in this synthetic smoke.")
 
     lower_from_socket = run_lower_mpc_from_upper_result(
         df=df,

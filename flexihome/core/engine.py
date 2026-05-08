@@ -110,6 +110,12 @@ PREQUALIFICATION_PREP_NOTICE = (
     "Simulation screening only; formal Fingrid prequalification still requires approved test data, "
     "measurement evidence, telemetry, baseline validation, settlement setup, and TSO review."
 )
+FORECAST_QUANTILES = (0.05, 0.10, 0.20, 0.50, 0.80, 0.90, 0.95)
+PRICE_FORECAST_TARGETS = {
+    "fcrn_capacity_eur_per_mw_h",
+    "afrr_up_capacity_eur_per_mw_h",
+    "afrr_down_capacity_eur_per_mw_h",
+}
 
 RISK_POLICY_PRESETS = {
     "investor_balanced": {
@@ -154,6 +160,7 @@ class ForecastSpec:
     horizon_steps: int
     model: XGBRegressor
     metrics: Dict[str, float]
+    residual_quantiles: Dict[str, float] | None = None
 
 def hvac_fast_fraction(hvac_mode: str) -> float:
     return float(HVAC_FAST_FRACTION.get(hvac_mode, HVAC_FAST_FRACTION[HVAC_MODES[0]]))
@@ -1233,7 +1240,22 @@ def train_forecaster(
         "rmse": float(np.sqrt(mean_squared_error(y_test, pred))),
     }
     comparison = pd.DataFrame({"actual": y_test, "prediction": pred})
-    spec = ForecastSpec(target=target, predictors=predictors, lags=lags, horizon_steps=horizon_steps, model=model, metrics=metrics)
+    residuals = (pd.Series(y_test, index=pred.index).astype(float) - pred.astype(float)).dropna()
+    residual_quantiles = {
+        f"p{int(round(q * 100)):02d}": float(np.nanquantile(residuals.to_numpy(dtype=float), q)) if not residuals.empty else 0.0
+        for q in FORECAST_QUANTILES
+    }
+    for label, residual in residual_quantiles.items():
+        comparison[f"prediction_{label}"] = pred + residual
+    spec = ForecastSpec(
+        target=target,
+        predictors=predictors,
+        lags=lags,
+        horizon_steps=horizon_steps,
+        model=model,
+        metrics=metrics,
+        residual_quantiles=residual_quantiles,
+    )
     return spec, comparison
 
 def build_single_feature_row(frame: pd.DataFrame, row_idx: int, predictors: List[str], lags: int) -> pd.DataFrame:
@@ -1267,6 +1289,67 @@ def train_default_mpc_models(df: pd.DataFrame, seed: int) -> Dict[str, ForecastS
         registry[target] = spec
     return registry
 
+
+def _forecast_quantile_label(quantile: float) -> str:
+    return f"p{int(round(float(quantile) * 100)):02d}"
+
+
+def _forecast_quantile_column(target: str, quantile: float) -> str:
+    return f"{target}_forecast_{_forecast_quantile_label(quantile)}"
+
+
+def _coerce_uncertainty_frame(uncertainty: Any, index: pd.Index) -> pd.DataFrame:
+    if uncertainty is None:
+        return pd.DataFrame(index=index)
+    if isinstance(uncertainty, pd.Series):
+        return uncertainty.to_frame()
+    if isinstance(uncertainty, pd.DataFrame):
+        return uncertainty.reindex(index)
+    array = np.asarray(uncertainty)
+    if array.ndim == 1:
+        return pd.DataFrame({"p50": array}, index=index)
+    return pd.DataFrame(array, index=index)
+
+
+def _predict_one_step_with_uncertainty(spec: Any, row: pd.DataFrame) -> tuple[float, Dict[str, float]]:
+    predict_fn = getattr(spec, "predict", None)
+    uncertainty = None
+    if callable(predict_fn):
+        payload = predict_fn(row, horizon_steps=1)
+        if isinstance(payload, tuple):
+            predictions, uncertainty = payload
+        else:
+            predictions = payload
+        if isinstance(predictions, pd.Series):
+            point = float(predictions.iloc[0])
+        else:
+            values = np.asarray(predictions).reshape(-1)
+            point = float(values[0])
+    else:
+        point = float(spec.model.predict(row)[0])
+
+    quantiles: Dict[str, float] = {}
+    uncertainty_frame = _coerce_uncertainty_frame(uncertainty, row.index)
+    if not uncertainty_frame.empty:
+        first = uncertainty_frame.iloc[0]
+        for column, value in first.items():
+            label = str(column)
+            if label.startswith("prediction_"):
+                label = label.replace("prediction_", "", 1)
+            if label.startswith("p") and pd.notna(value):
+                quantiles[label] = float(value)
+
+    residual_quantiles = getattr(spec, "residual_quantiles", None) or {}
+    for label, residual in dict(residual_quantiles).items():
+        label = str(label)
+        if label.startswith("p") and label not in quantiles:
+            quantiles[label] = float(point + float(residual))
+
+    if "p50" not in quantiles:
+        quantiles["p50"] = point
+    return point, quantiles
+
+
 def iterative_forecast(
     df: pd.DataFrame,
     current_pos: int,
@@ -1286,23 +1369,17 @@ def iterative_forecast(
         for target in targets:
             spec = models[target]
             row = build_single_feature_row(future_slice, base_pos, spec.predictors, spec.lags)
-            prediction = _predict_one_step(spec, row)
+            prediction, quantiles = _predict_one_step_with_uncertainty(spec, row)
             future_slice.loc[future_slice.index[pred_pos], target] = prediction
             output.loc[future_slice.index[pred_pos], target] = prediction
+            for label, value in quantiles.items():
+                output.loc[future_slice.index[pred_pos], f"{target}_forecast_{label}"] = value
         if step_callback:
             step_callback(step_ahead, horizon_steps)
     return output
 
 def _predict_one_step(spec: Any, row: pd.DataFrame) -> float:
-    predict_fn = getattr(spec, "predict", None)
-    if callable(predict_fn):
-        payload = predict_fn(row, horizon_steps=1)
-        predictions = payload[0] if isinstance(payload, tuple) else payload
-        if isinstance(predictions, pd.Series):
-            return float(predictions.iloc[0])
-        values = np.asarray(predictions).reshape(-1)
-        return float(values[0])
-    return float(spec.model.predict(row)[0])
+    return _predict_one_step_with_uncertainty(spec, row)[0]
 
 def response_model_profiles(
     tau_bess_s: float,
@@ -1500,6 +1577,70 @@ def _risk_factors(risk_quantile: float, reserve_buffer_pct: float) -> Dict[str, 
     return {resource: _risk_factor(resource, risk_quantile, reserve_buffer_pct) for resource in ["BESS", "EV", "HVAC", "PV"]}
 
 
+def _price_bid_quantile(risk_quantile: float) -> float:
+    return float(np.clip(1.0 - float(np.clip(risk_quantile, 0.50, 0.95)), 0.05, 0.50))
+
+
+def _price_bid_column(price_column: str) -> str:
+    return price_column.replace("_eur_per_mw_h", "_bid_eur_per_mw_h")
+
+
+def _price_quantile_column(price_column: str) -> str:
+    return price_column.replace("_eur_per_mw_h", "_bid_quantile")
+
+
+def _price_forecast_mode_column(price_column: str) -> str:
+    return price_column.replace("_eur_per_mw_h", "_forecast_mode")
+
+
+def _market_price_bid_value(row: pd.Series, price_column: str, risk_quantile: float) -> tuple[float, float, str]:
+    target_quantile = _price_bid_quantile(risk_quantile)
+    candidates: list[tuple[float, str]] = []
+    for quantile in FORECAST_QUANTILES:
+        column = _forecast_quantile_column(price_column, quantile)
+        if column in row and pd.notna(row.get(column)):
+            candidates.append((float(quantile), column))
+    if candidates:
+        lower_or_equal = [(quantile, column) for quantile, column in candidates if quantile <= target_quantile + 1e-9]
+        used_quantile, used_column = max(lower_or_equal, key=lambda item: item[0]) if lower_or_equal else min(candidates, key=lambda item: item[0])
+        return float(max(float(row[used_column]), 0.0)), float(used_quantile), "quantile"
+    return float(max(float(row.get(price_column, 0.0)), 0.0)), 0.50, "point"
+
+
+def _attach_market_price_bid_forecasts(forecast_df: pd.DataFrame, risk_quantile: float) -> pd.DataFrame:
+    frame = forecast_df.copy()
+    for price_column in PRICE_FORECAST_TARGETS:
+        bid_values = []
+        used_quantiles = []
+        modes = []
+        for _, row in frame.iterrows():
+            bid_value, used_quantile, mode = _market_price_bid_value(row, price_column, risk_quantile)
+            bid_values.append(bid_value)
+            used_quantiles.append(used_quantile)
+            modes.append(mode)
+        frame[_price_bid_column(price_column)] = bid_values
+        frame[_price_quantile_column(price_column)] = used_quantiles
+        frame[_price_forecast_mode_column(price_column)] = modes
+    frame["price_bid_quantile"] = float(_price_bid_quantile(risk_quantile))
+    frame["price_forecast_mode"] = "quantile" if any(
+        frame[_price_forecast_mode_column(column)].eq("quantile").any() for column in PRICE_FORECAST_TARGETS
+    ) else "point"
+    return frame
+
+
+def _market_price_bid_audit(row: pd.Series) -> Dict[str, object]:
+    values: Dict[str, object] = {
+        "price_forecast_mode": str(row.get("price_forecast_mode", "point")),
+        "price_bid_quantile": float(row.get("price_bid_quantile", 0.50)),
+    }
+    for price_column in PRICE_FORECAST_TARGETS:
+        bid_column = _price_bid_column(price_column)
+        values[bid_column] = float(row.get(bid_column, row.get(price_column, 0.0)))
+        values[_price_quantile_column(price_column)] = float(row.get(_price_quantile_column(price_column), 0.50))
+        values[_price_forecast_mode_column(price_column)] = str(row.get(_price_forecast_mode_column(price_column), "point"))
+    return values
+
+
 def _risk_cost_terms(
     values: Dict[str, float],
     row: pd.Series,
@@ -1552,13 +1693,14 @@ def solve_mpc_step(
     fleet_meta: Dict[str, float],
 ) -> Dict[str, object]:
     penalty_weights = apply_risk_policy_defaults(penalty_weights)
+    risk_quantile = float(np.clip(penalty_weights.get("risk_quantile", 0.80), 0.50, 0.95))
+    forecast_df = _attach_market_price_bid_forecasts(forecast_df, risk_quantile)
     horizon = len(forecast_df)
     dt_h = float(forecast_df["dt_h"].iloc[0])
     eta_c = 0.95
     eta_d = 0.95
     temp_alpha = 0.90
     temp_beta = 0.16 * dt_h
-    risk_quantile = float(np.clip(penalty_weights.get("risk_quantile", 0.80), 0.50, 0.95))
     reserve_buffer_pct = float(np.clip(penalty_weights.get("reserve_buffer_pct", 0.08), 0.0, 0.40))
     risk_factors = _risk_factors(risk_quantile, reserve_buffer_pct)
 
@@ -1708,9 +1850,9 @@ def solve_mpc_step(
         problem += temp_ref + temp_delta[k + 1] <= temp_hi + temp_high_slack[k]
 
         cap_revenue = dt_h / 1000.0 * (
-            row["fcrn_capacity_eur_per_mw_h"] * fcr_bid
-            + row["afrr_up_capacity_eur_per_mw_h"] * afrr_up_bid
-            + row["afrr_down_capacity_eur_per_mw_h"] * afrr_down_bid
+            row[_price_bid_column("fcrn_capacity_eur_per_mw_h")] * fcr_bid
+            + row[_price_bid_column("afrr_up_capacity_eur_per_mw_h")] * afrr_up_bid
+            + row[_price_bid_column("afrr_down_capacity_eur_per_mw_h")] * afrr_down_bid
         )
         energy_revenue = dt_h / 1000.0 * (
             row["afrr_up_energy_eur_per_mwh"] * afrr_up_frac * afrr_up_bid
@@ -1808,13 +1950,14 @@ def solve_mpc_step(
             }
         )
         values.update(_fcr_n_bid_dynamic_metrics(values, fleet_meta))
+        values.update(_market_price_bid_audit(row))
         fcr_bid_val = values["fcr_bid_kw"]
         afrr_up_bid_val = values["afrr_up_bid_kw"]
         afrr_down_bid_val = values["afrr_down_bid_kw"]
         cap_revenue = dt_h / 1000.0 * (
-            row["fcrn_capacity_eur_per_mw_h"] * fcr_bid_val
-            + row["afrr_up_capacity_eur_per_mw_h"] * afrr_up_bid_val
-            + row["afrr_down_capacity_eur_per_mw_h"] * afrr_down_bid_val
+            row[_price_bid_column("fcrn_capacity_eur_per_mw_h")] * fcr_bid_val
+            + row[_price_bid_column("afrr_up_capacity_eur_per_mw_h")] * afrr_up_bid_val
+            + row[_price_bid_column("afrr_down_capacity_eur_per_mw_h")] * afrr_down_bid_val
         )
         energy_revenue = dt_h / 1000.0 * (
             row["afrr_up_energy_eur_per_mwh"] * row["afrr_up_act_frac"] * afrr_up_bid_val
@@ -2534,6 +2677,13 @@ def run_mpc_controller(
                 "afrr_down_energy_eur_per_mwh",
             ]
         ].copy()
+        price_quantile_cols = [
+            col
+            for col in base_slice.columns
+            if any(col.startswith(f"{target}_forecast_p") for target in PRICE_FORECAST_TARGETS)
+        ]
+        if price_quantile_cols:
+            forecast = forecast.join(base_slice[price_quantile_cols])
         solution = _solve_mpc_with_plugin(
             forecast=forecast,
             state=state,
@@ -2702,6 +2852,11 @@ def run_mpc_controller(
                 "fcrn_capacity_eur_per_mw_h": float(row["fcrn_capacity_eur_per_mw_h"]),
                 "afrr_up_capacity_eur_per_mw_h": float(row["afrr_up_capacity_eur_per_mw_h"]),
                 "afrr_down_capacity_eur_per_mw_h": float(row["afrr_down_capacity_eur_per_mw_h"]),
+                "price_forecast_mode": str(plan.get("price_forecast_mode", "point")),
+                "price_bid_quantile": float(plan.get("price_bid_quantile", 0.50)),
+                "fcrn_capacity_bid_eur_per_mw_h": float(plan.get("fcrn_capacity_bid_eur_per_mw_h", row["fcrn_capacity_eur_per_mw_h"])),
+                "afrr_up_capacity_bid_eur_per_mw_h": float(plan.get("afrr_up_capacity_bid_eur_per_mw_h", row["afrr_up_capacity_eur_per_mw_h"])),
+                "afrr_down_capacity_bid_eur_per_mw_h": float(plan.get("afrr_down_capacity_bid_eur_per_mw_h", row["afrr_down_capacity_eur_per_mw_h"])),
                 "afrr_up_energy_eur_per_mwh": float(row["afrr_up_energy_eur_per_mwh"]),
                 "afrr_down_energy_eur_per_mwh": float(row["afrr_down_energy_eur_per_mwh"]),
                 "requested_up_kw": requested_up,
@@ -3024,6 +3179,10 @@ def run_mpc_controller(
         "resource_activation_revenue": resource_activation_revenue,
         "resource_energy_kwh": resource_energy_kwh,
         "risk_policy": str(penalty_weights.get("risk_policy", "investor_balanced")),
+        "price_forecast_mode": str(result_df.get("price_forecast_mode", pd.Series(["point"])).mode().iloc[0])
+        if "price_forecast_mode" in result_df and not result_df["price_forecast_mode"].empty
+        else "point",
+        "price_bid_quantile": float(result_df.get("price_bid_quantile", pd.Series([0.50])).mean()),
         "fast_vs_slow": {
             "Fast (BESS + EV)": float(resource_revenue["BESS"] + resource_revenue["EV"]),
             "Slow (HVAC + PV)": float(resource_revenue["HVAC"] + resource_revenue["PV"]),
@@ -3125,6 +3284,13 @@ def run_lower_mpc_from_upper_result(
         "reserve_buffer_pct",
         "socket_up_kw",
         "socket_down_kw",
+        "price_bid_quantile",
+        "fcrn_capacity_bid_eur_per_mw_h",
+        "afrr_up_capacity_bid_eur_per_mw_h",
+        "afrr_down_capacity_bid_eur_per_mw_h",
+        "fcrn_capacity_bid_quantile",
+        "afrr_up_capacity_bid_quantile",
+        "afrr_down_capacity_bid_quantile",
     ]
     passthrough_plan_columns = [
         "combined_stacking_model",
@@ -3132,6 +3298,10 @@ def run_lower_mpc_from_upper_result(
         "combined_split_capacity_ok",
         "combined_stack_violation_reason",
         "combined_socket_rule",
+        "price_forecast_mode",
+        "fcrn_capacity_forecast_mode",
+        "afrr_up_capacity_forecast_mode",
+        "afrr_down_capacity_forecast_mode",
     ]
     controller_config = InnerControllerConfig(
         mode=inner_controller_mode,
@@ -3163,7 +3333,21 @@ def run_lower_mpc_from_upper_result(
         except KeyError:
             row_idx = min(t + 1, len(df) - 1)
         row = df.iloc[row_idx]
-        plan = {key: float(upper_row.get(key, 0.0)) for key in numeric_plan_columns}
+        price_defaults = {
+            "fcrn_capacity_bid_eur_per_mw_h": float(row["fcrn_capacity_eur_per_mw_h"]),
+            "afrr_up_capacity_bid_eur_per_mw_h": float(row["afrr_up_capacity_eur_per_mw_h"]),
+            "afrr_down_capacity_bid_eur_per_mw_h": float(row["afrr_down_capacity_eur_per_mw_h"]),
+            "fcrn_capacity_bid_quantile": 0.50,
+            "afrr_up_capacity_bid_quantile": 0.50,
+            "afrr_down_capacity_bid_quantile": 0.50,
+            "price_bid_quantile": 0.50,
+        }
+        plan = {}
+        for key in numeric_plan_columns:
+            value = upper_row.get(key, price_defaults.get(key, 0.0))
+            if pd.isna(value):
+                value = price_defaults.get(key, 0.0)
+            plan[key] = float(value)
         for key in passthrough_plan_columns:
             if key in upper_row:
                 plan[key] = upper_row.get(key)
@@ -3265,6 +3449,11 @@ def run_lower_mpc_from_upper_result(
                 "afrr_down_bid_kw": afrr_down_bid_kw,
                 "socket_up_kw": float(plan.get("socket_up_kw", 0.0)),
                 "socket_down_kw": float(plan.get("socket_down_kw", 0.0)),
+                "price_forecast_mode": str(plan.get("price_forecast_mode", upper_row.get("price_forecast_mode", "point"))),
+                "price_bid_quantile": float(plan.get("price_bid_quantile", upper_row.get("price_bid_quantile", 0.50))),
+                "fcrn_capacity_bid_eur_per_mw_h": float(plan.get("fcrn_capacity_bid_eur_per_mw_h", row["fcrn_capacity_eur_per_mw_h"])),
+                "afrr_up_capacity_bid_eur_per_mw_h": float(plan.get("afrr_up_capacity_bid_eur_per_mw_h", row["afrr_up_capacity_eur_per_mw_h"])),
+                "afrr_down_capacity_bid_eur_per_mw_h": float(plan.get("afrr_down_capacity_bid_eur_per_mw_h", row["afrr_down_capacity_eur_per_mw_h"])),
                 "stacking_ok": bool(stacking_ok),
                 **stack_audit,
                 "requested_up_kw": interval_summary["requested_up_kw"],

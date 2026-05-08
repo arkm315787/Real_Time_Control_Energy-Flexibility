@@ -94,14 +94,19 @@ class BaseForecaster(ABC):
 
         if X_val.empty:
             predictions = pd.Series(dtype=float, name="prediction")
+            uncertainty = None
             metrics = ForecastMetrics(mae=float("nan"), rmse=float("nan"), bias=float("nan"), mape=None)
         else:
-            predictions, _ = self.predict(X_val, horizon_steps=horizon_steps)
+            predictions, uncertainty = self.predict(X_val, horizon_steps=horizon_steps)
             predictions = pd.Series(predictions, index=X_val.index, name="prediction")
             metrics = self.evaluate(y_val, predictions)
 
         self.metrics = metrics.to_dict()
-        return pd.DataFrame({"actual": y_val, "prediction": predictions})
+        comparison = pd.DataFrame({"actual": y_val, "prediction": predictions})
+        if isinstance(uncertainty, pd.DataFrame) and not uncertainty.empty:
+            for column in uncertainty.columns:
+                comparison[f"prediction_{column}"] = uncertainty[column].reindex(comparison.index)
+        return comparison
 
     def evaluate(self, y_true: pd.Series, y_pred: pd.Series) -> ForecastMetrics:
         """Calculate common forecast metrics."""
@@ -151,4 +156,5 @@ class BaseForecaster(ABC):
             horizon_steps=int(self.horizon_steps),
             model=model,
             metrics=dict(self.metrics),
+            residual_quantiles=dict(getattr(self, "residual_quantiles", {}) or {}),
         )

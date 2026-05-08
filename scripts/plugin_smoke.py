@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -87,6 +89,18 @@ def main() -> None:
     )
     if comparison.empty or not forecaster.metrics:
         raise SystemExit("Forecaster plugin did not produce validation predictions and metrics.")
+    sample_features = None
+    for feature in getattr(forecaster, "feature_columns", []):
+        if sample_features is None:
+            sample_features = {}
+        sample_features[feature] = float(df[feature.split("_lag")[0]].iloc[-1]) if feature.split("_lag")[0] in df else 0.0
+    if sample_features is None:
+        raise SystemExit("Forecaster plugin did not expose fitted feature columns.")
+    sample_frame = pd.DataFrame([sample_features], index=df.tail(1).index)
+    _, uncertainty = forecaster.predict(sample_frame, horizon_steps=1)
+    required_quantiles = {"p05", "p20", "p50", "p80", "p95"}
+    if uncertainty is None or not required_quantiles.issubset(set(uncertainty.columns)):
+        raise SystemExit("XGBoost forecaster must expose calibrated quantile forecast bands.")
     print("forecast metrics:", forecaster.metrics)
 
     optimizer = registry.get_optimizer(DEFAULT_OPTIMIZER_PLUGIN)

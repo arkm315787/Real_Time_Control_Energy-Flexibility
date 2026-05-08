@@ -60,9 +60,11 @@ def main() -> None:
         'st.session_state["portfolio_bundle"]',
         'st.session_state["portfolio_signature"]',
         'button("Run Upper MPC Layer"',
-        'button("Start Market Pressure"',
+        'button("Start Simulated Market"',
         'button("Activate Lower MPC"',
-        'button("Stop Market"',
+        'button("Stop Simulated Market"',
+        "st.fragment(",
+        "cached_lower_mpc_from_upper(",
         'run_lower_mpc_from_upper_result(',
         "MarketSimulator(",
         "sync_market_simulator_feed(",
@@ -72,6 +74,10 @@ def main() -> None:
     missing = [fragment for fragment in required_fragments if fragment not in source]
     if missing:
         raise SystemExit(f"Dashboard scenario form/cache guard is incomplete: {missing}")
+    if 'st.session_state["mpc_result"] = lower_result' in source:
+        raise SystemExit("Dashboard must not overwrite the upper MPC result with the live lower-MPC attachment.")
+    if "time.sleep(1)" in source:
+        raise SystemExit("Dashboard live refresh must not force a one-second full app rerun.")
 
     session = {"start_at_wall_s": 110.0, "duration_seconds": 20.0, "dt_seconds": 4}
     if live_market_status(session, now_s=100.0)["status"] != "scheduled":

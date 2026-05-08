@@ -426,6 +426,36 @@ def live_visible_frame(frame: pd.DataFrame, session: Dict[str, object] | None, n
     return frame.iloc[:visible_rows]
 
 
+@st.cache_data(show_spinner=False, ttl=4)
+def cached_lower_mpc_from_upper(
+    df: pd.DataFrame,
+    upper_result: Dict[str, object],
+    fleet_meta: Dict[str, float],
+    market_mode: str,
+    resource_mode: str,
+    preview_4s: pd.DataFrame,
+    device_roster: pd.DataFrame,
+    elapsed_tick: int,
+    inner_dt_seconds: int = 4,
+) -> Dict[str, object]:
+    elapsed_seconds = float(max(int(elapsed_tick), 0) * max(int(inner_dt_seconds), 1))
+    return run_lower_mpc_from_upper_result(
+        df=df,
+        upper_result=upper_result,
+        fleet_meta=fleet_meta,
+        market_mode=market_mode,
+        resource_mode=resource_mode,
+        preview_4s=preview_4s,
+        device_roster=device_roster,
+        inner_controller_mode="mpc",
+        inner_dt_seconds=int(inner_dt_seconds),
+        inner_mpc_horizon_seconds=4,
+        rotation_strategy="usage_aware",
+        gateway_mode="live_market_coupled",
+        elapsed_seconds=elapsed_seconds,
+    )
+
+
 def result_history(result: Dict[str, object] | None) -> pd.DataFrame:
     if not isinstance(result, dict):
         return pd.DataFrame()
@@ -825,6 +855,11 @@ def line_dual_axis(result_df: pd.DataFrame, template: str) -> go.Figure:
 
 def main() -> None:
     theme_mode = st.sidebar.radio("Dashboard theme", ["Dark", "Light"], horizontal=True, help="Applies to charts and dashboard styling.")
+    dev_mode = st.sidebar.toggle(
+        "Developer / research panels",
+        value=False,
+        help="Shows educational response-model plots, Sankey diagrams, equations, and animated diagnostics that are not operator controls.",
+    )
     inject_css(theme_mode)
     template = PLOTLY_TEMPLATE[theme_mode]
 
@@ -1009,12 +1044,12 @@ def main() -> None:
 
     tabs = st.tabs(
         [
-            "Home",
-            "Training Data Explorer",
-            "Response Models",
-            "Forecasting Lab",
+            "Live Ops",
+            "Markets & Data",
+            "Fleet" if not dev_mode else "Fleet / Response Models",
+            "Forecasting & Compliance",
             "MPC Optimizer & Market Participation",
-            "Simulation & Impact Visualizations",
+            "Settlement & Impact",
             "Advanced / Export",
         ]
     )
@@ -1047,7 +1082,8 @@ def main() -> None:
                 """,
                 unsafe_allow_html=True,
             )
-            st.plotly_chart(plot_sankey(summary), use_container_width=True)
+            if dev_mode:
+                st.plotly_chart(plot_sankey(summary), use_container_width=True, key="dev_home_sankey")
         with right:
             c1, c2 = st.columns(2)
             c1.metric("Fast reserve headroom", f"{summary['peak_fast_mw']:.2f} MW")
@@ -1073,18 +1109,19 @@ def main() -> None:
                 """,
                 unsafe_allow_html=True,
             )
-            with st.expander("Educational notes and equations", expanded=False):
-                st.markdown(
-                    r"""
-                    - **FCR-N activation**: full response at $\pm 0.1$ Hz from nominal frequency.
-                    - **aFRR**: a centralized signal updated every 4 seconds, with 30-second start and full activation within 5 minutes.
-                    - **Thermal response transfer function**:
-                      $$
-                      G(s) = \frac{K}{\tau_1 \tau_2 s^2 + (\tau_1 + \tau_2)s + 1}
-                      $$
-                    - **MPC concept**: at each time step, forecast the next horizon, optimize reserve bids and state trajectories, apply the first move, then re-optimize.
-                    """
-                )
+            if dev_mode:
+                with st.expander("Educational notes and equations", expanded=False):
+                    st.markdown(
+                        r"""
+                        - **FCR-N activation**: full response at $\pm 0.1$ Hz from nominal frequency.
+                        - **aFRR**: a centralized signal updated every 4 seconds, with 30-second start and full activation within 5 minutes.
+                        - **Thermal response transfer function**:
+                          $$
+                          G(s) = \frac{K}{\tau_1 \tau_2 s^2 + (\tau_1 + \tau_2)s + 1}
+                          $$
+                        - **MPC concept**: at each time step, forecast the next horizon, optimize reserve bids and state trajectories, apply the first move, then re-optimize.
+                        """
+                    )
 
     with tabs[1]:
         st.subheader("Data Explorer")
@@ -1189,15 +1226,16 @@ def main() -> None:
         heat2.plotly_chart(apply_chart_style(availability_heatmap(df, "hvac_up_kw", "Thermal upward flexibility heatmap", "YlOrBr"), template, height=320), use_container_width=True)
 
     with tabs[2]:
-        st.subheader("Response Models")
+        st.subheader("Fleet Response Models" if dev_mode else "Fleet Response Summary")
         c1, c2, c3, c4 = st.columns(4)
-        tau_bess_s = c1.slider("BESS time constant (s)", 1.0, 5.0, 2.0, 0.5)
-        tau_ev_s = c2.slider("EV time constant (s)", 1.0, 8.0, 4.0, 0.5)
-        tau_hvac1_min = c3.slider("HVAC fast thermal mode τ1 (min)", 5.0, 15.0, 8.0, 1.0)
-        tau_hvac2_min = c4.slider("HVAC slow thermal mode τ2 (min)", 30.0, 60.0, 45.0, 1.0)
+        tau_bess_s = c1.slider("Visual-only BESS time constant (s)", 1.0, 5.0, 2.0, 0.5, disabled=not dev_mode)
+        tau_ev_s = c2.slider("Visual-only EV time constant (s)", 1.0, 8.0, 4.0, 0.5, disabled=not dev_mode)
+        tau_hvac1_min = c3.slider("Visual-only HVAC fast mode (min)", 5.0, 15.0, 8.0, 1.0, disabled=not dev_mode)
+        tau_hvac2_min = c4.slider("Visual-only HVAC slow mode (min)", 30.0, 60.0, 45.0, 1.0, disabled=not dev_mode)
         st.caption(
             f"HVAC is currently modeled as {hvac_mode}. "
-            + ("Inverter mode uses the electrical response for the fast HVAC trace." if hvac_mode == HVAC_MODES[1] else "Conventional mode uses the slower thermal second-order response.")
+            + ("Inverter mode uses the electrical response for the fast HVAC trace. " if hvac_mode == HVAC_MODES[1] else "Conventional mode uses the slower thermal second-order response. ")
+            + "These sliders are response-chart diagnostics only; optimizer response uses the scenario-level delivered HVAC response time and fixed BESS/EV device classes."
         )
         profiles = response_model_profiles(
             tau_bess_s,
@@ -1216,42 +1254,44 @@ def main() -> None:
         step_fig.update_layout(xaxis_title="Seconds", yaxis_title="Delivered fraction")
         st.plotly_chart(apply_chart_style(step_fig, template, height=420, title="Normalized step response to a reserve activation request"), use_container_width=True)
 
-        anim_records = []
-        for resource, data in profiles.items():
-            for i, (tt, yy) in enumerate(zip(data["t"][::12], data["y"][::12])):
-                anim_records.append({"Resource": resource, "time": float(tt), "response": float(yy), "frame": i})
-        anim_df = pd.DataFrame(anim_records)
-        anim_fig = px.scatter(
-            anim_df,
-            x="time",
-            y="response",
-            color="Resource",
-            animation_frame="frame",
-            range_y=[0, 1.05],
-            range_x=[0, float(max(profiles["HVAC"]["t"]))],
-            template=template,
-            title="Animated reserve activation playback",
-        )
-        st.plotly_chart(
-            apply_chart_style(anim_fig, template, height=420, title="Animated reserve activation playback"),
-            use_container_width=True,
-        )
+        if dev_mode:
+            anim_records = []
+            for resource, data in profiles.items():
+                for i, (tt, yy) in enumerate(zip(data["t"][::12], data["y"][::12])):
+                    anim_records.append({"Resource": resource, "time": float(tt), "response": float(yy), "frame": i})
+            anim_df = pd.DataFrame(anim_records)
+            anim_fig = px.scatter(
+                anim_df,
+                x="time",
+                y="response",
+                color="Resource",
+                animation_frame="frame",
+                range_y=[0, 1.05],
+                range_x=[0, float(max(profiles["HVAC"]["t"]))],
+                template=template,
+                title="Animated reserve activation playback",
+            )
+            st.plotly_chart(
+                apply_chart_style(anim_fig, template, height=420, title="Animated reserve activation playback"),
+                use_container_width=True,
+                key="dev_response_animation",
+            )
 
-        bode_cols = st.columns(2)
-        with bode_cols[0]:
-            bode_fig = go.Figure()
-            for resource in ["BESS", "EV", "HVAC"]:
-                bode = bode_points(resource, tau_bess_s, tau_ev_s, tau_hvac1_min * 60.0, tau_hvac2_min * 60.0, hvac_mode, hvac_response_s)
-                bode_fig.add_trace(go.Scatter(x=bode["omega"], y=bode["mag_db"], name=resource))
-            bode_fig.update_layout(xaxis_type="log", xaxis_title="rad/s", yaxis_title="dB")
-            st.plotly_chart(apply_chart_style(bode_fig, template, height=360, title="Bode magnitude"), use_container_width=True)
-        with bode_cols[1]:
-            phase_fig = go.Figure()
-            for resource in ["BESS", "EV", "HVAC"]:
-                bode = bode_points(resource, tau_bess_s, tau_ev_s, tau_hvac1_min * 60.0, tau_hvac2_min * 60.0, hvac_mode, hvac_response_s)
-                phase_fig.add_trace(go.Scatter(x=bode["omega"], y=bode["phase_deg"], name=resource))
-            phase_fig.update_layout(xaxis_type="log", xaxis_title="rad/s", yaxis_title="Degrees")
-            st.plotly_chart(apply_chart_style(phase_fig, template, height=360, title="Bode phase"), use_container_width=True)
+            bode_cols = st.columns(2)
+            with bode_cols[0]:
+                bode_fig = go.Figure()
+                for resource in ["BESS", "EV", "HVAC"]:
+                    bode = bode_points(resource, tau_bess_s, tau_ev_s, tau_hvac1_min * 60.0, tau_hvac2_min * 60.0, hvac_mode, hvac_response_s)
+                    bode_fig.add_trace(go.Scatter(x=bode["omega"], y=bode["mag_db"], name=resource))
+                bode_fig.update_layout(xaxis_type="log", xaxis_title="rad/s", yaxis_title="dB")
+                st.plotly_chart(apply_chart_style(bode_fig, template, height=360, title="Bode magnitude"), use_container_width=True, key="dev_bode_magnitude")
+            with bode_cols[1]:
+                phase_fig = go.Figure()
+                for resource in ["BESS", "EV", "HVAC"]:
+                    bode = bode_points(resource, tau_bess_s, tau_ev_s, tau_hvac1_min * 60.0, tau_hvac2_min * 60.0, hvac_mode, hvac_response_s)
+                    phase_fig.add_trace(go.Scatter(x=bode["omega"], y=bode["phase_deg"], name=resource))
+                phase_fig.update_layout(xaxis_type="log", xaxis_title="rad/s", yaxis_title="Degrees")
+                st.plotly_chart(apply_chart_style(phase_fig, template, height=360, title="Bode phase"), use_container_width=True, key="dev_bode_phase")
 
         st.info(
             "Interpretation: BESS and EV fleets can closely track the required reserve trajectory in seconds. HVAC thermal flexibility adds volume, but its slower second-order behavior makes it more suitable for aFRR or hybrid strategies than for pure FCR-N."
@@ -1528,9 +1568,9 @@ def main() -> None:
             st.warning("Stopped the live market session because the current upper MPC result has no accepted reserve socket.")
         market_started = bool(live_market_session) and market_status["status"] in {"scheduled", "live", "closed"}
         run_upper_mpc = btn_upper.button("Run Upper MPC Layer", type="primary")
-        start_market_pressure = btn_market.button("Start Market Pressure", disabled=not upper_socket_ready or market_status["status"] in {"scheduled", "live"})
+        start_market_pressure = btn_market.button("Start Simulated Market", disabled=not upper_socket_ready or market_status["status"] in {"scheduled", "live"})
         activate_lower_mpc = btn_lower.button("Activate Lower MPC", disabled=not market_started or not upper_socket_ready)
-        stop_live_market = btn_stop.button("Stop Market", disabled=not bool(live_market_session))
+        stop_live_market = btn_stop.button("Stop Simulated Market", disabled=not bool(live_market_session))
         if upper_market_ready and not socket_metrics["ready"]:
             st.warning(
                 "No executable market period is available yet: "
@@ -1676,82 +1716,94 @@ def main() -> None:
             st.session_state["mpc_phase"] = "lower_waiting" if market_status["status"] == "scheduled" else "market_live"
             st.rerun()
 
-        live_market_session = st.session_state.get("live_market_session", {})
-        market_status = live_market_status(live_market_session)
-        lower_armed = bool(st.session_state.get("lower_mpc_armed", False))
-        runtime_market_feed = (
-            sync_market_simulator_feed(
-                preview_4s,
-                st.session_state.get("upper_mpc_result", {}),
-                live_market_session,
-                int(float(live_market_session.get("duration_seconds", dispatch_minutes * 60))) if live_market_session else int(dispatch_minutes * 60),
-                dt_seconds=4,
+        def render_live_market_tile() -> bool:
+            live_market_session = st.session_state.get("live_market_session", {})
+            market_status = live_market_status(live_market_session)
+            lower_armed = bool(st.session_state.get("lower_mpc_armed", False))
+            runtime_market_feed = (
+                sync_market_simulator_feed(
+                    preview_4s,
+                    st.session_state.get("upper_mpc_result", {}),
+                    live_market_session,
+                    int(float(live_market_session.get("duration_seconds", dispatch_minutes * 60))) if live_market_session else int(dispatch_minutes * 60),
+                    dt_seconds=4,
+                )
+                if live_market_session
+                else preview_4s
             )
-            if live_market_session
-            else preview_4s
-        )
-        if live_market_session and market_status["status"] == "live" and st.session_state.get("mpc_phase") in {"market_scheduled", "lower_waiting"}:
-            st.session_state["mpc_phase"] = "market_live" if not lower_armed else "lower_waiting"
-        if lower_armed and not upper_socket_ready:
-            st.session_state["lower_mpc_armed"] = False
-            st.session_state.pop("live_lower_result", None)
-            st.warning("Lower MPC was disarmed because the current upper socket has no accepted committed reserve.")
-            lower_armed = False
-        if lower_armed and live_market_session and market_status["status"] in {"live", "closed"}:
-            fleet_meta = {
-                "bess_energy_cap_mwh": float(df["bess_energy_cap_mwh"].iloc[0]),
-                "setpoint_c": setpoint_c,
-                "comfort_band_c": comfort_band_c,
-                "n_hvac": summary["n_hvac"],
-                "hvac_mode": hvac_mode,
-                "hvac_response_s": hvac_response_s,
-            }
-            upper_socket = st.session_state.get("upper_mpc_result", st.session_state.get("mpc_result", {}))
-            lower_result = run_lower_mpc_from_upper_result(
-                df=df,
-                upper_result=upper_socket,
-                fleet_meta=fleet_meta,
-                market_mode=str(live_market_session.get("market_mode", market_mode)),
-                resource_mode=str(live_market_session.get("resource_mode", resource_mode)),
-                preview_4s=runtime_market_feed,
-                device_roster=device_roster,
-                inner_controller_mode="mpc",
-                inner_dt_seconds=4,
-                inner_mpc_horizon_seconds=4,
-                rotation_strategy="usage_aware",
-                gateway_mode="live_market_coupled",
-                elapsed_seconds=float(market_status["elapsed_seconds"]),
-            )
-            st.session_state["live_lower_result"] = lower_result
-            st.session_state["mpc_result"] = lower_result
-            st.session_state["mpc_config"] = {
-                **st.session_state.get("mpc_config", {}),
-                "execute_lower_mpc": True,
-                "gateway_mode": "live_market_coupled",
-            }
-            st.session_state["mpc_result_stale"] = False
-            st.session_state["mpc_phase"] = "lower_live"
+            if live_market_session and market_status["status"] == "live" and st.session_state.get("mpc_phase") in {"market_scheduled", "lower_waiting"}:
+                st.session_state["mpc_phase"] = "market_live" if not lower_armed else "lower_waiting"
+            if lower_armed and not upper_socket_ready:
+                st.session_state["lower_mpc_armed"] = False
+                st.session_state.pop("live_lower_result", None)
+                st.warning("Lower MPC was disarmed because the current upper socket has no accepted committed reserve.")
+                lower_armed = False
+            if lower_armed and live_market_session and market_status["status"] in {"live", "closed"}:
+                fleet_meta = {
+                    "bess_energy_cap_mwh": float(df["bess_energy_cap_mwh"].iloc[0]),
+                    "setpoint_c": setpoint_c,
+                    "comfort_band_c": comfort_band_c,
+                    "n_hvac": summary["n_hvac"],
+                    "hvac_mode": hvac_mode,
+                    "hvac_response_s": hvac_response_s,
+                }
+                upper_socket = st.session_state.get("upper_mpc_result", st.session_state.get("mpc_result", {}))
+                elapsed_tick = int(float(market_status["elapsed_seconds"]) // 4) + 1
+                lower_result = cached_lower_mpc_from_upper(
+                    df=df,
+                    upper_result=upper_socket,
+                    fleet_meta=fleet_meta,
+                    market_mode=str(live_market_session.get("market_mode", market_mode)),
+                    resource_mode=str(live_market_session.get("resource_mode", resource_mode)),
+                    preview_4s=runtime_market_feed,
+                    device_roster=device_roster,
+                    inner_dt_seconds=4,
+                    elapsed_tick=elapsed_tick,
+                )
+                st.session_state["live_lower_result"] = lower_result
+                st.session_state["mpc_config"] = {
+                    **st.session_state.get("mpc_config", {}),
+                    "execute_lower_mpc": True,
+                    "gateway_mode": "live_market_coupled",
+                }
+                st.session_state["mpc_result_stale"] = False
+                st.session_state["mpc_phase"] = "lower_live"
 
-        if live_market_session:
-            status_label = str(market_status["status"]).replace("_", " ").title()
-            live_cols = st.columns(4)
-            live_cols[0].metric("Market process", status_label)
-            live_cols[1].metric("Start countdown", f"{float(market_status['countdown_seconds']):.0f} s")
-            live_cols[2].metric("Market elapsed", f"{float(market_status['elapsed_seconds']):.0f} s")
-            lower_ticks = len(result_frame(st.session_state.get("live_lower_result", {}), "tracking_4s"))
-            live_cols[3].metric("Lower MPC", f"Live ({lower_ticks} ticks)" if st.session_state.get("live_lower_result") else ("Armed" if lower_armed else "Waiting"))
-            market_feed = runtime_market_feed
-            visible_market_feed = live_visible_frame(market_feed, live_market_session)
-            if visible_market_feed.empty and market_status["status"] == "scheduled":
-                st.info("Market pressure countdown is active. The live market plot will start at the scheduled wall-clock time.")
-            else:
-                market_fig = go.Figure()
-                market_fig.add_trace(go.Scatter(x=visible_market_feed.index, y=visible_market_feed["fcr_signal_norm"], name="FCR signal", line={"color": RESOURCE_COLORS["Frequency"]}))
-                market_fig.add_trace(go.Scatter(x=visible_market_feed.index, y=visible_market_feed["afrr_signal_norm"], name="aFRR signal", line={"color": RESOURCE_COLORS["Net"], "dash": "dot"}))
-                market_fig.update_layout(yaxis_title="normalized signal")
-                st.plotly_chart(apply_chart_style(market_fig, template, height=260, title="Live Market Pressure"), use_container_width=True)
-            if market_status["status"] in {"scheduled", "live"}:
-                live_refresh_requested = True
+            if live_market_session:
+                status_label = str(market_status["status"]).replace("_", " ").title()
+                live_cols = st.columns(4)
+                live_cols[0].metric("Market process", status_label)
+                live_cols[1].metric("Start countdown", f"{float(market_status['countdown_seconds']):.0f} s")
+                live_cols[2].metric("Market elapsed", f"{float(market_status['elapsed_seconds']):.0f} s")
+                lower_ticks = len(result_frame(st.session_state.get("live_lower_result", {}), "tracking_4s"))
+                live_cols[3].metric("Lower MPC", f"Live ({lower_ticks} ticks)" if st.session_state.get("live_lower_result") else ("Armed" if lower_armed else "Waiting"))
+                visible_market_feed = live_visible_frame(runtime_market_feed, live_market_session)
+                if visible_market_feed.empty and market_status["status"] == "scheduled":
+                    st.info("Market pressure countdown is active. The live market plot will start at the scheduled wall-clock time.")
+                else:
+                    market_fig = go.Figure()
+                    market_fig.add_trace(go.Scatter(x=visible_market_feed.index, y=visible_market_feed["fcr_signal_norm"], name="FCR signal", line={"color": RESOURCE_COLORS["Frequency"]}))
+                    market_fig.add_trace(go.Scatter(x=visible_market_feed.index, y=visible_market_feed["afrr_signal_norm"], name="aFRR signal", line={"color": RESOURCE_COLORS["Net"], "dash": "dot"}))
+                    market_fig.update_layout(yaxis_title="normalized signal")
+                    st.caption("Simulated market-pressure replay for MVP/demo use; this is not a live Fingrid activation feed.")
+                    st.plotly_chart(
+                        apply_chart_style(market_fig, template, height=260, title="Simulated Market Pressure"),
+                        use_container_width=True,
+                        key="live_market_pressure_signal",
+                    )
+                return bool(market_status["status"] in {"scheduled", "live"})
+            return False
+
+        current_live_session = st.session_state.get("live_market_session", {})
+        current_live_status = live_market_status(current_live_session)
+        if hasattr(st, "fragment"):
+            @st.fragment(run_every="4s" if current_live_session and current_live_status["status"] in {"scheduled", "live"} else None)
+            def live_market_fragment() -> None:
+                render_live_market_tile()
+
+            live_market_fragment()
+        else:
+            live_refresh_requested = render_live_market_tile()
         active_result = st.session_state.get(
             "mpc_result",
             {
@@ -1773,8 +1825,11 @@ def main() -> None:
         lower_view_result = st.session_state.get("live_lower_result", {})
         if result_history(lower_view_result).empty and result_summary(active_result).get("execute_lower_mpc"):
             lower_view_result = active_result
-        result = lower_view_result if not result_history(lower_view_result).empty else upper_view_result
-        result_df = result_history(result)
+        result = upper_view_result
+        result_df = result_history(upper_view_result)
+        if result_df.empty:
+            result = active_result
+            result_df = result_history(active_result)
         upper_result_df = result_history(upper_view_result)
         lower_result_df = result_history(lower_view_result)
         upper_plot_df = upper_result_df if not upper_result_df.empty else result_df
@@ -1786,7 +1841,7 @@ def main() -> None:
             st.info("Configure the scenario and click Run Upper MPC Layer. Market pressure and lower MPC attach only after their own buttons are pressed.")
         else:
             s = result_summary(result)
-            c = result.get("compliance", {}) if isinstance(result, dict) else {}
+            c = upper_view_result.get("compliance", {}) if isinstance(upper_view_result, dict) else {}
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Total revenue", fmt_money(float(s.get("total_revenue_eur", 0.0))))
             m2.metric("Delivered up energy", f"{float(s.get('delivered_up_mwh', 0.0)):.2f} MWh")
@@ -1846,18 +1901,25 @@ def main() -> None:
             left, right = st.columns([1.45, 1.0])
             with left:
                 dispatch_fig = go.Figure()
-                dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=upper_plot_df["fcr_bid_kw"] / 1000.0, name="FCR-N bid", stackgroup="one"))
-                dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=upper_plot_df["afrr_up_bid_kw"] / 1000.0, name="aFRR up bid", stackgroup="one"))
-                dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=upper_plot_df["afrr_down_bid_kw"] / 1000.0, name="aFRR down bid", stackgroup="two"))
+                dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=upper_plot_df["fcr_bid_kw"] / 1000.0, name="FCR-N symmetric bid", line={"color": RESOURCE_COLORS["Frequency"], "width": 3}))
+                dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=upper_plot_df["afrr_up_bid_kw"] / 1000.0, name="aFRR up bid", line={"color": RESOURCE_COLORS["Net"], "dash": "dash"}))
+                dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=-upper_plot_df["afrr_down_bid_kw"] / 1000.0, name="aFRR down bid", line={"color": RESOURCE_COLORS["aFRR"], "dash": "dot"}))
+                if {"socket_up_kw", "socket_down_kw"}.issubset(upper_plot_df.columns):
+                    dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=upper_plot_df["socket_up_kw"] / 1000.0, name="Executable up socket", line={"color": "#6b7280", "dash": "longdash"}))
+                    dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=-upper_plot_df["socket_down_kw"] / 1000.0, name="Executable down socket", line={"color": "#6b7280", "dash": "longdashdot"}))
                 dispatch_fig.update_layout(yaxis_title="MW")
                 st.plotly_chart(apply_chart_style(dispatch_fig, template, height=400, title="Upper MPC reserve socket"), use_container_width=True)
                 waterfall_cols = {"raw_fcr_symmetric_kw", "fcr_dynamic_cap_total_kw", "fcr_energy_cap_total_kw", "reserve_buffer_kw", "fcr_bid_kw"}
                 if waterfall_cols.issubset(upper_plot_df.columns):
-                    raw_kw = float(upper_plot_df["raw_fcr_symmetric_kw"].mean())
-                    dynamic_kw = min(raw_kw, float(upper_plot_df["fcr_dynamic_cap_total_kw"].mean()))
-                    energy_kw = min(dynamic_kw, float(upper_plot_df["fcr_energy_cap_total_kw"].mean()))
-                    buffer_kw = float(upper_plot_df["reserve_buffer_kw"].mean())
-                    granular_kw = float(upper_plot_df["fcr_bid_kw"].mean())
+                    if "market_gate_status" in upper_plot_df and (upper_plot_df["market_gate_status"].astype(str) == "Participate").any():
+                        waterfall_row = upper_plot_df[upper_plot_df["market_gate_status"].astype(str) == "Participate"].iloc[0]
+                    else:
+                        waterfall_row = upper_plot_df.iloc[0]
+                    raw_kw = float(waterfall_row["raw_fcr_symmetric_kw"])
+                    dynamic_kw = min(raw_kw, float(waterfall_row["fcr_dynamic_cap_total_kw"]))
+                    energy_kw = min(dynamic_kw, float(waterfall_row["fcr_energy_cap_total_kw"]))
+                    buffer_kw = float(waterfall_row["reserve_buffer_kw"])
+                    granular_kw = float(waterfall_row["fcr_bid_kw"])
                     bid_waterfall = go.Figure(
                         go.Waterfall(
                             measure=["absolute", "relative", "relative", "relative", "absolute"],
@@ -1873,6 +1935,7 @@ def main() -> None:
                     )
                     bid_waterfall.update_layout(yaxis_title="MW")
                     st.plotly_chart(apply_chart_style(bid_waterfall, template, height=320, title="Why the FCR-N bid was reduced"), use_container_width=True)
+                    st.caption(f"Waterfall uses one market interval: {pd.Timestamp(waterfall_row.name)}.")
                 bidirectional_rows = []
                 for resource, fcr_col, up_col, down_col in [
                     ("BESS", "bess_fcr_kw", "bess_afrr_up_kw", "bess_afrr_down_kw"),
@@ -1880,10 +1943,11 @@ def main() -> None:
                     ("HVAC", "hvac_fcr_kw", "hvac_afrr_up_kw", "hvac_afrr_down_kw"),
                 ]:
                     if {fcr_col, up_col, down_col}.issubset(upper_plot_df.columns):
-                        bidirectional_rows.append({"Resource": resource, "Direction": "Up", "MW": float((upper_plot_df[fcr_col] + upper_plot_df[up_col]).mean()) / 1000.0})
-                        bidirectional_rows.append({"Resource": resource, "Direction": "Down", "MW": -float((upper_plot_df[fcr_col] + upper_plot_df[down_col]).mean()) / 1000.0})
+                        bidirectional_rows.append({"Resource": resource, "Direction": "FCR-N symmetric", "MW": float(upper_plot_df[fcr_col].mean()) / 1000.0})
+                        bidirectional_rows.append({"Resource": resource, "Direction": "aFRR up", "MW": float(upper_plot_df[up_col].mean()) / 1000.0})
+                        bidirectional_rows.append({"Resource": resource, "Direction": "aFRR down", "MW": -float(upper_plot_df[down_col].mean()) / 1000.0})
                 if "pv_afrr_down_kw" in upper_plot_df:
-                    bidirectional_rows.append({"Resource": "PV", "Direction": "Down", "MW": -float(upper_plot_df["pv_afrr_down_kw"].mean()) / 1000.0})
+                    bidirectional_rows.append({"Resource": "PV", "Direction": "aFRR down", "MW": -float(upper_plot_df["pv_afrr_down_kw"].mean()) / 1000.0})
                 if bidirectional_rows:
                     bidirectional_fig = px.bar(
                         pd.DataFrame(bidirectional_rows),
@@ -2069,10 +2133,11 @@ def main() -> None:
                 live_lower_tracking = live_visible_frame(lower_tracking_full, st.session_state.get("live_market_session", {}))
                 lower_visible = live_lower_tracking if not live_lower_tracking.empty else lower_tracking_full
                 lm1, lm2, lm3, lm4 = st.columns(4)
-                lm1.metric("4-sec ticks solved", f"{len(lower_tracking_full):,}")
-                lm2.metric("Mean abs tracking error", f"{float(lower_tracking_full['tracking_error_kw'].abs().mean()):.2f} kW")
-                lm3.metric("Max control latency", f"{float(lower_tracking_full.get('control_latency_ms', pd.Series([0.0])).max()):.1f} ms")
-                lm4.metric("Recovery ticks", f"{int(lower_tracking_full.get('recovery_mode', pd.Series(dtype=bool)).astype(bool).sum()):,}")
+                metric_frame = lower_visible
+                lm1.metric("Visible 4-sec ticks", f"{len(metric_frame):,}")
+                lm2.metric("Visible mean abs error", f"{float(metric_frame['tracking_error_kw'].abs().mean()):.2f} kW")
+                lm3.metric("Visible max latency", f"{float(metric_frame.get('control_latency_ms', pd.Series([0.0])).max()):.1f} ms")
+                lm4.metric("Visible recovery ticks", f"{int(metric_frame.get('recovery_mode', pd.Series(dtype=bool)).astype(bool).sum()):,}")
 
                 lower_trace_fig = go.Figure()
                 signed_request = lower_visible["requested_up_kw"] - lower_visible["requested_down_kw"]
@@ -2083,15 +2148,15 @@ def main() -> None:
                     lower_trace_fig.add_trace(go.Scatter(x=lower_visible.index, y=lower_visible["committed_up_kw"] / 1000.0, name="Committed up limit", line={"color": "#6b7280", "dash": "dash"}))
                     lower_trace_fig.add_trace(go.Scatter(x=lower_visible.index, y=-lower_visible["committed_down_kw"] / 1000.0, name="Committed down limit", line={"color": "#6b7280", "dash": "dash"}))
                 lower_trace_fig.update_layout(yaxis_title="MW")
-                st.plotly_chart(apply_chart_style(lower_trace_fig, template, height=340, title="Lower MPC live request vs delivered"), use_container_width=True)
+                st.plotly_chart(apply_chart_style(lower_trace_fig, template, height=340, title="Lower MPC live request vs delivered"), use_container_width=True, key="lower_live_request_delivery")
 
                 lower_diag_left, lower_diag_right = st.columns([1.15, 1.0])
                 if {"fleet_power_before_kw", "fleet_power_after_kw", "target_command_kw"}.issubset(lower_visible.columns):
                     power_fig = signal_line_figure(lower_visible, ["fleet_power_before_kw", "fleet_power_after_kw", "target_command_kw"], "Lower MPC internal power state", "kW")
-                    lower_diag_left.plotly_chart(apply_chart_style(power_fig, template, height=320), use_container_width=True)
+                    lower_diag_left.plotly_chart(apply_chart_style(power_fig, template, height=320), use_container_width=True, key="lower_live_internal_power")
                 if {"control_latency_ms", "control_deadline_ms"}.issubset(lower_visible.columns):
                     latency_fig = signal_line_figure(lower_visible, ["control_latency_ms", "control_deadline_ms"], "4-second control deadline check", "ms")
-                    lower_diag_right.plotly_chart(apply_chart_style(latency_fig, template, height=320), use_container_width=True)
+                    lower_diag_right.plotly_chart(apply_chart_style(latency_fig, template, height=320), use_container_width=True, key="lower_live_latency")
 
                 if {"afrr_accuracy_ratio", "afrr_accuracy_low", "afrr_accuracy_high"}.issubset(lower_visible.columns):
                     accuracy_fig = go.Figure()
@@ -2099,7 +2164,7 @@ def main() -> None:
                     accuracy_fig.add_trace(go.Scatter(x=lower_visible.index, y=lower_visible["afrr_accuracy_low"], name="90% floor", line={"color": "#6b7280", "dash": "dash"}))
                     accuracy_fig.add_trace(go.Scatter(x=lower_visible.index, y=lower_visible["afrr_accuracy_high"], name="110% ceiling", line={"color": "#6b7280", "dash": "dash"}))
                     accuracy_fig.update_layout(yaxis_title="ratio")
-                    st.plotly_chart(apply_chart_style(accuracy_fig, template, height=300, title="aFRR 90-110% tracking audit"), use_container_width=True)
+                    st.plotly_chart(apply_chart_style(accuracy_fig, template, height=300, title="aFRR 90-110% tracking audit"), use_container_width=True, key="lower_live_afrr_accuracy")
 
                 afrr_energy_audit = result_frame(lower_view_result, "afrr_energy_audit")
                 if afrr_energy_audit.empty:
@@ -2123,7 +2188,7 @@ def main() -> None:
                         yaxis_title="MWh",
                         yaxis2={"title": "diff ratio", "overlaying": "y", "side": "right", "range": [0, max(0.12, float(afrr_energy_audit["afrr_energy_reporting_diff_pct"].max()) * 1.2)]},
                     )
-                    st.plotly_chart(apply_chart_style(energy_audit_fig, template, height=320, title="aFRR delivered energy reconciliation"), use_container_width=True)
+                    st.plotly_chart(apply_chart_style(energy_audit_fig, template, height=320, title="aFRR delivered energy reconciliation"), use_container_width=True, key="lower_live_afrr_energy_audit")
 
                 lower_cols = [
                     "inner_solver_status",
@@ -2164,13 +2229,17 @@ def main() -> None:
                 st.info("Lower MPC has not produced a tracking trace yet. If it is armed early, it will attach when the Market Pressure countdown reaches zero.")
 
     with tabs[5]:
-        st.subheader("Simulation & Impact Visualizations")
-        result = st.session_state.get("mpc_result")
+        st.subheader("Settlement & Impact")
+        result = st.session_state.get("upper_mpc_result", st.session_state.get("mpc_result"))
+        lower_result_for_viz = st.session_state.get("live_lower_result", {})
         if not result or result["history"].empty:
             st.info("Run the MPC tab to populate the simulation results.")
         else:
             result_df = result["history"]
-            tracking_df = live_visible_frame(result.get("tracking_4s", pd.DataFrame()), st.session_state.get("live_market_session", {}))
+            lower_tracking_source = result_frame(lower_result_for_viz, "tracking_4s")
+            if lower_tracking_source.empty:
+                lower_tracking_source = result.get("tracking_4s", pd.DataFrame())
+            tracking_df = live_visible_frame(lower_tracking_source, st.session_state.get("live_market_session", {}))
             viz_df = tracking_df if not tracking_df.empty else result_df
             contribution_df = viz_df
             s = result["summary"]
@@ -2219,14 +2288,32 @@ def main() -> None:
             charts[2].plotly_chart(apply_chart_style(energy_fig, template, height=330), use_container_width=True)
 
             heat_cols = st.columns(2)
-            bid_success = result_df.assign(success=(result_df["delivered_up_kw"] >= 0.9 * result_df["requested_up_kw"]).astype(int))
-            heat_cols[0].plotly_chart(apply_chart_style(availability_heatmap(result_df, "fcr_bid_kw", "FCR/aFRR bid heatmap", "PuBu"), template, height=320), use_container_width=True)
-            heat_cols[1].plotly_chart(apply_chart_style(availability_heatmap(bid_success, "success", "Bid success heatmap", "Greens"), template, height=320), use_container_width=True)
+            upper_bid_heatmap_df = result_df
+            heat_cols[0].plotly_chart(
+                apply_chart_style(availability_heatmap(upper_bid_heatmap_df, "fcr_bid_kw", "Upper bid heatmap (market intervals)", "PuBu"), template, height=320),
+                use_container_width=True,
+                key="settlement_upper_bid_heatmap",
+            )
+            if not tracking_df.empty:
+                lower_success = tracking_df.assign(success=(tracking_df["delivered_up_kw"] >= 0.9 * tracking_df["requested_up_kw"]).astype(int))
+                heat_cols[1].plotly_chart(
+                    apply_chart_style(availability_heatmap(lower_success, "success", "Lower tracking success heatmap (4-sec ticks)", "Greens"), template, height=320),
+                    use_container_width=True,
+                    key="settlement_lower_success_heatmap",
+                )
+            else:
+                bid_success = result_df.assign(success=(result_df.get("market_gate_status", pd.Series(index=result_df.index, dtype=object)).astype(str) == "Participate").astype(int))
+                heat_cols[1].plotly_chart(
+                    apply_chart_style(availability_heatmap(bid_success, "success", "Upper market-gate success heatmap (market intervals)", "Greens"), template, height=320),
+                    use_container_width=True,
+                    key="settlement_upper_success_heatmap",
+                )
 
             if not tracking_df.empty:
                 st.markdown("### Centralized 4-second MPC")
                 st.caption("This view shows the centralized lower-layer MPC following the reserve request through simulated gateway commands.")
-                tracking_window = tracking_df.iloc[: min(len(tracking_df), max(450, int(3600 / 4)))]
+                window_ticks = min(len(tracking_df), max(450, int(3600 / 4)))
+                tracking_window = tracking_df.tail(window_ticks)
                 tracking_fig = go.Figure()
                 tracking_fig.add_trace(
                     go.Scatter(
@@ -2266,7 +2353,7 @@ def main() -> None:
                     go.Scatter(x=tracking_window.index, y=-tracking_window["pv_down_kw"] / 1000.0, name="PV down", line={"color": RESOURCE_COLORS["PV"], "dash": "dot"})
                 )
                 tracking_fig.update_layout(yaxis_title="MW")
-                st.plotly_chart(apply_chart_style(tracking_fig, template, height=380, title="Lower MPC reserve tracking"), use_container_width=True)
+                st.plotly_chart(apply_chart_style(tracking_fig, template, height=380, title="Lower MPC reserve tracking"), use_container_width=True, key="settlement_lower_tracking")
 
                 lower_left, lower_right = st.columns([1.15, 1.0])
                 allocation_fig = go.Figure()
@@ -2277,7 +2364,7 @@ def main() -> None:
                 allocation_fig.add_trace(go.Scatter(x=tracking_window.index, y=-tracking_window["ev_down_kw"] / 1000.0, name="EV down", stackgroup="down", line={"color": RESOURCE_COLORS["EV"], "dash": "dot"}))
                 allocation_fig.add_trace(go.Scatter(x=tracking_window.index, y=-tracking_window["pv_down_kw"] / 1000.0, name="PV down", stackgroup="down", line={"color": RESOURCE_COLORS["PV"]}))
                 allocation_fig.update_layout(yaxis_title="MW")
-                lower_left.plotly_chart(apply_chart_style(allocation_fig, template, height=340, title="Lower MPC appliance allocation"), use_container_width=True)
+                lower_left.plotly_chart(apply_chart_style(allocation_fig, template, height=340, title="Lower MPC appliance allocation"), use_container_width=True, key="settlement_lower_allocation")
 
                 diagnostic_cols = [
                     col
@@ -2293,7 +2380,7 @@ def main() -> None:
                 ]
                 if diagnostic_cols:
                     diagnostic_fig = signal_line_figure(tracking_window, diagnostic_cols, "Lower MPC tracking diagnostics", "kW")
-                    lower_right.plotly_chart(apply_chart_style(diagnostic_fig, template, height=340), use_container_width=True)
+                    lower_right.plotly_chart(apply_chart_style(diagnostic_fig, template, height=340), use_container_width=True, key="settlement_lower_diagnostics")
 
                 if {"afrr_accuracy_ratio", "afrr_accuracy_low", "afrr_accuracy_high"}.issubset(tracking_window.columns):
                     accuracy_fig = go.Figure()
@@ -2301,9 +2388,11 @@ def main() -> None:
                     accuracy_fig.add_trace(go.Scatter(x=tracking_window.index, y=tracking_window["afrr_accuracy_low"], name="90%", line={"color": "#6b7280", "dash": "dash"}))
                     accuracy_fig.add_trace(go.Scatter(x=tracking_window.index, y=tracking_window["afrr_accuracy_high"], name="110%", line={"color": "#6b7280", "dash": "dash"}))
                     accuracy_fig.update_layout(yaxis_title="delivered/requested")
-                    st.plotly_chart(apply_chart_style(accuracy_fig, template, height=300, title="aFRR tracking ratio in plotted data"), use_container_width=True)
+                    st.plotly_chart(apply_chart_style(accuracy_fig, template, height=300, title="aFRR tracking ratio in plotted data"), use_container_width=True, key="settlement_lower_afrr_ratio")
 
-                gateway_commands = result.get("gateway_commands", pd.DataFrame())
+                gateway_commands = result_frame(lower_result_for_viz, "gateway_commands")
+                if gateway_commands.empty:
+                    gateway_commands = result.get("gateway_commands", pd.DataFrame())
                 if not gateway_commands.empty:
                     device_filter = st.multiselect(
                         "Gateway command appliance filter",
@@ -2522,7 +2611,7 @@ def main() -> None:
             )
 
     if live_refresh_requested:
-        time.sleep(1)
+        time.sleep(4)
         st.rerun()
 
 

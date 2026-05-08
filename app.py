@@ -531,6 +531,186 @@ def upper_socket_metrics(result: Dict[str, object] | None) -> Dict[str, object]:
     }
 
 
+def render_lower_live_trace(
+    lower_result: Dict[str, object] | None,
+    session: Dict[str, object] | None,
+    template: str,
+    key_prefix: str,
+    fallback_result: Dict[str, object] | None = None,
+    title: str = "Lower MPC 4-second Optimization Trace",
+    include_debug_table: bool = True,
+) -> bool:
+    lower_tracking_full = result_frame(lower_result, "tracking_4s")
+    if lower_tracking_full.empty:
+        return False
+
+    st.markdown(f"### {title}")
+    live_lower_tracking = live_visible_frame(lower_tracking_full, session)
+    lower_visible = live_lower_tracking if not live_lower_tracking.empty else lower_tracking_full
+    if lower_visible.empty:
+        return False
+
+    lm1, lm2, lm3, lm4 = st.columns(4)
+    lm1.metric("Visible 4-sec ticks", f"{len(lower_visible):,}")
+    lm2.metric("Visible mean abs error", f"{float(lower_visible['tracking_error_kw'].abs().mean()):.2f} kW")
+    lm3.metric("Visible max latency", f"{float(lower_visible.get('control_latency_ms', pd.Series([0.0])).max()):.1f} ms")
+    lm4.metric("Visible recovery ticks", f"{int(lower_visible.get('recovery_mode', pd.Series(dtype=bool)).astype(bool).sum()):,}")
+
+    lower_trace_fig = go.Figure()
+    signed_request = lower_visible["requested_up_kw"] - lower_visible["requested_down_kw"]
+    signed_delivery = lower_visible["delivered_up_kw"] - lower_visible["delivered_down_kw"]
+    lower_trace_fig.add_trace(
+        go.Scatter(
+            x=lower_visible.index,
+            y=signed_request / 1000.0,
+            name="TSO request",
+            line={"color": RESOURCE_COLORS["Frequency"], "dash": "dot"},
+        )
+    )
+    lower_trace_fig.add_trace(
+        go.Scatter(
+            x=lower_visible.index,
+            y=signed_delivery / 1000.0,
+            name="Lower delivered",
+            line={"color": RESOURCE_COLORS["Net"], "width": 3},
+        )
+    )
+    if {"committed_up_kw", "committed_down_kw"}.issubset(lower_visible.columns):
+        lower_trace_fig.add_trace(
+            go.Scatter(
+                x=lower_visible.index,
+                y=lower_visible["committed_up_kw"] / 1000.0,
+                name="Committed up limit",
+                line={"color": "#6b7280", "dash": "dash"},
+            )
+        )
+        lower_trace_fig.add_trace(
+            go.Scatter(
+                x=lower_visible.index,
+                y=-lower_visible["committed_down_kw"] / 1000.0,
+                name="Committed down limit",
+                line={"color": "#6b7280", "dash": "dash"},
+            )
+        )
+    lower_trace_fig.update_layout(yaxis_title="MW")
+    st.plotly_chart(
+        apply_chart_style(lower_trace_fig, template, height=340, title="Lower MPC live request vs delivered"),
+        use_container_width=True,
+        key=f"{key_prefix}_request_delivery",
+    )
+
+    lower_diag_left, lower_diag_right = st.columns([1.15, 1.0])
+    if {"fleet_power_before_kw", "fleet_power_after_kw", "target_command_kw"}.issubset(lower_visible.columns):
+        power_fig = signal_line_figure(
+            lower_visible,
+            ["fleet_power_before_kw", "fleet_power_after_kw", "target_command_kw"],
+            "Lower MPC internal power state",
+            "kW",
+        )
+        lower_diag_left.plotly_chart(
+            apply_chart_style(power_fig, template, height=320),
+            use_container_width=True,
+            key=f"{key_prefix}_internal_power",
+        )
+    if {"control_latency_ms", "control_deadline_ms"}.issubset(lower_visible.columns):
+        latency_fig = signal_line_figure(lower_visible, ["control_latency_ms", "control_deadline_ms"], "4-second control deadline check", "ms")
+        lower_diag_right.plotly_chart(
+            apply_chart_style(latency_fig, template, height=320),
+            use_container_width=True,
+            key=f"{key_prefix}_latency",
+        )
+
+    if {"afrr_accuracy_ratio", "afrr_accuracy_low", "afrr_accuracy_high"}.issubset(lower_visible.columns):
+        accuracy_fig = go.Figure()
+        accuracy_fig.add_trace(
+            go.Scatter(
+                x=lower_visible.index,
+                y=lower_visible["afrr_accuracy_ratio"],
+                name="aFRR delivered/requested",
+                line={"color": RESOURCE_COLORS["Net"], "width": 3},
+            )
+        )
+        accuracy_fig.add_trace(go.Scatter(x=lower_visible.index, y=lower_visible["afrr_accuracy_low"], name="90% floor", line={"color": "#6b7280", "dash": "dash"}))
+        accuracy_fig.add_trace(go.Scatter(x=lower_visible.index, y=lower_visible["afrr_accuracy_high"], name="110% ceiling", line={"color": "#6b7280", "dash": "dash"}))
+        accuracy_fig.update_layout(yaxis_title="ratio")
+        st.plotly_chart(
+            apply_chart_style(accuracy_fig, template, height=300, title="aFRR 90-110% tracking audit"),
+            use_container_width=True,
+            key=f"{key_prefix}_afrr_accuracy",
+        )
+
+    afrr_energy_audit = result_frame(lower_result, "afrr_energy_audit")
+    if afrr_energy_audit.empty:
+        afrr_energy_audit = result_frame(fallback_result, "afrr_energy_audit")
+    if not afrr_energy_audit.empty:
+        st.markdown("### aFRR settlement-period energy audit")
+        energy_audit_fig = go.Figure()
+        energy_audit_fig.add_trace(go.Bar(x=afrr_energy_audit["isp_start"], y=afrr_energy_audit["afrr_reported_energy_mwh"], name="BSP reported aFRR energy"))
+        energy_audit_fig.add_trace(go.Bar(x=afrr_energy_audit["isp_start"], y=afrr_energy_audit["afrr_fingrid_calculated_energy_mwh"], name="Fingrid-calculated proxy"))
+        energy_audit_fig.add_trace(
+            go.Scatter(
+                x=afrr_energy_audit["isp_start"],
+                y=afrr_energy_audit["afrr_energy_reporting_diff_pct"],
+                name="absolute diff %",
+                yaxis="y2",
+                line={"color": RESOURCE_COLORS["Frequency"], "width": 3},
+            )
+        )
+        energy_audit_fig.update_layout(
+            barmode="group",
+            yaxis_title="MWh",
+            yaxis2={
+                "title": "diff ratio",
+                "overlaying": "y",
+                "side": "right",
+                "range": [0, max(0.12, float(afrr_energy_audit["afrr_energy_reporting_diff_pct"].max()) * 1.2)],
+            },
+        )
+        st.plotly_chart(
+            apply_chart_style(energy_audit_fig, template, height=320, title="aFRR delivered energy reconciliation"),
+            use_container_width=True,
+            key=f"{key_prefix}_afrr_energy_audit",
+        )
+
+    if include_debug_table:
+        lower_cols = [
+            "inner_solver_status",
+            "optimization_strategy",
+            "requested_signed_kw",
+            "requested_up_kw",
+            "requested_down_kw",
+            "delivered_signed_kw",
+            "delivered_up_kw",
+            "delivered_down_kw",
+            "ideal_delivered_kw",
+            "telemetry_error_kw",
+            "raw_request_kw",
+            "socket_up_kw",
+            "socket_down_kw",
+            "socket_violation_up_kw",
+            "socket_violation_down_kw",
+            "tracking_error_kw",
+            "tracking_tolerance_kw",
+            "active_capacity_kw",
+            "buffer_capacity_kw",
+            "buffer_used_kw",
+            "fast_bridge_used_kw",
+            "afrr_accuracy_ratio",
+            "afrr_reporting_error_kw",
+            "fcr_response_ratio",
+            "recovery_mode",
+            "error_rising",
+            "control_latency_ms",
+            "control_deadline_met",
+        ]
+        st.dataframe(
+            styled_dataframe(lower_tracking_full[[col for col in lower_cols if col in lower_tracking_full.columns]].head(80).round(3)),
+            use_container_width=True,
+            height=320,
+        )
+    return True
+
+
 def build_live_market_feed(
     preview_4s: pd.DataFrame,
     upper_result: Dict[str, object],
@@ -1439,7 +1619,7 @@ def main() -> None:
         st.info(SIMULATION_ONLY_NOTICE)
         st.caption(
             f"The outer MPC, synthetic portfolio, and forecasting loop run at a {freq_minutes}-minute interval. "
-            "First run the upper MPC socket, then start market pressure, then arm the lower 4-second MPC against the live market clock."
+            "First run the upper MPC socket, then start the simulated market. The lower 4-second MPC is auto-armed against the live market clock."
         )
         opt1, opt2, opt3, opt4 = st.columns(4)
         market_mode = opt1.selectbox("Market product", ["Combined", "FCR-N", "aFRR"], help="Combined allows the MPC to split the portfolio across both products.")
@@ -1567,9 +1747,13 @@ def main() -> None:
             market_status = live_market_status(live_market_session)
             st.warning("Stopped the live market session because the current upper MPC result has no accepted reserve socket.")
         market_started = bool(live_market_session) and market_status["status"] in {"scheduled", "live", "closed"}
+        lower_already_armed = bool(st.session_state.get("lower_mpc_armed", False))
         run_upper_mpc = btn_upper.button("Run Upper MPC Layer", type="primary")
         start_market_pressure = btn_market.button("Start Simulated Market", disabled=not upper_socket_ready or market_status["status"] in {"scheduled", "live"})
-        activate_lower_mpc = btn_lower.button("Activate Lower MPC", disabled=not market_started or not upper_socket_ready)
+        activate_lower_mpc = btn_lower.button(
+            "Lower MPC Auto-Armed" if lower_already_armed else "Activate Lower MPC",
+            disabled=not market_started or not upper_socket_ready or lower_already_armed,
+        )
         stop_live_market = btn_stop.button("Stop Simulated Market", disabled=not bool(live_market_session))
         if upper_market_ready and not socket_metrics["ready"]:
             st.warning(
@@ -1694,9 +1878,9 @@ def main() -> None:
                 start_wall_time_s=now_s + float(market_delay_seconds),
             )
             st.session_state["live_market_ticks"] = []
-            st.session_state["lower_mpc_armed"] = False
+            st.session_state["lower_mpc_armed"] = True
             st.session_state.pop("live_lower_result", None)
-            st.session_state["mpc_phase"] = "market_scheduled"
+            st.session_state["mpc_phase"] = "lower_waiting"
             st.rerun()
 
         if stop_live_market:
@@ -1720,6 +1904,9 @@ def main() -> None:
             live_market_session = st.session_state.get("live_market_session", {})
             market_status = live_market_status(live_market_session)
             lower_armed = bool(st.session_state.get("lower_mpc_armed", False))
+            if live_market_session and st.session_state.get("live_lower_result"):
+                lower_armed = True
+                st.session_state["lower_mpc_armed"] = True
             runtime_market_feed = (
                 sync_market_simulator_feed(
                     preview_4s,
@@ -1791,6 +1978,17 @@ def main() -> None:
                         use_container_width=True,
                         key="live_market_pressure_signal",
                     )
+                lower_rendered = render_lower_live_trace(
+                    st.session_state.get("live_lower_result", {}),
+                    live_market_session,
+                    template,
+                    key_prefix="fragment_lower_live",
+                    fallback_result=st.session_state.get("upper_mpc_result", {}),
+                    title="Live lower MPC replay",
+                    include_debug_table=False,
+                )
+                if lower_armed and not lower_rendered and market_status["status"] == "live":
+                    st.info("Lower MPC is armed and will draw the live request/delivery plot as soon as the first 4-second solve finishes.")
                 return bool(market_status["status"] in {"scheduled", "live"})
             return False
 

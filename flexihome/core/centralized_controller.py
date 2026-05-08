@@ -10,6 +10,10 @@ import numpy as np
 import pandas as pd
 
 DEVICE_ORDER = ["BESS", "EV", "HVAC", "PV"]
+FCR_N_MIN_BID_KW = 100.0
+FCR_N_BID_GRANULARITY_KW = 100.0
+AFRR_MIN_BID_KW = 1000.0
+AFRR_BID_GRANULARITY_KW = 1000.0
 RECOVERY_PRIORITY = ["BESS", "EV", "HVAC", "PV"]
 FCR_N_RESPONSE_63_SECONDS = 60.0
 FCR_N_RESPONSE_95_SECONDS = 180.0
@@ -534,6 +538,48 @@ class CentralizedVPPController:
         pv_down = float(plan.get("pv_afrr_down_kw", 0.0))
         if pv_down > 0.001:
             plan["pv_afrr_down_kw"] = min(pv_down, caps["PV"]["down"])
+        self._snap_derated_plan_to_market_segments(plan)
+
+    def _floor_market_segment(self, total_kw: float, min_kw: float, granularity_kw: float) -> float:
+        total = float(total_kw)
+        if total + 1e-6 < min_kw:
+            return total
+        segments = int(np.floor((total + 1e-6) / max(granularity_kw, 1e-9)))
+        return float(max(segments, 0) * granularity_kw)
+
+    def _scale_plan_keys(self, plan: Dict[str, float], keys: List[str], target_total_kw: float) -> None:
+        current_total = float(sum(float(plan.get(key, 0.0)) for key in keys))
+        if current_total <= 1e-9:
+            for key in keys:
+                plan[key] = 0.0
+            return
+        ratio = float(np.clip(target_total_kw / current_total, 0.0, 1.0))
+        for key in keys:
+            plan[key] = float(plan.get(key, 0.0)) * ratio
+
+    def _snap_derated_plan_to_market_segments(self, plan: Dict[str, float]) -> None:
+        """Keep selected-roster derating from creating non-biddable aggregates."""
+
+        fcr_keys = ["bess_fcr_kw", "ev_fcr_kw", "hvac_fcr_kw"]
+        afrr_up_keys = ["bess_afrr_up_kw", "ev_afrr_up_kw", "hvac_afrr_up_kw"]
+        afrr_down_keys = ["bess_afrr_down_kw", "ev_afrr_down_kw", "hvac_afrr_down_kw", "pv_afrr_down_kw"]
+
+        fcr_target = self._floor_market_segment(sum(float(plan.get(key, 0.0)) for key in fcr_keys), FCR_N_MIN_BID_KW, FCR_N_BID_GRANULARITY_KW)
+        afrr_up_target = self._floor_market_segment(sum(float(plan.get(key, 0.0)) for key in afrr_up_keys), AFRR_MIN_BID_KW, AFRR_BID_GRANULARITY_KW)
+        afrr_down_target = self._floor_market_segment(sum(float(plan.get(key, 0.0)) for key in afrr_down_keys), AFRR_MIN_BID_KW, AFRR_BID_GRANULARITY_KW)
+
+        self._scale_plan_keys(plan, fcr_keys, fcr_target)
+        self._scale_plan_keys(plan, afrr_up_keys, afrr_up_target)
+        self._scale_plan_keys(plan, afrr_down_keys, afrr_down_target)
+        plan["fcr_bid_kw"] = float(fcr_target)
+        plan["afrr_up_bid_kw"] = float(afrr_up_target)
+        plan["afrr_down_bid_kw"] = float(afrr_down_target)
+        plan["fcr_bid_mw"] = float(fcr_target / 1000.0)
+        plan["afrr_up_bid_mw"] = float(afrr_up_target / 1000.0)
+        plan["afrr_down_bid_mw"] = float(afrr_down_target / 1000.0)
+        plan["fcr_bid_segments"] = int(round(fcr_target / FCR_N_BID_GRANULARITY_KW)) if fcr_target >= FCR_N_MIN_BID_KW else 0
+        plan["afrr_up_segments"] = int(round(afrr_up_target / AFRR_BID_GRANULARITY_KW)) if afrr_up_target >= AFRR_MIN_BID_KW else 0
+        plan["afrr_down_segments"] = int(round(afrr_down_target / AFRR_BID_GRANULARITY_KW)) if afrr_down_target >= AFRR_MIN_BID_KW else 0
 
     def _requirements_by_type(self, plan: Dict[str, float], resource_mode: str) -> Dict[str, Dict[str, float]]:
         requirements = {

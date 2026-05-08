@@ -209,6 +209,32 @@ def main() -> None:
     if overload_tracking["requested_up_kw"].max() > overload_tracking["committed_up_kw"].max() + 1e-6:
         raise SystemExit("Requested reserve should never exceed committed upward reserve.")
 
+    derated_market_plan = {
+        "bess_fcr_kw": 350.0,
+        "ev_fcr_kw": 250.0,
+        "hvac_fcr_kw": 100.0,
+        "bess_afrr_up_kw": 3000.0,
+        "ev_afrr_up_kw": 1000.0,
+        "hvac_afrr_up_kw": 508.92,
+        "bess_afrr_down_kw": 1000.0,
+        "ev_afrr_down_kw": 500.0,
+        "hvac_afrr_down_kw": 174.933,
+        "pv_afrr_down_kw": 0.0,
+    }
+    controller._snap_derated_plan_to_market_segments(derated_market_plan)
+    derated_fcr = derated_market_plan["bess_fcr_kw"] + derated_market_plan["ev_fcr_kw"] + derated_market_plan["hvac_fcr_kw"]
+    derated_afrr_up = derated_market_plan["bess_afrr_up_kw"] + derated_market_plan["ev_afrr_up_kw"] + derated_market_plan["hvac_afrr_up_kw"]
+    derated_afrr_down = (
+        derated_market_plan["bess_afrr_down_kw"]
+        + derated_market_plan["ev_afrr_down_kw"]
+        + derated_market_plan["hvac_afrr_down_kw"]
+        + derated_market_plan["pv_afrr_down_kw"]
+    )
+    if abs(derated_fcr - 700.0) > 1e-6 or abs(derated_afrr_up - 4000.0) > 1e-6 or abs(derated_afrr_down - 1000.0) > 1e-6:
+        raise SystemExit("Selected-roster derating must snap market bids down to valid FCR-N/aFRR segments.")
+    if derated_market_plan["afrr_up_segments"] != 4 or derated_market_plan["afrr_down_segments"] != 1:
+        raise SystemExit("Derated aFRR segment metadata should match the executable market bid.")
+
     combined_plan = dict(plan)
     combined_plan.update(
         {

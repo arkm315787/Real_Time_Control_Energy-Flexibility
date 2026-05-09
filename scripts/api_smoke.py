@@ -16,12 +16,12 @@ from flexihome.api.optimizer import app
 
 SMALL_PORTFOLIO = {
     "days": 1,
-    "n_homes": 80,
+    "n_homes": 1200,
     "freq_minutes": 15,
-    "ev_pen": 0.2,
-    "bess_pen": 0.2,
-    "pv_pen": 0.3,
-    "hvac_pen": 0.5,
+    "ev_pen": 0.35,
+    "bess_pen": 0.30,
+    "pv_pen": 0.45,
+    "hvac_pen": 0.80,
 }
 
 

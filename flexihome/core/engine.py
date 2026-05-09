@@ -861,6 +861,31 @@ def _apply_fcr_n_bid_rules(values: Dict[str, float]) -> Dict[str, float]:
     payload["fcr_symmetric"] = True
     return _market_bid_metadata(payload)
 
+
+def _apply_afrr_bid_rules(values: Dict[str, float]) -> Dict[str, float]:
+    """Round aFRR up/down capacity to market granularity while preserving resource mix."""
+
+    payload = dict(values)
+    min_kw = float(FINGRID_RULES["aFRR"]["min_bid_kw"])
+    granularity_kw = float(FINGRID_RULES["aFRR"]["bid_granularity_kw"])
+    groups = (
+        ("up", ("bess_afrr_up_kw", "ev_afrr_up_kw", "hvac_afrr_up_kw")),
+        ("down", ("bess_afrr_down_kw", "ev_afrr_down_kw", "hvac_afrr_down_kw", "pv_afrr_down_kw")),
+    )
+    for _, keys in groups:
+        total_kw = sum(float(payload.get(key, 0.0) or 0.0) for key in keys)
+        if total_kw <= 0.0:
+            quantized_kw = 0.0
+        else:
+            quantized_kw = np.floor(total_kw / max(granularity_kw, 1e-9)) * granularity_kw
+            if quantized_kw < min_kw:
+                quantized_kw = 0.0
+        ratio = quantized_kw / total_kw if total_kw > 1e-9 else 0.0
+        for key in keys:
+            payload[key] = float(payload.get(key, 0.0) * ratio)
+    return _market_bid_metadata(payload)
+
+
 def serialize_forecast_spec(spec: ForecastSpec) -> bytes:
     payload = {
         "target": spec.target,
@@ -1513,6 +1538,7 @@ def heuristic_mpc_step(
     market_mode: str,
     resource_mode: str,
     fleet_meta: Dict[str, float],
+    penalty_weights: Dict[str, float] | None = None,
 ) -> Dict[str, object]:
     """Fallback scheduler used when the LP solver is unavailable.
 
@@ -1521,6 +1547,12 @@ def heuristic_mpc_step(
     conservative: it avoids claiming HVAC/PV flexibility in "Fast only" mode and
     subtracts FCR commitments before assigning aFRR capacity.
     """
+
+    penalty_weights = apply_risk_policy_defaults(penalty_weights or {})
+    risk_quantile = float(np.clip(penalty_weights.get("risk_quantile", 0.80), 0.50, 0.95))
+    reserve_buffer_pct = float(np.clip(penalty_weights.get("reserve_buffer_pct", 0.08), 0.0, 0.40))
+    risk_factors = _risk_factors(risk_quantile, reserve_buffer_pct)
+    forecast_df = _attach_market_price_bid_forecasts(forecast_df, risk_quantile)
 
     rows = []
     only_fast = resource_mode == "Fast only"
@@ -1545,21 +1577,21 @@ def heuristic_mpc_step(
         if fcr_on:
             bess_up_energy_kw = max((bess_soc - 0.10 * bess_cap) * 1000.0 * eta_d / max(fcr_endurance_h, 1e-6), 0.0)
             bess_down_energy_kw = max((0.95 * bess_cap - bess_soc) * 1000.0 / (max(fcr_endurance_h, 1e-6) * eta_c), 0.0)
-            bess_fcr = float(min(row["bess_up_kw"], row["bess_down_kw"], bess_up_energy_kw, bess_down_energy_kw))
+            bess_fcr = float(min(float(row["bess_up_kw"]) * risk_factors["BESS"], float(row["bess_down_kw"]) * risk_factors["BESS"], bess_up_energy_kw, bess_down_energy_kw))
             ev_actual_soc = float(row["ev_soc_ref_mwh"]) + ev_delta
             ev_up_energy_kw = max((ev_actual_soc - float(row["ev_soc_min_mwh"])) * 1000.0 * eta_d / max(fcr_endurance_h, 1e-6), 0.0)
             ev_down_energy_kw = max((float(row["ev_soc_max_mwh"]) - ev_actual_soc) * 1000.0 / (max(fcr_endurance_h, 1e-6) * eta_c), 0.0)
-            ev_fcr = float(min(row["ev_up_kw"], row["ev_down_kw"], ev_up_energy_kw, ev_down_energy_kw))
-            hvac_fcr_cap = enable_hvac * fcr_n_dynamic_deliverable_kw(row["hvac_up_kw"], row["hvac_down_kw"], hvac_response_s, hvac_delay_s)
+            ev_fcr = float(min(float(row["ev_up_kw"]) * risk_factors["EV"], float(row["ev_down_kw"]) * risk_factors["EV"], ev_up_energy_kw, ev_down_energy_kw))
+            hvac_fcr_cap = enable_hvac * risk_factors["HVAC"] * fcr_n_dynamic_deliverable_kw(row["hvac_up_kw"], row["hvac_down_kw"], hvac_response_s, hvac_delay_s)
             hvac_fcr = float(min(hvac_fcr_cap, _fcr_n_hvac_share_limit(bess_fcr + ev_fcr, fleet_meta)))
 
-        bess_up_av = max(float(row["bess_up_kw"]) - bess_fcr, 0.0)
-        bess_down_av = max(float(row["bess_down_kw"]) - bess_fcr, 0.0)
-        ev_up_av = max(float(row["ev_up_kw"]) - ev_fcr, 0.0)
-        ev_down_av = max(float(row["ev_down_kw"]) - ev_fcr, 0.0)
-        hvac_up_av = enable_hvac * max(float(row["hvac_up_kw"]) - hvac_fcr, 0.0)
-        hvac_down_av = enable_hvac * max(float(row["hvac_down_kw"]) - hvac_fcr, 0.0)
-        pv_down = enable_pv * float(row["pv_down_kw"]) if afrr_on else 0.0
+        bess_up_av = max(float(row["bess_up_kw"]) * risk_factors["BESS"] - bess_fcr, 0.0)
+        bess_down_av = max(float(row["bess_down_kw"]) * risk_factors["BESS"] - bess_fcr, 0.0)
+        ev_up_av = max(float(row["ev_up_kw"]) * risk_factors["EV"] - ev_fcr, 0.0)
+        ev_down_av = max(float(row["ev_down_kw"]) * risk_factors["EV"] - ev_fcr, 0.0)
+        hvac_up_av = enable_hvac * max(float(row["hvac_up_kw"]) * risk_factors["HVAC"] - hvac_fcr, 0.0)
+        hvac_down_av = enable_hvac * max(float(row["hvac_down_kw"]) * risk_factors["HVAC"] - hvac_fcr, 0.0)
+        pv_down = enable_pv * float(row["pv_down_kw"]) * risk_factors["PV"] if afrr_on else 0.0
 
         bess_up = bess_up_av if afrr_on else 0.0
         bess_down = bess_down_av if afrr_on else 0.0
@@ -1587,27 +1619,59 @@ def heuristic_mpc_step(
             / max(float(fleet_meta["n_hvac"]), 1.0)
         )
 
-        values = _apply_fcr_n_bid_rules(
-            {
-                "bess_fcr_kw": bess_fcr,
-                "ev_fcr_kw": ev_fcr,
-                "hvac_fcr_kw": hvac_fcr,
-                "bess_afrr_up_kw": bess_up,
-                "bess_afrr_down_kw": bess_down,
-                "ev_afrr_up_kw": ev_up,
-                "ev_afrr_down_kw": ev_down,
-                "hvac_afrr_up_kw": hvac_up,
-                "hvac_afrr_down_kw": hvac_down,
-                "pv_afrr_down_kw": pv_down,
-                "bess_soc_mwh_plan": bess_soc,
-                "ev_delta_mwh_plan": ev_delta,
-                "temp_delta_c_plan": temp_delta,
-                "hvac_fcr_dynamic_cap_kw": hvac_fcr_cap if fcr_on else 0.0,
-                "hvac_fcr_dynamic_fraction": fcr_n_dynamic_deliverable_fraction(hvac_response_s, hvac_delay_s),
-                "fcr_hvac_share_cap": _fcr_n_hvac_share_cap(fleet_meta),
-            }
+        values = _apply_afrr_bid_rules(
+            _apply_fcr_n_bid_rules(
+                {
+                    "bess_fcr_kw": bess_fcr,
+                    "ev_fcr_kw": ev_fcr,
+                    "hvac_fcr_kw": hvac_fcr,
+                    "bess_afrr_up_kw": bess_up,
+                    "bess_afrr_down_kw": bess_down,
+                    "ev_afrr_up_kw": ev_up,
+                    "ev_afrr_down_kw": ev_down,
+                    "hvac_afrr_up_kw": hvac_up,
+                    "hvac_afrr_down_kw": hvac_down,
+                    "pv_afrr_down_kw": pv_down,
+                    "bess_soc_mwh_plan": bess_soc,
+                    "ev_delta_mwh_plan": ev_delta,
+                    "temp_delta_c_plan": temp_delta,
+                    "hvac_fcr_dynamic_cap_kw": hvac_fcr_cap if fcr_on else 0.0,
+                    "hvac_fcr_dynamic_fraction": fcr_n_dynamic_deliverable_fraction(hvac_response_s, hvac_delay_s),
+                    "fcr_hvac_share_cap": _fcr_n_hvac_share_cap(fleet_meta),
+                }
+            )
         )
         values.update(_fcr_n_bid_dynamic_metrics(values, fleet_meta))
+        values.update(_market_price_bid_audit(row))
+        risk_costs = _risk_cost_terms(values, row, dt_h, risk_factors, penalty_weights)
+        cap_revenue = dt_h / 1000.0 * (
+            float(row[_price_bid_column("fcrn_capacity_eur_per_mw_h")]) * float(values["fcr_bid_kw"])
+            + float(row[_price_bid_column("afrr_up_capacity_eur_per_mw_h")]) * float(values["afrr_up_bid_kw"])
+            + float(row[_price_bid_column("afrr_down_capacity_eur_per_mw_h")]) * float(values["afrr_down_bid_kw"])
+        )
+        energy_revenue = dt_h / 1000.0 * (
+            float(row["afrr_up_energy_eur_per_mwh"]) * afrr_up_frac * float(values["afrr_up_bid_kw"])
+            + float(row["afrr_down_energy_eur_per_mwh"]) * afrr_down_frac * float(values["afrr_down_bid_kw"])
+        )
+        degradation = penalty_weights["degradation"] * dt_h / 1000.0 * (
+            (afrr_up_frac * float(values["bess_afrr_up_kw"]) + afrr_down_frac * float(values["bess_afrr_down_kw"]) + (fcr_up_frac + fcr_down_frac) * float(values["bess_fcr_kw"]))
+            + 0.4 * (afrr_up_frac * float(values["ev_afrr_up_kw"]) + afrr_down_frac * float(values["ev_afrr_down_kw"]) + (fcr_up_frac + fcr_down_frac) * float(values["ev_fcr_kw"]))
+        )
+        risk_adjusted_profit = cap_revenue + energy_revenue - degradation - float(risk_costs["asset_fatigue_cost_eur"])
+        values.update(
+            {
+                "non_delivery_risk_cost_eur": float(risk_costs["non_delivery_risk_cost_eur"]),
+                "activation_uncertainty_cost_eur": float(risk_costs["activation_uncertainty_cost_eur"]),
+                "asset_fatigue_cost_eur": float(risk_costs["asset_fatigue_cost_eur"]),
+                "risk_adjusted_profit_eur": float(risk_adjusted_profit),
+                "risk_policy": str(penalty_weights.get("risk_policy", "investor_balanced")),
+                "risk_quantile": float(risk_quantile),
+                "reserve_buffer_pct": float(reserve_buffer_pct),
+                "reserve_buffer_kw": float(risk_costs["reserve_buffer_kw"]),
+                "stacking_ok": True,
+                "energy_endurance_ok": True,
+            }
+        )
         rows.append(values)
 
     schedule = pd.DataFrame(rows, index=forecast_df.index)
@@ -1950,10 +2014,10 @@ def solve_mpc_step(
     try:
         problem.solve(PULP_CBC_CMD(msg=False))
     except Exception:
-        return heuristic_mpc_step(forecast_df, state, market_mode, resource_mode, fleet_meta)
+        return heuristic_mpc_step(forecast_df, state, market_mode, resource_mode, fleet_meta, penalty_weights)
 
     if LpStatus[problem.status] not in {"Optimal", "Not Solved"}:
-        return heuristic_mpc_step(forecast_df, state, market_mode, resource_mode, fleet_meta)
+        return heuristic_mpc_step(forecast_df, state, market_mode, resource_mode, fleet_meta, penalty_weights)
 
     rows = []
     for k in idxs:

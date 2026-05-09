@@ -2,7 +2,7 @@
 
 FlexiHome is a development-stage Virtual Power Plant platform for residential energy flexibility. The current system models how aggregated homes with BESS, EV, HVAC, and PV resources can be forecasted, selected, and dispatched for Fingrid-oriented reserve products.
 
-This branch, `codex-fastapi-api-layer`, is the active development branch. It contains the Streamlit operator dashboard, FastAPI optimizer service, plugin/pipeline architecture, Airflow DAGs, and the centralized two-layer MPC control prototype.
+This branch, `codex/vpp-mvp-market-corrections`, is the active VPP MVP market/control branch. It builds on the `codex-fastapi-api-layer` API and pipeline foundation, then adds Fingrid-oriented market participation, risk-aware bidding, VPP technical audit screens, and the production-style 4-second centralized controller simulation.
 
 ## Product Direction
 
@@ -11,6 +11,8 @@ FlexiHome is moving from a research dashboard toward a startup-grade VPP softwar
 - centralized portfolio optimization for residential flexibility
 - traceable household and appliance participation
 - simulated gateway-level telemetry and commands
+- market-product eligibility, bid granularity, and socket-stacking checks
+- VPP technical compliance evidence for simulation review
 - clean API artifacts for downstream services
 - professional dashboard views for market, control, and contribution analysis
 - modular forecasting, optimization, pipeline, and orchestration components
@@ -196,12 +198,12 @@ Comfort is time-normalized as `comfort_weight * degC_slack * dt_h`, so changing 
 
 ## Local Setup
 
-Use Windows Command Prompt or PowerShell from the repository root.
+Use Python 3.11 from Windows Command Prompt or PowerShell.
 
 ```cmd
 git clone https://github.com/arkm315787/Real_Time_Control_Energy-Flexibility.git
 cd Real_Time_Control_Energy-Flexibility
-git switch codex-fastapi-api-layer
+git switch codex/vpp-mvp-market-corrections
 py -3 -m venv .venv
 .venv\Scripts\activate
 python -m pip install --upgrade pip
@@ -212,12 +214,16 @@ pip install -r requirements-dev.txt
 If the repository is already cloned:
 
 ```cmd
-cd /d "C:\Users\Kasutaja\OneDrive - Tallinna Tehnikaülikool\Documents\Playground\Real_Time_Control_Energy-Flexibility"
+cd /d "C:\path\to\Real_Time_Control_Energy-Flexibility"
 git fetch origin
-git switch codex-fastapi-api-layer
+git switch codex/vpp-mvp-market-corrections
 git pull
 .venv\Scripts\activate
 ```
+
+The main runtime dependencies are in `requirements.txt`. The file intentionally pins `numpy<2` and compatible Pandas, SciPy, and control-system ranges because the VPP technical-audit path imports `python-control` and Matplotlib-backed response tooling. Without the NumPy upper bound, local installs can resolve to NumPy 2.x and fail before the dashboard or smoke tests start.
+
+Use `requirements-dev.txt` for the FastAPI smoke test client. Use `requirements-airflow.txt` only inside the Airflow Docker image. Install `requirements-lstm.txt` only if you want to try the optional LSTM forecaster in the Forecasting Lab.
 
 ## Run The Dashboard
 
@@ -251,7 +257,7 @@ The API uses an in-memory job store by default. TimescaleDB persistence is optio
 ## Run A Local Optimization
 
 ```cmd
-python scripts\run_optimization.py --days 1 --n-homes 80 --horizon-hours 1 --dispatch-hours 1 --output-root runs
+python scripts\run_optimization.py --days 1 --n-homes 1200 --horizon-hours 1 --dispatch-hours 1 --output-root runs
 ```
 
 The run writes CSV and JSON artifacts under `runs/optimization_*`.
@@ -261,15 +267,17 @@ The run writes CSV and JSON artifacts under `runs/optimization_*`.
 Core local checks:
 
 ```cmd
-python -m py_compile app.py flexihome/core/engine.py flexihome/core/centralized_controller.py flexihome/api/services.py
+python -m py_compile app.py flexihome/core/engine.py flexihome/core/centralized_controller.py flexihome/core/market_data.py flexihome/api/services.py
 python scripts\centralized_mpc_smoke.py
 python scripts\risk_aware_mpc_smoke.py
+python scripts\compliance_pending_state_smoke.py
+python scripts\vpp_mvp_multi_scenario_smoke.py
 python scripts\vpp_technical_compliance_smoke.py
 python scripts\dashboard_scenario_smoke.py
 python scripts\api_smoke.py
 python scripts\plugin_smoke.py
 python scripts\pipeline_smoke.py
-python scripts\run_optimization.py --days 1 --n-homes 80 --horizon-hours 1 --dispatch-hours 1 --output-root runs
+python scripts\run_optimization.py --days 1 --n-homes 1200 --horizon-hours 1 --dispatch-hours 1 --output-root runs
 ```
 
 GitHub CI also runs:
@@ -279,6 +287,8 @@ GitHub CI also runs:
 - plugin smoke test
 - centralized 4-second MPC smoke test
 - risk-aware upper MPC smoke test
+- compliance pending-state smoke test
+- multi-scenario VPP MVP smoke test
 - five-context technical compliance smoke test
 - dashboard scenario apply smoke test
 - pipeline smoke test
@@ -355,10 +365,10 @@ Important work that remains before this can become an operational VPP platform:
 
 ## Branch Strategy
 
-The latest implementation is on:
+The latest VPP MVP market/control implementation is on:
 
 ```text
-codex-fastapi-api-layer
+codex/vpp-mvp-market-corrections
 ```
 
 Branch relationship at the time this README was updated:
@@ -367,9 +377,10 @@ Branch relationship at the time this README was updated:
 main
   -> feature/plugin-architecture
       -> codex-fastapi-api-layer
+          -> codex/vpp-mvp-market-corrections
 ```
 
-`main` is currently stale, not redundant. The recommended cleanup is to merge `codex-fastapi-api-layer` into `main`, then delete `feature/plugin-architecture` and optionally delete `codex-fastapi-api-layer` after the merge.
+`codex-fastapi-api-layer` is the API/pipeline base for this branch. `main` is currently stale, not redundant. The recommended cleanup is to merge the VPP branch forward into `main` when it is accepted, then delete superseded intermediate branches only after their changes are safely included.
 
 ## License And Usage
 

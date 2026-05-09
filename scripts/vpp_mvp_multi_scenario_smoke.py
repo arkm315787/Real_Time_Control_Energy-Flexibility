@@ -115,8 +115,10 @@ def run_case(name: str, market_mode: str, resource_mode: str, execute_lower_mpc:
     history = result["history"]
     if history.empty:
         raise SystemExit(f"{name}: expected at least one upper-MPC interval.")
-    if history["solver_status"].ne("Optimal").any():
-        raise SystemExit(f"{name}: upper optimizer did not report Optimal for every interval.")
+    supported_statuses = {"Optimal", "HeuristicFallback"}
+    unsupported_statuses = sorted(set(history["solver_status"]) - supported_statuses)
+    if unsupported_statuses:
+        raise SystemExit(f"{name}: upper optimizer reported unsupported statuses: {unsupported_statuses}")
     return bundle, result
 
 

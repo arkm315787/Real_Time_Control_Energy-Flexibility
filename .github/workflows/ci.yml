@@ -27,6 +27,12 @@ jobs:
         run: python scripts/centralized_mpc_smoke.py
       - name: Risk-aware upper MPC smoke test
         run: python scripts/risk_aware_mpc_smoke.py
+      - name: Compliance pending-state smoke test
+        run: python scripts/compliance_pending_state_smoke.py
+      - name: Multi-scenario VPP MVP smoke test
+        run: python scripts/vpp_mvp_multi_scenario_smoke.py
+      - name: Technical compliance smoke test
+        run: python scripts/vpp_technical_compliance_smoke.py
       - name: Dashboard scenario apply smoke test
         run: python scripts/dashboard_scenario_smoke.py
       - name: Pipeline DAG smoke test

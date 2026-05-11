@@ -1,8 +1,8 @@
-# FlexiHome: Docker, Airflow, and Application Architecture - Detailed Explanation
+# Coverly: Docker, Airflow, and Application Architecture - Detailed Explanation
 
 ## 1. WHERE YOUR APPLICATION ACTUALLY LIVES
 
-Your FlexiHome application exists in **THREE DIFFERENT PLACES**:
+Your Coverly application exists in **THREE DIFFERENT PLACES**:
 
 ### 1.1 On Your Computer (Host Machine)
 - **Location**: `C:\Users\Kasutaja\OneDrive - Tallinna Tehnikaülikool\Documents\Playground\Real_Time_Control_Energy-Flexibility\`
@@ -182,7 +182,7 @@ At this URL, you can:
 │  │                                                    │  │
 │  │ Reads from TimescaleDB in container ──────────────┼──┼─►
 │  │ Runs forecasting/optimization in Python process  │  │
-│  │ (uses local ./flexihome/ code)                    │  │
+│  │ (uses local ./flexihome/ code)                  │  │
 │  └────────────────────────────────────────────────────┘  │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
@@ -383,14 +383,14 @@ Docker containers run in isolated Linux environments. They're great for **backgr
 │  │ http://localhost:8501                                      │ │
 │  │                                                             │ │
 │  │ - Reads from TimescaleDB container via :5432             │ │
-│  │ - Runs forecasting/optimization code from ./flexihome/    │ │
+│  │ - Runs forecasting/optimization code from ./flexihome/   │ │
 │  │ - Displays interactive dashboard                          │ │
 │  │ - Saves results to ./runs/ folder                         │ │
 │  └─────────────────────────────────────────────────────────────┘ │
 │                                                                     │
 │  Your File System:                                                  │
 │  ./app.py                 ← Streamlit code (runs locally)         │
-│  ./flexihome/             ← Core logic (runs locally)             │
+│  ./flexihome/           ← Core logic (runs locally)             │
 │  ./airflow/dags/          ← Mounted into containers              │
 │  ./airflow/logs/          ← Container writes logs here           │
 │  ./runs/                  ← Results from optimization             │
@@ -411,7 +411,7 @@ $ docker compose up -d
 
 **What happens:**
 - Docker reads `compose.yaml`
-- Pulls images: `timescale/timescaledb:latest-pg17`, `postgres:16`, builds `flexihome-airflow:local`
+- Pulls images: `timescale/timescaledb:latest-pg17`, `postgres:16`, builds `coverly-airflow:local`
 - Creates a Docker network: `real_time_control_energy-flexibility_default`
 - Starts 5 containers in order:
   1. airflow-postgres (needed before airflow-init)
@@ -693,4 +693,3 @@ Real_Time_Control_Energy-Flexibility/
 - ← AIRFLOW CONTAINER = Runs inside Docker container (Linux)
 - ← MOUNTED from container = Written by container, visible on your computer
 - ← DOCKER CONFIGURATION = Tells Docker how to build & run containers
-

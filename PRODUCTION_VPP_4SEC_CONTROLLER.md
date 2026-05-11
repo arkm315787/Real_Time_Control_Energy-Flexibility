@@ -2,7 +2,7 @@
 
 ## Quick Answer
 
-**YES, you absolutely need a real-time 4-second MPC (or a faster reactive controller).** Your current FlexiHome simulator runs 4-second tracking **offline** (after the fact). Real VPPs need **online real-time control**.
+**YES, you absolutely need a real-time 4-second MPC (or a faster reactive controller).** Your current Coverly simulator runs 4-second tracking **offline** (after the fact). Real VPPs need **online real-time control**.
 
 ---
 
@@ -388,7 +388,7 @@ LAYER 3: National TSO (Fingrid in Finland)
 
 ## What Happens If You DON'T Have 4-Second Controller?
 
-### Scenario: You Only Have 15-Min MPC (Like Current FlexiHome)
+### Scenario: You Only Have 15-Min MPC (Like Current Coverly)
 
 ```
 Time 0:00-0:15
@@ -561,7 +561,7 @@ After (next 4-sec cycle): BESS 50 kW + EV 0 kW + HVAC 25 kW = 75 kW total
 
 ---
 
-## Your FlexiHome: Road to Production
+## Your Coverly: Road to Production
 
 ### Current State (Simulation)
 

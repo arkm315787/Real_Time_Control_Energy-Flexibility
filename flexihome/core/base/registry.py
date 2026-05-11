@@ -1,4 +1,4 @@
-"""Runtime plugin registry for FlexiHome forecasters, optimizers, and stages."""
+"""Runtime plugin registry for Coverly forecasters, optimizers, and stages."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from .optimizer import BaseOptimizer
 
 
 class PluginRegistry:
-    """Central registry for swappable FlexiHome model and pipeline plugins."""
+    """Central registry for swappable Coverly model and pipeline plugins."""
 
     def __init__(self) -> None:
         self._forecasters: Dict[str, Type[BaseForecaster]] = {}

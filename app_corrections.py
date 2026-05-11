@@ -1,5 +1,5 @@
 """
-FlexiHome Audit Fixes: Priority 1, 2, 3 Corrections
+Coverly Audit Fixes: Priority 1, 2, 3 Corrections
 =====================================================
 
 This file documents all corrections needed for the MVP VPP application.

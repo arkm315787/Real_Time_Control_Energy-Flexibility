@@ -1,2 +1,2 @@
-"""FastAPI surface for FlexiHome."""
+"""FastAPI surface for Coverly."""
 

@@ -1,4 +1,4 @@
-"""Explicit data and artifact contracts for FlexiHome pipelines."""
+"""Explicit data and artifact contracts for Coverly pipelines."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Run the FlexiHome FastAPI service on an available local port.
+"""Run the Coverly FastAPI service on an available local port.
 
 Windows can reserve common development ports such as 8000. This launcher tests
 candidate ports before starting Uvicorn and skips ports that are already in use
@@ -52,7 +52,7 @@ def choose_port(host: str, requested_port: int | None) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the FlexiHome FastAPI service.")
+    parser = argparse.ArgumentParser(description="Run the Coverly FastAPI service.")
     parser.add_argument("--host", default="127.0.0.1", help="Host interface to bind.")
     parser.add_argument("--port", type=int, default=8000, help="Preferred API port.")
     parser.add_argument("--reload", action="store_true", help="Enable Uvicorn auto-reload.")

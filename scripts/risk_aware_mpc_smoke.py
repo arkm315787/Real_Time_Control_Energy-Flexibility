@@ -142,6 +142,8 @@ def main() -> None:
         "hvac_combined_up_stack_kw",
         "hvac_combined_down_stack_kw",
         "energy_endurance_ok",
+        "storage_up_endurance_margin_kw",
+        "storage_down_endurance_margin_kw",
         "granularity_ok",
         "simulation_only_notice",
         "price_forecast_mode",
@@ -155,6 +157,8 @@ def main() -> None:
     dynamic_cols = {"hvac_fcr_dynamic_cap_kw", "fcr_response_60_fraction", "fcr_response_180_fraction", "fcr_energy_60_seconds", "fcr_dynamic_response_ok"}
     if not dynamic_cols.issubset(history.columns):
         raise SystemExit(f"Missing FCR-N dynamic deliverability columns: {sorted(dynamic_cols - set(history.columns))}")
+    if not history["energy_endurance_ok"].all():
+        raise SystemExit("Accepted storage-backed reserve bids must pass the one-hour BESS/EV endurance audit.")
     if (history["hvac_fcr_kw"] > history["hvac_fcr_dynamic_cap_kw"] + 1e-6).any():
         raise SystemExit("HVAC FCR-N schedule must stay inside the dynamically deliverable cap.")
     if not history["fcr_dynamic_response_ok"].all():
@@ -281,6 +285,17 @@ def main() -> None:
     )
     if unsafe_combined_gate["market_gate_status"] != "Wait":
         raise SystemExit("Combined market gate must reject FCR+aFRR bids that fail the split-capacity stacking audit.")
+    no_endurance_gate = _market_gate_decision(
+        {
+            "bess_afrr_up_kw": 1000.0,
+            "energy_endurance_ok": False,
+            "energy_endurance_reason": "Synthetic storage endurance failure.",
+            "risk_adjusted_profit_eur": 5.0,
+        },
+        "aFRR",
+    )
+    if no_endurance_gate["market_gate_status"] != "Wait":
+        raise SystemExit("aFRR market gate must reject storage bids that fail the endurance audit.")
     afrr_below_min_gate = _market_gate_decision({"bess_afrr_up_kw": 900.0, "risk_adjusted_profit_eur": 5.0}, "Combined")
     if afrr_below_min_gate["market_gate_status"] != "Wait":
         raise SystemExit("Combined market mode must reject aFRR bids below the 1 MW minimum.")

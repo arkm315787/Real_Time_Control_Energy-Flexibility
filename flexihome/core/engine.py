@@ -1,4 +1,4 @@
-"""Core FlexiHome modeling, forecasting, and optimization logic.
+"""Core Coverly modeling, forecasting, and optimization logic.
 
 This module is intentionally free of Streamlit imports so it can be shared by
 the Streamlit dashboard, FastAPI service, tests, and future worker processes.
@@ -1565,6 +1565,7 @@ def heuristic_mpc_step(
     eta_c = 0.95
     eta_d = 0.95
     fcr_endurance_h = float(FINGRID_RULES["FCR-N"]["storage_endurance_hours"])
+    reserve_endurance_h = max(fcr_endurance_h, float(FINGRID_RULES["aFRR"]["storage_endurance_hours"]))
     hvac_response_s = float(fleet_meta.get("hvac_response_s", RESOURCE_RESPONSE_SECONDS["HVAC"]))
     hvac_delay_s = _fcr_n_resource_delay_seconds("HVAC", fleet_meta)
 
@@ -1572,6 +1573,8 @@ def heuristic_mpc_step(
         fcr_on = market_mode in {"FCR-N", "Combined"}
         afrr_on = market_mode in {"aFRR", "Combined"}
         dt_h = float(row["dt_h"])
+        bess_soc_start = bess_soc
+        ev_delta_start = ev_delta
 
         bess_fcr = ev_fcr = hvac_fcr = 0.0
         if fcr_on:
@@ -1643,6 +1646,16 @@ def heuristic_mpc_step(
         )
         values.update(_fcr_n_bid_dynamic_metrics(values, fleet_meta))
         values.update(_market_price_bid_audit(row))
+        values.update(
+            _storage_endurance_metrics(
+                values,
+                row,
+                {"bess_soc_mwh": bess_soc_start, "ev_soc_delta_mwh": ev_delta_start},
+                fleet_meta,
+                market_mode,
+                reserve_endurance_h,
+            )
+        )
         risk_costs = _risk_cost_terms(values, row, dt_h, risk_factors, penalty_weights)
         cap_revenue = dt_h / 1000.0 * (
             float(row[_price_bid_column("fcrn_capacity_eur_per_mw_h")]) * float(values["fcr_bid_kw"])
@@ -1669,7 +1682,6 @@ def heuristic_mpc_step(
                 "reserve_buffer_pct": float(reserve_buffer_pct),
                 "reserve_buffer_kw": float(risk_costs["reserve_buffer_kw"]),
                 "stacking_ok": True,
-                "energy_endurance_ok": True,
             }
         )
         rows.append(values)
@@ -1801,6 +1813,70 @@ def _risk_cost_terms(
         "reserve_buffer_kw": reserve_buffer_kw,
     }
 
+def _storage_endurance_metrics(
+    values: Dict[str, float],
+    row: pd.Series,
+    state: Dict[str, float],
+    fleet_meta: Dict[str, float],
+    market_mode: str,
+    endurance_hours: float | None = None,
+) -> Dict[str, object]:
+    """Audit one-hour storage headroom for BESS/EV reserve bids."""
+
+    hours = float(endurance_hours) if endurance_hours is not None else max(
+        float(FINGRID_RULES["FCR-N"]["storage_endurance_hours"]),
+        float(FINGRID_RULES["aFRR"]["storage_endurance_hours"]),
+    )
+    hours = max(hours, 1e-6)
+    eta_c = 0.95
+    eta_d = 0.95
+    fcr_on = market_mode in {"FCR-N", "Combined"}
+    afrr_on = market_mode in {"aFRR", "Combined"}
+
+    bess_cap = max(float(fleet_meta["bess_energy_cap_mwh"]), 1e-6)
+    bess_soc = float(state.get("bess_soc_mwh", row.get("bess_soc_mwh", 0.50 * bess_cap)))
+    bess_up_headroom_kw = max((bess_soc - 0.10 * bess_cap) * 1000.0 * eta_d / hours, 0.0)
+    bess_down_headroom_kw = max((0.95 * bess_cap - bess_soc) * 1000.0 / (hours * eta_c), 0.0)
+
+    ev_actual_soc = float(row.get("ev_soc_ref_mwh", 0.0)) + float(state.get("ev_soc_delta_mwh", 0.0))
+    ev_min = float(row.get("ev_soc_min_mwh", 0.0))
+    ev_max = float(row.get("ev_soc_max_mwh", ev_actual_soc))
+    ev_up_headroom_kw = max((ev_actual_soc - ev_min) * 1000.0 * eta_d / hours, 0.0)
+    ev_down_headroom_kw = max((ev_max - ev_actual_soc) * 1000.0 / (hours * eta_c), 0.0)
+
+    bess_up_required_kw = (float(values.get("bess_fcr_kw", 0.0)) if fcr_on else 0.0) + (float(values.get("bess_afrr_up_kw", 0.0)) if afrr_on else 0.0)
+    bess_down_required_kw = (float(values.get("bess_fcr_kw", 0.0)) if fcr_on else 0.0) + (float(values.get("bess_afrr_down_kw", 0.0)) if afrr_on else 0.0)
+    ev_up_required_kw = (float(values.get("ev_fcr_kw", 0.0)) if fcr_on else 0.0) + (float(values.get("ev_afrr_up_kw", 0.0)) if afrr_on else 0.0)
+    ev_down_required_kw = (float(values.get("ev_fcr_kw", 0.0)) if fcr_on else 0.0) + (float(values.get("ev_afrr_down_kw", 0.0)) if afrr_on else 0.0)
+
+    margins = {
+        "bess_up_endurance_margin_kw": bess_up_headroom_kw - bess_up_required_kw,
+        "bess_down_endurance_margin_kw": bess_down_headroom_kw - bess_down_required_kw,
+        "ev_up_endurance_margin_kw": ev_up_headroom_kw - ev_up_required_kw,
+        "ev_down_endurance_margin_kw": ev_down_headroom_kw - ev_down_required_kw,
+    }
+    relevant_margins = [
+        margins["bess_up_endurance_margin_kw"] if bess_up_required_kw > 1e-6 else 0.0,
+        margins["bess_down_endurance_margin_kw"] if bess_down_required_kw > 1e-6 else 0.0,
+        margins["ev_up_endurance_margin_kw"] if ev_up_required_kw > 1e-6 else 0.0,
+        margins["ev_down_endurance_margin_kw"] if ev_down_required_kw > 1e-6 else 0.0,
+    ]
+    min_margin = min(relevant_margins) if relevant_margins else 0.0
+    ok = bool(min_margin >= -1e-6)
+    reason = "" if ok else f"Storage reserve endurance margin is negative ({min_margin:.1f} kW)."
+    return {
+        "energy_endurance_ok": ok,
+        "energy_endurance_reason": reason,
+        "storage_endurance_hours": float(hours),
+        "bess_up_endurance_headroom_kw": float(bess_up_headroom_kw),
+        "bess_down_endurance_headroom_kw": float(bess_down_headroom_kw),
+        "ev_up_endurance_headroom_kw": float(ev_up_headroom_kw),
+        "ev_down_endurance_headroom_kw": float(ev_down_headroom_kw),
+        "storage_up_endurance_margin_kw": float(min(margins["bess_up_endurance_margin_kw"], margins["ev_up_endurance_margin_kw"])),
+        "storage_down_endurance_margin_kw": float(min(margins["bess_down_endurance_margin_kw"], margins["ev_down_endurance_margin_kw"])),
+        **{key: float(value) for key, value in margins.items()},
+    }
+
 
 def solve_mpc_step(
     forecast_df: pd.DataFrame,
@@ -1845,7 +1921,7 @@ def solve_mpc_step(
         "PV": 1.0 if RESOURCE_RESPONSE_SECONDS["PV"] <= FINGRID_RULES["aFRR"]["full_activation_seconds"] else 0.0,
     }
 
-    problem = LpProblem("FlexiHome_MPC", LpMaximize)
+    problem = LpProblem("Coverly_MPC", LpMaximize)
     idxs = list(range(horizon))
 
     soc_b = LpVariable.dicts("soc_b", range(horizon + 1), lowBound=0)
@@ -2069,6 +2145,16 @@ def solve_mpc_step(
         )
         values.update(_fcr_n_bid_dynamic_metrics(values, fleet_meta))
         values.update(_market_price_bid_audit(row))
+        values.update(
+            _storage_endurance_metrics(
+                values,
+                row,
+                {"bess_soc_mwh": soc_b_val, "ev_soc_delta_mwh": ev_actual_val - float(row["ev_soc_ref_mwh"])},
+                fleet_meta,
+                market_mode,
+                reserve_endurance_h,
+            )
+        )
         fcr_bid_val = values["fcr_bid_kw"]
         afrr_up_bid_val = values["afrr_up_bid_kw"]
         afrr_down_bid_val = values["afrr_down_bid_kw"]
@@ -2114,7 +2200,6 @@ def solve_mpc_step(
                 "reserve_buffer_pct": float(reserve_buffer_pct),
                 "reserve_buffer_kw": float(risk_costs["reserve_buffer_kw"]),
                 "stacking_ok": True,
-                "energy_endurance_ok": True,
             }
         )
         rows.append(values)
@@ -2224,8 +2309,9 @@ def _market_gate_decision(plan: Dict[str, float], market_mode: str) -> Dict[str,
     )
     afrr_granularity_ok = afrr_up_granularity_ok and afrr_down_granularity_ok
     combined_stack_ok = True if market_mode != "Combined" else _truthy(plan.get("combined_shared_capacity_ok", True), default=True)
-    fcr_product_ok = fcr_ok and fcr_local_ok and fcr_granularity_ok and fcr_dynamic_cap_ok and fcr_dynamic_response_ok and fcr_hvac_share_ok
-    afrr_product_ok = afrr_ok and afrr_granularity_ok
+    energy_endurance_ok = bool(plan.get("energy_endurance_ok", True))
+    fcr_product_ok = fcr_ok and fcr_local_ok and fcr_granularity_ok and fcr_dynamic_cap_ok and fcr_dynamic_response_ok and fcr_hvac_share_ok and energy_endurance_ok
+    afrr_product_ok = afrr_ok and afrr_granularity_ok and energy_endurance_ok
     profitable = risk_profit >= 0.0
     if market_mode == "FCR-N":
         product_ok = fcr_product_ok
@@ -2272,6 +2358,9 @@ def _market_gate_decision(plan: Dict[str, float], market_mode: str) -> Dict[str,
     elif fcr_enabled and fcr_ok and not fcr_hvac_share_ok:
         status = "Wait"
         reason = "FCR-N HVAC contribution exceeds the configured comfort-disturbance share cap."
+    elif (fcr_present or afrr_present) and not energy_endurance_ok:
+        status = "Wait"
+        reason = str(plan.get("energy_endurance_reason", "")) or "BESS/EV storage headroom cannot sustain the committed reserve endurance."
     elif market_mode == "Combined" and not combined_stack_ok:
         status = "Wait"
         reason = "Combined FCR-N+aFRR bid is not backed by a split-capacity stacking audit."
@@ -2293,6 +2382,7 @@ def _market_gate_decision(plan: Dict[str, float], market_mode: str) -> Dict[str,
         "fcr_dynamic_response_ok": bool(fcr_dynamic_response_ok),
         "fcr_hvac_share_ok": bool(fcr_hvac_share_ok),
         "combined_shared_capacity_ok": bool(combined_stack_ok),
+        "energy_endurance_ok": bool(energy_endurance_ok),
         "fcr_bid_segments": int(plan.get("fcr_bid_segments", 0) or 0),
         "afrr_up_segments": int(plan.get("afrr_up_segments", 0) or 0),
         "afrr_down_segments": int(plan.get("afrr_down_segments", 0) or 0),
@@ -2954,6 +3044,10 @@ def run_mpc_controller(
                 "stacking_ok": bool(stacking_ok),
                 **stack_audit,
                 "energy_endurance_ok": bool(plan.get("energy_endurance_ok", True)),
+                "energy_endurance_reason": str(plan.get("energy_endurance_reason", "")),
+                "storage_endurance_hours": float(plan.get("storage_endurance_hours", FINGRID_RULES["aFRR"]["storage_endurance_hours"])),
+                "storage_up_endurance_margin_kw": float(plan.get("storage_up_endurance_margin_kw", 0.0)),
+                "storage_down_endurance_margin_kw": float(plan.get("storage_down_endurance_margin_kw", 0.0)),
                 "granularity_ok": bool(granularity_ok),
                 "socket_up_kw": socket_up_kw,
                 "socket_down_kw": socket_down_kw,
@@ -3741,7 +3835,7 @@ def make_pdf_summary(summary: Dict[str, float], compliance: Dict[str, float], co
     y = height - 40
 
     lines = [
-        "FlexiHome MPC Formulation Summary",
+        "Coverly MPC Formulation Summary",
         "",
         f"Market mode: {config['market_mode']}",
         f"Resource mode: {config['resource_mode']}",

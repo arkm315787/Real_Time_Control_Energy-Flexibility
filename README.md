@@ -1,12 +1,12 @@
-# FlexiHome VPP
+# Coverly VPP
 
-FlexiHome is a development-stage Virtual Power Plant platform for residential energy flexibility. The current system models how aggregated homes with BESS, EV, HVAC, and PV resources can be forecasted, selected, and dispatched for Fingrid-oriented reserve products.
+Coverly is a development-stage Virtual Power Plant platform for residential energy flexibility. The current system models how aggregated homes with BESS, EV, HVAC, and PV resources can be forecasted, selected, and dispatched for Fingrid-oriented reserve products.
 
-This branch, `codex/vpp-mvp-market-corrections`, is the active VPP MVP market/control branch. It builds on the `codex-fastapi-api-layer` API and pipeline foundation, then adds Fingrid-oriented market participation, risk-aware bidding, VPP technical audit screens, and the production-style 4-second centralized controller simulation.
+This branch, `vpp-mvp-market-corrections`, is the active VPP MVP market/control branch. It builds on the `codex-fastapi-api-layer` API and pipeline foundation, then adds Fingrid-oriented market participation, risk-aware bidding, VPP technical audit screens, and the production-style 4-second centralized controller simulation.
 
 ## Product Direction
 
-FlexiHome is moving from a research dashboard toward a startup-grade VPP software foundation:
+Coverly is moving from a research dashboard toward a startup-grade VPP software foundation:
 
 - centralized portfolio optimization for residential flexibility
 - traceable household and appliance participation
@@ -23,7 +23,7 @@ The compliance layer is therefore a prequalification-prep screen, not a certific
 
 ## Current Control Architecture
 
-FlexiHome uses a centralized two-layer control structure.
+Coverly uses a centralized two-layer control structure.
 
 ```text
 Market and portfolio data
@@ -59,7 +59,7 @@ Centralized 4-second lower MPC
   - requested vs delivered reserve trace
 ```
 
-The lower layer is implemented as a one-step proportional tracking allocator, not a second scheduler. The dashboard does not run it automatically: first run the upper MPC layer, start the independent Market Pressure process, and then arm the centralized 4-second tracker. If the lower MPC is armed before the market start timestamp, it waits until the live market clock begins before attaching. The upper layer selects an active resource roster and a standby buffer roster from devices that satisfy availability, response-time, energy, usage, and cooldown limits. The executable plan is derated to the selected active roster when a paper bid exceeds physically selected capacity. Every 4-second tick, the lower layer clips the TSO request to the committed product limit, then distributes the request proportionally across the active BESS, EV, HVAC, and PV pools. If the predicted tracking error exceeds the 10% tolerance and is rising, the lower layer enters recovery mode and allocates the residual error to standby buffer capacity using fast-resource priority: BESS, then EV, then HVAC, then PV.
+The lower layer is implemented as a one-step proportional tracking allocator, not a second scheduler. In the dashboard workflow, first run the upper MPC layer and then start the independent simulated Market Pressure process; when the upper socket is valid, the lower 4-second tracker is auto-armed and waits for the market start timestamp before attaching. The upper layer selects an active resource roster and a standby buffer roster from devices that satisfy availability, response-time, energy, usage, and cooldown limits. The executable plan is derated to the selected active roster when a paper bid exceeds physically selected capacity. Every 4-second tick, the lower layer clips the TSO request to the committed product limit, then distributes the request proportionally across the active BESS, EV, HVAC, and PV pools. If the predicted tracking error exceeds the 10% tolerance and is rising, the lower layer enters recovery mode and allocates the residual error to standby buffer capacity using fast-resource priority: BESS, then EV, then HVAC, then PV.
 
 ## Implemented Plan Status
 
@@ -158,7 +158,7 @@ The MPC tab now follows a market-operator workflow:
 - run the risk-aware upper MPC layer to create the executable reserve socket
 - inspect bidirectional BESS/EV/HVAC/PV commitments, risk-adjusted profit, buffers, and Participate/Wait decisions
 - start the independent Market Pressure process with a wall-clock countdown delay
-- arm the lower MPC; if it is armed early, it waits for the market start timestamp before attaching
+- let the lower MPC auto-arm from the cleared upper socket; if it starts before the market timestamp, it waits before attaching
 - reveal the live market and lower MPC traces according to elapsed wall-clock time
 - inspect whether the lower layer stayed in normal proportional mode or entered buffer recovery mode
 
@@ -203,7 +203,7 @@ Use Python 3.11 from Windows Command Prompt or PowerShell.
 ```cmd
 git clone https://github.com/arkm315787/Real_Time_Control_Energy-Flexibility.git
 cd Real_Time_Control_Energy-Flexibility
-git switch codex/vpp-mvp-market-corrections
+git switch vpp-mvp-market-corrections
 py -3 -m venv .venv
 .venv\Scripts\activate
 python -m pip install --upgrade pip
@@ -216,7 +216,7 @@ If the repository is already cloned:
 ```cmd
 cd /d "C:\path\to\Real_Time_Control_Energy-Flexibility"
 git fetch origin
-git switch codex/vpp-mvp-market-corrections
+git switch vpp-mvp-market-corrections
 git pull
 .venv\Scripts\activate
 ```
@@ -319,11 +319,13 @@ Configure the API:
 
 ```cmd
 set FLEXIHOME_JOB_STORE=timescale
-set FLEXIHOME_TIMESCALE_DSN=postgresql://flexihome:flexihome@localhost:5432/flexihome
+set FLEXIHOME_TIMESCALE_DSN=postgresql://coverly:coverly@localhost:5432/coverly
 python scripts\run_api.py --reload
 ```
 
 If the DSN is configured but unavailable, the API falls back to in-memory storage unless `FLEXIHOME_TIMESCALE_STRICT=1` is set.
+
+Compatibility note: the public product name is now Coverly, while the Python package path `flexihome` and existing `FLEXIHOME_*` environment-variable names are retained so older scripts and deployments do not break.
 
 ## Airflow Orchestration
 
@@ -368,7 +370,7 @@ Important work that remains before this can become an operational VPP platform:
 The latest VPP MVP market/control implementation is on:
 
 ```text
-codex/vpp-mvp-market-corrections
+vpp-mvp-market-corrections
 ```
 
 Branch relationship at the time this README was updated:
@@ -377,7 +379,7 @@ Branch relationship at the time this README was updated:
 main
   -> feature/plugin-architecture
       -> codex-fastapi-api-layer
-          -> codex/vpp-mvp-market-corrections
+          -> vpp-mvp-market-corrections
 ```
 
 `codex-fastapi-api-layer` is the API/pipeline base for this branch. `main` is currently stale, not redundant. The recommended cleanup is to merge the VPP branch forward into `main` when it is accepted, then delete superseded intermediate branches only after their changes are safely included.

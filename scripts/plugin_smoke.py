@@ -1,4 +1,4 @@
-"""Smoke-test FlexiHome plugin registration and default plugin execution."""
+"""Smoke-test Coverly plugin registration and default plugin execution."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Run the full FlexiHome market-data to optimization pipeline."""
+"""Run the full Coverly market-data to optimization pipeline."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from flexihome.pipeline import PipelineRunConfig, build_default_pipeline
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the full FlexiHome pipeline and write a manifest.")
+    parser = argparse.ArgumentParser(description="Run the full Coverly pipeline and write a manifest.")
     parser.add_argument("--start-date", default="2026-01-15")
     parser.add_argument("--days", type=int, default=1)
     parser.add_argument("--n-homes", type=int, default=80)

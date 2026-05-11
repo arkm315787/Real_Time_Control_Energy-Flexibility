@@ -1,4 +1,4 @@
-"""Real market data overlays for the FlexiHome simulator.
+"""Real market data overlays for the Coverly simulator.
 
 The simulator remains runnable without external services. When API keys are
 available, this module overlays historical ENTSO-E and Fingrid market values on
@@ -231,7 +231,7 @@ def fetch_fingrid_dataset(
 ) -> pd.Series:
     start_text = _iso_utc(start)
     end_text = _iso_utc(end)
-    headers = {"x-api-key": api_key, "User-Agent": "FlexiHome-market-data/0.1"}
+    headers = {"x-api-key": api_key, "User-Agent": "Coverly-market-data/0.1"}
 
     current_url = f"{FINGRID_CURRENT_API_URL}/datasets/{dataset_id}/data"
     rows = []
@@ -276,7 +276,7 @@ def persist_market_data(raw_series: Dict[str, pd.Series], status: MarketDataStat
     if not dsn:
         status.timescaledb = "not_configured"
         return
-    schema = _validate_identifier(os.getenv("FLEXIHOME_TIMESCALE_SCHEMA", "flexihome").strip() or "flexihome")
+    schema = _validate_identifier(os.getenv("FLEXIHOME_TIMESCALE_SCHEMA", "coverly").strip() or "coverly")
     table = _validate_identifier(os.getenv("FLEXIHOME_MARKET_DATA_TABLE", "market_data_observations").strip() or "market_data_observations")
     try:
         import psycopg

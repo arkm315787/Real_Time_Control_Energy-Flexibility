@@ -1,5 +1,5 @@
 """
-FlexiHome: Aggregated Residential Flexibility for Fingrid Balancing Markets
+Coverly: Aggregated Residential Flexibility for Fingrid Balancing Markets
 ============================================================================
 
 README
@@ -55,7 +55,7 @@ from flexihome.plugins import DEFAULT_FORECASTER_PLUGIN, DEFAULT_OPTIMIZER_PLUGI
 PLUGIN_REGISTRY = register_default_plugins(get_global_registry())
 
 st.set_page_config(
-    page_title="FlexiHome",
+    page_title="Coverly",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1236,7 +1236,7 @@ def main() -> None:
     live_refresh_requested = False
 
     with tabs[0]:
-        st.title("FlexiHome: Aggregated Residential Flexibility for Fingrid Balancing Markets")
+        st.title("Coverly: Aggregated Residential Flexibility for Fingrid Balancing Markets")
         h1, h2, h3, h4 = st.columns(4)
         h1.metric("Data source", str(market_data_status.get("mode_used", "synthetic")).title())
         h2.metric("Model rows", f"{len(df):,}")
@@ -1316,7 +1316,7 @@ def main() -> None:
         export_col.download_button(
             "Download active training data as CSV",
             data=df.to_csv().encode("utf-8"),
-            file_name="flexihome_training_data.csv",
+            file_name="coverly_training_data.csv",
             mime="text/csv",
         )
         explain_col.info(
@@ -2743,17 +2743,17 @@ def main() -> None:
         tracking_export = result.get("tracking_4s", pd.DataFrame())
 
         export_left, export_right = st.columns([1, 1])
-        export_left.download_button("Download simulation bundle (JSON)", data=json.dumps(summary, indent=2).encode("utf-8"), file_name="flexihome_summary.json", mime="application/json")
+        export_left.download_button("Download simulation bundle (JSON)", data=json.dumps(summary, indent=2).encode("utf-8"), file_name="coverly_summary.json", mime="application/json")
         export_right.download_button(
             "Download centralized 4-second MPC trace (CSV)",
             data=(tracking_export if not tracking_export.empty else preview_4s).to_csv().encode("utf-8"),
-            file_name="flexihome_4s_tracking.csv",
+            file_name="coverly_4s_tracking.csv",
             mime="text/csv",
         )
 
         if result.get("summary"):
             pdf_bytes = make_pdf_summary(result["summary"], result["compliance"], config)
-            st.download_button("Export MPC formulation summary as PDF", data=pdf_bytes, file_name="flexihome_mpc_summary.pdf", mime="application/pdf")
+            st.download_button("Export MPC formulation summary as PDF", data=pdf_bytes, file_name="coverly_mpc_summary.pdf", mime="application/pdf")
 
         st.markdown("### External module artifacts")
         run_root = Path("runs")

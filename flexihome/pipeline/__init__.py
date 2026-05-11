@@ -1,4 +1,4 @@
-"""Local pipeline helpers for running FlexiHome modules outside Streamlit."""
+"""Local pipeline helpers for running Coverly modules outside Streamlit."""
 
 from .contracts import (
     ArtifactContract,

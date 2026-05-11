@@ -1,4 +1,4 @@
-"""Composable data pipeline contracts for FlexiHome."""
+"""Composable data pipeline contracts for Coverly."""
 
 from __future__ import annotations
 
@@ -61,9 +61,9 @@ class BasePipelineStage(ABC):
 
 
 class PipelineOrchestrator:
-    """Sequential pipeline runner for modular FlexiHome processing."""
+    """Sequential pipeline runner for modular Coverly processing."""
 
-    def __init__(self, name: str = "flexihome_pipeline") -> None:
+    def __init__(self, name: str = "coverly_pipeline") -> None:
         self.name = name
         self.stages: List[BasePipelineStage] = []
 

@@ -19,7 +19,7 @@ def _quantile_label(quantile: float) -> str:
 
 
 class XGBoostForecaster(BaseForecaster):
-    """XGBoost implementation of the FlexiHome forecaster contract."""
+    """XGBoost implementation of the Coverly forecaster contract."""
 
     def __init__(
         self,

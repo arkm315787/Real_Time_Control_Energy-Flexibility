@@ -11,6 +11,6 @@ __pycache__/
 runs/
 airflow/logs/
 airflow/plugins/
-flexihome_*.csv
-flexihome_*.json
-flexihome_*.pdf
+coverly_*.csv
+coverly_*.json
+coverly_*.pdf

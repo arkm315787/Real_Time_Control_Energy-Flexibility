@@ -1,4 +1,4 @@
-"""Optimization plugins bundled with FlexiHome."""
+"""Optimization plugins bundled with Coverly."""
 
 from flexihome.core.base.registry import PluginRegistry, get_global_registry
 

@@ -1,4 +1,4 @@
-"""Forecasting plugins bundled with FlexiHome."""
+"""Forecasting plugins bundled with Coverly."""
 
 from flexihome.core.base.registry import PluginRegistry, get_global_registry
 

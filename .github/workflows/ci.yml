@@ -1,4 +1,4 @@
-name: flexihome-ci
+name: coverly-ci
 
 on:
   push:

@@ -1,2 +1,2 @@
-"""FlexiHome application package."""
+"""Coverly application package."""
 

@@ -1,4 +1,4 @@
-"""Shared FlexiHome core logic."""
+"""Shared Coverly core logic."""
 
 from .engine import (
     FINGRID_RULES,

@@ -1,4 +1,4 @@
-"""Base plugin interfaces for FlexiHome."""
+"""Base plugin interfaces for Coverly."""
 
 from .data_pipeline import BasePipelineStage, PipelineContext, PipelineOrchestrator
 from .forecaster import BaseForecaster, ForecastMetrics

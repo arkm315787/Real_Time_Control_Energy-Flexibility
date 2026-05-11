@@ -2,7 +2,7 @@
 
 **Audit Date:** 2026-05-09  
 **Repository:** arkm315787/Real_Time_Control_Energy-Flexibility  
-**Branch:** codex/vpp-mvp-market-corrections  
+**Branch:** vpp-mvp-market-corrections  
 **Status:** 10 Critical + Design Issues Identified & Documented
 
 ---

@@ -76,6 +76,11 @@ def main() -> None:
         "sync_market_simulator_feed(",
         "upper_socket_ready",
         "upper_socket_metrics(",
+        "MarketDataService(",
+        "VPPOptimizerService(",
+        "operational_market_df",
+        "training_market_df",
+        "merge_market_data(",
     ]
     missing = [fragment for fragment in required_fragments if fragment not in source]
     if missing:
@@ -94,8 +99,10 @@ def main() -> None:
         raise SystemExit("Settlement tab must not show the start-lower-MPC notice when live lower ticks already exist.")
     if 'with st.expander("Debug: Lower result structure"' not in source:
         raise SystemExit("Settlement tab should expose live_lower_result structure while a live session has no visible trace.")
-    if "patch: settlement_live_trace_debug" not in source:
-        raise SystemExit("Settlement debug expander should include a patch marker so users can verify the served code version.")
+    if "settlement_live_lower_fragment()" not in source or "patch: settlement_live_fragment" not in source:
+        raise SystemExit("Settlement tab should use an auto-refreshing fragment for live lower-MPC replay state.")
+    if "real_time_preview_source" not in source or "Replay feed" not in source:
+        raise SystemExit("Dashboard must surface whether the 4-second market replay uses synthetic or real activation data.")
 
     session = {"start_at_wall_s": 110.0, "duration_seconds": 20.0, "dt_seconds": 4}
     if live_market_status(session, now_s=100.0)["status"] != "scheduled":

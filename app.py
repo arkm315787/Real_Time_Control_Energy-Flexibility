@@ -2538,7 +2538,88 @@ def main() -> None:
                     key="settlement_upper_success_heatmap",
                 )
 
-            if not tracking_df.empty:
+            live_settlement_session = st.session_state.get("live_market_session", {})
+
+            def render_settlement_live_lower_replay() -> None:
+                fresh_lower_result = st.session_state.get("live_lower_result", {})
+                fresh_tracking = result_frame(fresh_lower_result, "tracking_4s")
+                current_status = live_market_status(live_settlement_session)
+                if fresh_tracking.empty:
+                    if current_status["status"] == "scheduled":
+                        st.info("Market pressure countdown is active. Settlement lower-MPC plots will attach when the live market starts.")
+                    else:
+                        st.info("Waiting for live lower-MPC tracking ticks from the MPC tab.")
+                    with st.expander("Debug: Lower result structure", expanded=False):
+                        st.write("patch: settlement_live_fragment")
+                        st.write(f"live_market_status: {current_status}")
+                        st.write(f"live_lower_result type: {type(fresh_lower_result).__name__}")
+                        if isinstance(fresh_lower_result, dict):
+                            st.write(f"live_lower_result keys: {list(fresh_lower_result.keys())}")
+                            for key, value in fresh_lower_result.items():
+                                if isinstance(value, pd.DataFrame):
+                                    st.write(f"{key}: DataFrame shape {value.shape}")
+                                else:
+                                    st.write(f"{key}: {type(value).__name__}")
+                        st.write(f"fresh_tracking shape: {getattr(fresh_tracking, 'shape', None)}")
+                    return
+
+                visible_tracking = live_visible_frame(fresh_tracking, live_settlement_session)
+                displayed_tracking = visible_tracking if not visible_tracking.empty else fresh_tracking
+                displayed_lower_result = {**fresh_lower_result, "tracking_4s": displayed_tracking}
+                st.caption(
+                    f"Settlement live replay is using {len(displayed_tracking):,} current 4-second lower-MPC ticks. "
+                    f"Stored lower trace contains {len(fresh_tracking):,} tick(s)."
+                )
+                render_lower_live_trace(
+                    displayed_lower_result,
+                    {},
+                    template,
+                    key_prefix="settlement_fragment_lower",
+                    fallback_result=result,
+                    title="Settlement live lower MPC replay",
+                    include_debug_table=False,
+                )
+                gateway_commands = result_frame(fresh_lower_result, "gateway_commands")
+                if gateway_commands.empty:
+                    gateway_commands = result.get("gateway_commands", pd.DataFrame())
+                if not gateway_commands.empty:
+                    device_types = sorted(gateway_commands["device_type"].dropna().unique())
+                    device_filter = st.multiselect(
+                        "Gateway command appliance filter",
+                        device_types,
+                        default=device_types,
+                        key="settlement_live_gateway_filter",
+                    )
+                    command_view = gateway_commands[gateway_commands["device_type"].isin(device_filter)] if device_filter else gateway_commands
+                    command_cols = [
+                        "outer_interval",
+                        "household_id",
+                        "device_id",
+                        "device_type",
+                        "selection_role",
+                        "gateway_id",
+                        "up_energy_kwh",
+                        "down_energy_kwh",
+                        "active_seconds",
+                        "activation_count",
+                        "max_abs_command_kw",
+                    ]
+                    st.dataframe(
+                        styled_dataframe(command_view[[col for col in command_cols if col in command_view.columns]].head(40).round(3)),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=310,
+                    )
+
+            if live_settlement_session and hasattr(st, "fragment"):
+                settlement_status = live_market_status(live_settlement_session)
+
+                @st.fragment(run_every="4s" if settlement_status["status"] in {"scheduled", "live"} else None)
+                def settlement_live_lower_fragment() -> None:
+                    render_settlement_live_lower_replay()
+
+                settlement_live_lower_fragment()
+            elif not tracking_df.empty:
                 st.markdown("### Centralized 4-second MPC")
                 st.caption("This view shows the centralized lower-layer MPC following the reserve request through simulated gateway commands.")
                 window_ticks = min(len(tracking_df), max(450, int(3600 / 4)))
@@ -2649,23 +2730,7 @@ def main() -> None:
                         height=310,
                     )
             else:
-                if st.session_state.get("live_market_session"):
-                    with st.expander("Debug: Lower result structure", expanded=False):
-                        st.write("patch: settlement_live_trace_debug")
-                        st.write(f"live_market_status: {live_market_status(st.session_state.get('live_market_session', {}))}")
-                        st.write(f"live_lower_result type: {type(lower_result_for_viz).__name__}")
-                        if isinstance(lower_result_for_viz, dict):
-                            st.write(f"live_lower_result keys: {list(lower_result_for_viz.keys())}")
-                            for key, value in lower_result_for_viz.items():
-                                if isinstance(value, pd.DataFrame):
-                                    st.write(f"{key}: DataFrame shape {value.shape}")
-                                else:
-                                    st.write(f"{key}: {type(value).__name__}")
-                        st.write(f"lower_tracking_source shape: {getattr(lower_tracking_source, 'shape', None)}")
-                        st.write(f"visible_tracking_df shape: {getattr(visible_tracking_df, 'shape', None)}")
-                        st.write(f"tracking_df shape: {getattr(tracking_df, 'shape', None)}")
-                else:
-                    st.info("The upper market decision is available. Start the centralized 4-second MPC from the MPC tab to generate requested-vs-delivered tracking and gateway commands.")
+                st.info("The upper market decision is available. Start the centralized 4-second MPC from the MPC tab to generate requested-vs-delivered tracking and gateway commands.")
 
             st.markdown("### What-if scenario playground")
             wf1, wf2, wf3 = st.columns(3)

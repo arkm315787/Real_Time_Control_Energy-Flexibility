@@ -2353,7 +2353,11 @@ def main() -> None:
                     height=260,
                 )
 
-            lower_tracking_full = result_frame(lower_view_result, "tracking_4s")
+            lower_tracking_full = (
+                pd.DataFrame()
+                if st.session_state.get("live_market_session")
+                else result_frame(lower_view_result, "tracking_4s")
+            )
             if not lower_tracking_full.empty:
                 st.markdown("### Lower MPC 4-second Optimization Trace")
                 live_lower_tracking = live_visible_frame(lower_tracking_full, st.session_state.get("live_market_session", {}))
@@ -2451,8 +2455,6 @@ def main() -> None:
                     use_container_width=True,
                     height=320,
                 )
-            elif st.session_state.get("live_market_session"):
-                st.info("Lower MPC has not produced a tracking trace yet. If it is armed early, it will attach when the Market Pressure countdown reaches zero.")
 
     with tabs[5]:
         st.subheader("Settlement & Impact")
@@ -2465,7 +2467,8 @@ def main() -> None:
             lower_tracking_source = result_frame(lower_result_for_viz, "tracking_4s")
             if lower_tracking_source.empty:
                 lower_tracking_source = result.get("tracking_4s", pd.DataFrame())
-            tracking_df = live_visible_frame(lower_tracking_source, st.session_state.get("live_market_session", {}))
+            visible_tracking_df = live_visible_frame(lower_tracking_source, st.session_state.get("live_market_session", {}))
+            tracking_df = visible_tracking_df if not visible_tracking_df.empty else lower_tracking_source
             viz_df = tracking_df if not tracking_df.empty else result_df
             contribution_df = viz_df
             s = result["summary"]
@@ -2646,7 +2649,23 @@ def main() -> None:
                         height=310,
                     )
             else:
-                st.info("The upper market decision is available. Start the centralized 4-second MPC from the MPC tab to generate requested-vs-delivered tracking and gateway commands.")
+                if st.session_state.get("live_market_session"):
+                    with st.expander("Debug: Lower result structure", expanded=False):
+                        st.write("patch: settlement_live_trace_debug")
+                        st.write(f"live_market_status: {live_market_status(st.session_state.get('live_market_session', {}))}")
+                        st.write(f"live_lower_result type: {type(lower_result_for_viz).__name__}")
+                        if isinstance(lower_result_for_viz, dict):
+                            st.write(f"live_lower_result keys: {list(lower_result_for_viz.keys())}")
+                            for key, value in lower_result_for_viz.items():
+                                if isinstance(value, pd.DataFrame):
+                                    st.write(f"{key}: DataFrame shape {value.shape}")
+                                else:
+                                    st.write(f"{key}: {type(value).__name__}")
+                        st.write(f"lower_tracking_source shape: {getattr(lower_tracking_source, 'shape', None)}")
+                        st.write(f"visible_tracking_df shape: {getattr(visible_tracking_df, 'shape', None)}")
+                        st.write(f"tracking_df shape: {getattr(tracking_df, 'shape', None)}")
+                else:
+                    st.info("The upper market decision is available. Start the centralized 4-second MPC from the MPC tab to generate requested-vs-delivered tracking and gateway commands.")
 
             st.markdown("### What-if scenario playground")
             wf1, wf2, wf3 = st.columns(3)

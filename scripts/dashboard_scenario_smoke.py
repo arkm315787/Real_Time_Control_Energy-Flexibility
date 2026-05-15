@@ -84,6 +84,18 @@ def main() -> None:
         raise SystemExit("Dashboard must not overwrite the upper MPC result with the live lower-MPC attachment.")
     if "time.sleep(1)" in source:
         raise SystemExit("Dashboard live refresh must not force a one-second full app rerun.")
+    if "Lower MPC has not produced a tracking trace yet" in source:
+        raise SystemExit("Dashboard must not leave a stale static lower-MPC pending message while the live fragment owns replay rendering.")
+    if 'if st.session_state.get("live_market_session")\n                else result_frame(lower_view_result, "tracking_4s")' not in source:
+        raise SystemExit("Static lower-MPC trace should be suppressed while a live market session is rendered by the fragment.")
+    if "visible_tracking_df = live_visible_frame(lower_tracking_source" not in source:
+        raise SystemExit("Settlement tab should read the visible 4-second lower trace separately from the stored source trace.")
+    if "tracking_df = visible_tracking_df if not visible_tracking_df.empty else lower_tracking_source" not in source:
+        raise SystemExit("Settlement tab must not show the start-lower-MPC notice when live lower ticks already exist.")
+    if 'with st.expander("Debug: Lower result structure"' not in source:
+        raise SystemExit("Settlement tab should expose live_lower_result structure while a live session has no visible trace.")
+    if "patch: settlement_live_trace_debug" not in source:
+        raise SystemExit("Settlement debug expander should include a patch marker so users can verify the served code version.")
 
     session = {"start_at_wall_s": 110.0, "duration_seconds": 20.0, "dt_seconds": 4}
     if live_market_status(session, now_s=100.0)["status"] != "scheduled":

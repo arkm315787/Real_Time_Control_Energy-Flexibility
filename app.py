@@ -51,6 +51,10 @@ from flexihome.core.engine import (
 )
 from flexihome.core.market_simulator import MarketSimulator, MarketSimulatorConfig
 from flexihome.plugins import DEFAULT_FORECASTER_PLUGIN, DEFAULT_OPTIMIZER_PLUGIN, register_default_plugins
+from services.cache_manager import CacheManager
+from services.market_service import MarketDataService
+from services.vpp_optimizer_service import VPPOptimizerService
+from utils.data_sync import merge_market_data
 
 PLUGIN_REGISTRY = register_default_plugins(get_global_registry())
 
@@ -126,6 +130,18 @@ def scenario_portfolio_signature(scenario: Dict[str, object]) -> tuple:
         str(scenario.get("entsoe_key", "")),
         str(scenario.get("fingrid_key", "")),
         bool(scenario["persist_market_data"]),
+    )
+
+
+def market_data_signature(scenario: Dict[str, object]) -> tuple:
+    """Return the applied market-service fields that require a TSO data refresh."""
+
+    return (
+        str(scenario.get("market_source", "Synthetic")),
+        int(scenario.get("market_lookback_days", 90)),
+        bool(str(scenario.get("entsoe_key", "")).strip()),
+        bool(str(scenario.get("fingrid_key", "")).strip()),
+        pd.Timestamp.utcnow().date().isoformat(),
     )
 
 
@@ -1092,7 +1108,7 @@ def main() -> None:
         market_lookback_days_input = st.slider("Real market lookback days", 1, 120, int(scenario_defaults["market_lookback_days"]), 1, disabled=not use_real_market_input)
         entsoe_key_input_form = st.text_input("ENTSO-E security token", value=str(scenario_defaults.get("entsoe_key", "")), type="password", disabled=not use_real_market_input)
         fingrid_key_input_form = st.text_input("Fingrid Open Data API key", value=str(scenario_defaults.get("fingrid_key", "")), type="password", disabled=not use_real_market_input)
-        persist_market_data_input = st.toggle("Persist fetched market data to TimescaleDB", value=bool(scenario_defaults["persist_market_data"]), disabled=not use_real_market_input)
+        persist_market_data_input = st.toggle("Cache fetched market data locally", value=bool(scenario_defaults["persist_market_data"]), disabled=not use_real_market_input)
         apply_scenario = st.form_submit_button("Apply Scenario", type="primary")
 
     if apply_scenario:
@@ -1128,6 +1144,10 @@ def main() -> None:
             st.session_state.pop("live_market_session", None)
             st.session_state.pop("lower_mpc_armed", None)
             st.session_state.pop("live_lower_result", None)
+            st.session_state.pop("training_market_df", None)
+            st.session_state.pop("operational_market_df", None)
+            st.session_state.pop("market_metadata", None)
+            st.session_state.pop("market_data_signature", None)
 
     scenario = st.session_state["scenario_inputs"]
     start_date = scenario["start_date"]
@@ -1157,6 +1177,39 @@ def main() -> None:
     if use_real_market and not (entsoe_key_input or fingrid_key_input):
         st.sidebar.warning("Enter at least one API key and click Apply Scenario to enable real market ingestion.")
 
+    training_market_df = st.session_state.get("training_market_df", pd.DataFrame())
+    operational_market_df = st.session_state.get("operational_market_df", pd.DataFrame())
+    market_metadata = st.session_state.get("market_metadata", {})
+    if real_market_ready:
+        market_signature = market_data_signature(scenario)
+        if st.session_state.get("market_data_signature") != market_signature:
+            with st.spinner("Fetching TSO market data through the market service..."):
+                try:
+                    market_cache = None if persist_market_data else CacheManager(ttl_seconds=900, cache_dir=None)
+                    market_service = MarketDataService(entsoe_key_input.strip() or None, fingrid_key_input.strip() or None, cache=market_cache)
+                    combined_market_df, market_metadata = market_service.fetch_market_data(
+                        lookback_days=int(market_lookback_days),
+                        include_forecast_day=True,
+                    )
+                    training_market_df, operational_market_df = market_service.split_training_and_operational(combined_market_df)
+                    st.session_state["training_market_df"] = training_market_df
+                    st.session_state["operational_market_df"] = operational_market_df
+                    st.session_state["market_metadata"] = market_metadata
+                    st.session_state["market_data_signature"] = market_signature
+                except Exception as exc:
+                    st.sidebar.warning(f"Market service could not load external data: {exc}")
+                    training_market_df = pd.DataFrame()
+                    operational_market_df = pd.DataFrame()
+                    market_metadata = {"errors": [str(exc)], "mode_used": "synthetic"}
+                    st.session_state["training_market_df"] = training_market_df
+                    st.session_state["operational_market_df"] = operational_market_df
+                    st.session_state["market_metadata"] = market_metadata
+                    st.session_state["market_data_signature"] = market_signature
+    else:
+        training_market_df = pd.DataFrame()
+        operational_market_df = pd.DataFrame()
+        market_metadata = {}
+
     portfolio_args = {
         "start_date": str(start_date),
         "days": days,
@@ -1181,7 +1234,7 @@ def main() -> None:
         bundle = st.session_state["portfolio_bundle"]
     else:
         spinner_text = (
-            "Fetching real market data and generating the flexibility portfolio..."
+            "Generating the flexibility portfolio and applying cached TSO market data..."
             if real_market_ready
             else "Generating synthetic households, weather, and balancing market conditions..."
         )
@@ -1189,11 +1242,11 @@ def main() -> None:
             with st.spinner(spinner_text):
                 bundle = generate_portfolio_runtime(
                     **portfolio_args,
-                    market_data_mode="real" if real_market_ready else "synthetic",
-                    entsoe_api_key=entsoe_key_input.strip() or None,
-                    fingrid_api_key=fingrid_key_input.strip() or None,
-                    market_lookback_days=int(market_lookback_days) if real_market_ready else None,
-                    persist_market_data=bool(persist_market_data) if real_market_ready else False,
+                    market_data_mode="synthetic",
+                    entsoe_api_key=None,
+                    fingrid_api_key=None,
+                    market_lookback_days=None,
+                    persist_market_data=False,
                     use_cache=not real_market_ready,
                 )
         except RuntimeError as exc:
@@ -1202,10 +1255,34 @@ def main() -> None:
                 bundle = generate_portfolio_runtime(**portfolio_args, market_data_mode="synthetic", use_cache=True)
         st.session_state["portfolio_bundle"] = bundle
         st.session_state["portfolio_signature"] = portfolio_signature
-    df = bundle["data"]
-    preview_4s = bundle["preview_4s"]
+    df = bundle["data"].copy()
+    preview_4s = bundle["preview_4s"].copy()
     device_roster = bundle.get("device_roster", pd.DataFrame())
-    summary = bundle["summary"]
+    summary = dict(bundle["summary"])
+    if real_market_ready:
+        if isinstance(operational_market_df, pd.DataFrame) and not operational_market_df.empty:
+            df = merge_market_data(df, operational_market_df)
+            preview_4s = merge_market_data(preview_4s, operational_market_df)
+        service_status = {
+            "mode_requested": "real",
+            "mode_used": "market_service" if isinstance(operational_market_df, pd.DataFrame) and not operational_market_df.empty else "synthetic",
+            "entsoe": market_metadata.get("entsoe_status", "not_configured") if isinstance(market_metadata, dict) else "not_configured",
+            "fingrid": market_metadata.get("fingrid_status", "not_configured") if isinstance(market_metadata, dict) else "not_configured",
+            "columns_loaded": list((market_metadata.get("data_completeness", {}) if isinstance(market_metadata, dict) else {}).keys()),
+            "observations_loaded": {
+                "training_rows": int(market_metadata.get("training_rows", 0) or 0) if isinstance(market_metadata, dict) else 0,
+                "forecast_rows": int(market_metadata.get("forecast_rows", 0) or 0) if isinstance(market_metadata, dict) else 0,
+            },
+            "errors": list(market_metadata.get("errors", [])) if isinstance(market_metadata, dict) else [],
+            "query_start_utc": str(market_metadata.get("training_period", "")).split(" to ")[0] if isinstance(market_metadata, dict) else "",
+            "query_end_utc": str(market_metadata.get("training_period", "")).split(" to ")[-1] if isinstance(market_metadata, dict) else "",
+            "training_observations": int(market_metadata.get("training_rows", 0) or 0) if isinstance(market_metadata, dict) else 0,
+            "training_days": float(market_lookback_days),
+            "timescaledb": "local_service_cache" if persist_market_data else "memory_service_cache",
+            "rows_persisted": int(market_metadata.get("total_rows", 0) or 0) if isinstance(market_metadata, dict) else 0,
+            "generated_at_utc": str(market_metadata.get("generated_for_date", "")) if isinstance(market_metadata, dict) else "",
+        }
+        summary["market_data_status"] = service_status
     market_data_status = summary.get("market_data_status", {})
     market_columns = [
         col
@@ -1814,10 +1891,11 @@ def main() -> None:
                     "rotation_strategy": "usage_aware",
                     "gateway_mode": "simulated_centralized",
                 }
-                st.session_state["mpc_result"] = run_mpc_controller(
-                    df=df,
+                vpp_service = VPPOptimizerService(fleet_meta)
+                st.session_state["mpc_result"] = vpp_service.run_upper_mpc(
+                    portfolio_df=df,
+                    operational_market_df=operational_market_df if real_market_ready else pd.DataFrame(),
                     models=models,
-                    fleet_meta=fleet_meta,
                     market_mode=market_mode,
                     resource_mode=resource_mode,
                     horizon_hours=horizon_hours,
@@ -1838,6 +1916,11 @@ def main() -> None:
                         message,
                     ),
                 )
+                st.session_state["vpp_optimizer_service_boundary"] = {
+                    "service": "VPPOptimizerService",
+                    "market_data_source": "operational_market_df" if real_market_ready else "synthetic_portfolio",
+                    "operational_market_rows": int(len(operational_market_df)) if isinstance(operational_market_df, pd.DataFrame) else 0,
+                }
                 st.session_state["upper_mpc_result"] = st.session_state["mpc_result"]
                 st.session_state.pop("live_market_session", None)
                 st.session_state.pop("market_simulator", None)

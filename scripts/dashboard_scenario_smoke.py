@@ -76,6 +76,11 @@ def main() -> None:
         "sync_market_simulator_feed(",
         "upper_socket_ready",
         "upper_socket_metrics(",
+        "MarketDataService(",
+        "VPPOptimizerService(",
+        "operational_market_df",
+        "training_market_df",
+        "merge_market_data(",
     ]
     missing = [fragment for fragment in required_fragments if fragment not in source]
     if missing:

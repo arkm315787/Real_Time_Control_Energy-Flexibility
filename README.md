@@ -86,6 +86,12 @@ The lower layer is implemented as a one-step proportional tracking allocator, no
 - `app.py`  
   Streamlit dashboard for scenario setup, forecasting, MPC simulation, contribution analysis, and exports.
 
+- `services/`  
+  Service boundary that separates TSO-side market ingestion and caching from VPP-side optimization. `MarketDataService` owns ENTSO-E/Fingrid pulls and training/operational splits; `VPPOptimizerService` owns upper/lower MPC execution from supplied market frames.
+
+- `models/`, `config/`, and `utils/`  
+  Lightweight service-layer data structures, runtime settings, and market-frame alignment helpers used by the dashboard and smoke checks.
+
 - `flexihome/core/engine.py`  
   Shared simulation, forecasting, outer MPC, and orchestration logic used by the dashboard, API, scripts, and pipeline.
 
@@ -267,8 +273,9 @@ The run writes CSV and JSON artifacts under `runs/optimization_*`.
 Core local checks:
 
 ```cmd
-python -m py_compile app.py flexihome/core/engine.py flexihome/core/centralized_controller.py flexihome/core/market_data.py flexihome/api/services.py
+python -m py_compile app.py flexihome/core/engine.py flexihome/core/centralized_controller.py flexihome/core/market_data.py flexihome/api/services.py services/market_service.py services/vpp_optimizer_service.py
 python scripts\centralized_mpc_smoke.py
+python scripts\service_layer_smoke.py
 python scripts\risk_aware_mpc_smoke.py
 python scripts\compliance_pending_state_smoke.py
 python scripts\vpp_mvp_multi_scenario_smoke.py

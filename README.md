@@ -307,6 +307,8 @@ set FINGRID_API_KEY=<your-fingrid-open-data-key>
 
 Fingrid requests use `https://data.fingrid.fi/api` with the `x-api-key` header. The connector includes pacing and retry handling to reduce accidental API throttling.
 
+When Fingrid activation datasets are loaded, the normalized aFRR activation signal is also carried into the 4-second Market Pressure replay feed used by the live lower-MPC simulation. Price datasets continue to feed the training frame, forecasts, and upper market decision.
+
 ## Optional TimescaleDB
 
 Start the local database:

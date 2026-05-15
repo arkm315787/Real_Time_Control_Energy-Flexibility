@@ -54,6 +54,8 @@ class MarketDataStatus:
     mode_used: str = "synthetic"
     entsoe: str = "not_configured"
     fingrid: str = "not_configured"
+    real_time_preview_source: str = "synthetic"
+    real_time_preview_columns: list[str] = field(default_factory=list)
     columns_loaded: list[str] = field(default_factory=list)
     observations_loaded: Dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
@@ -71,6 +73,8 @@ class MarketDataStatus:
             "mode_used": self.mode_used,
             "entsoe": self.entsoe,
             "fingrid": self.fingrid,
+            "real_time_preview_source": self.real_time_preview_source,
+            "real_time_preview_columns": self.real_time_preview_columns,
             "columns_loaded": self.columns_loaded,
             "observations_loaded": self.observations_loaded,
             "errors": self.errors,
@@ -169,10 +173,41 @@ def overlay_real_market_data(
     if persist_to_timescale and raw_series:
         persist_market_data(raw_series, status)
 
+    output_preview = overlay_real_activation_preview(preview_4s, output_activation, status)
     status.mode_used = _resolve_mode(status)
     if selected_mode == "real" and status.mode_used == "synthetic":
         raise RuntimeError("Real market data mode was requested, but no external market data could be loaded.")
-    return output_prices, output_activation, preview_4s, status.as_dict()
+    return output_prices, output_activation, output_preview, status.as_dict()
+
+
+def overlay_real_activation_preview(
+    preview_4s: pd.DataFrame,
+    activation: pd.DataFrame,
+    status: MarketDataStatus,
+) -> pd.DataFrame:
+    """Carry loaded real activation into the 4-second replay feed."""
+
+    if preview_4s is None or preview_4s.empty or activation is None or activation.empty:
+        return preview_4s
+
+    loaded_columns = set(status.columns_loaded)
+    preview_columns: list[str] = []
+    preview = preview_4s.copy()
+    aligned_activation = _align_frame_to_index(activation, preview.index)
+
+    if {"afrr_up_act_frac", "afrr_down_act_frac"} & loaded_columns and "afrr_signal_norm" in aligned_activation:
+        preview["afrr_signal_norm"] = aligned_activation["afrr_signal_norm"].astype(float).clip(-1.0, 1.0)
+        preview_columns.append("afrr_signal_norm")
+
+    if "fcr_signed_act" in loaded_columns and "fcr_signed_act" in aligned_activation:
+        preview["fcr_signal_norm"] = aligned_activation["fcr_signed_act"].astype(float).clip(-1.0, 1.0)
+        preview["frequency_hz"] = 50.0 - 0.1 * preview["fcr_signal_norm"]
+        preview_columns.extend(["fcr_signal_norm", "frequency_hz"])
+
+    if preview_columns:
+        status.real_time_preview_source = "real_activation"
+        status.real_time_preview_columns = list(dict.fromkeys(preview_columns))
+    return preview
 
 
 def configured_fingrid_datasets() -> Dict[str, Tuple[str, int]]:
@@ -387,6 +422,13 @@ def align_series_to_index(series: pd.Series, index: pd.DatetimeIndex) -> pd.Seri
         return cleaned.reindex(index, method="ffill")
     values = np.resize(cleaned.to_numpy(dtype=float), len(index))
     return pd.Series(values, index=index, name=series.name)
+
+
+def _align_frame_to_index(frame: pd.DataFrame, index: pd.DatetimeIndex) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(index=index)
+    expanded_index = frame.index.union(index)
+    return frame.reindex(expanded_index).sort_index().interpolate(method="time").ffill().bfill().reindex(index)
 
 
 def normalize_activation(series: pd.Series) -> pd.Series:

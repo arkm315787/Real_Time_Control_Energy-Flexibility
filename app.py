@@ -477,6 +477,15 @@ def result_summary(result: Dict[str, object] | None) -> Dict[str, object]:
     return summary if isinstance(summary, dict) else {}
 
 
+def market_replay_source_label(status: Dict[str, object] | None) -> str:
+    if not isinstance(status, dict):
+        return "Synthetic"
+    source = str(status.get("real_time_preview_source", "synthetic"))
+    if source == "real_activation":
+        return "Real activation"
+    return "Synthetic"
+
+
 def upper_socket_metrics(result: Dict[str, object] | None) -> Dict[str, object]:
     history = result_history(result)
     summary = result_summary(result)
@@ -1207,6 +1216,7 @@ def main() -> None:
     device_roster = bundle.get("device_roster", pd.DataFrame())
     summary = bundle["summary"]
     market_data_status = summary.get("market_data_status", {})
+    replay_source_label = market_replay_source_label(market_data_status)
     market_columns = [
         col
         for col in [
@@ -1237,11 +1247,12 @@ def main() -> None:
 
     with tabs[0]:
         st.title("Coverly: Aggregated Residential Flexibility for Fingrid Balancing Markets")
-        h1, h2, h3, h4 = st.columns(4)
+        h1, h2, h3, h4, h5 = st.columns(5)
         h1.metric("Data source", str(market_data_status.get("mode_used", "synthetic")).title())
-        h2.metric("Model rows", f"{len(df):,}")
-        h3.metric("Real observations", f"{int(market_data_status.get('training_observations', 0) or 0):,}")
-        h4.metric("Timescale rows", f"{int(market_data_status.get('rows_persisted', 0) or 0):,}")
+        h2.metric("Replay feed", replay_source_label)
+        h3.metric("Model rows", f"{len(df):,}")
+        h4.metric("Real observations", f"{int(market_data_status.get('training_observations', 0) or 0):,}")
+        h5.metric("Timescale rows", f"{int(market_data_status.get('rows_persisted', 0) or 0):,}")
         if market_data_status.get("errors"):
             st.warning("Some market API signals were unavailable. Open Training Data Explorer for the exact API messages and fallback status.")
         left, right = st.columns([1.2, 1.0], gap="large")
@@ -1273,7 +1284,7 @@ def main() -> None:
             c1.metric("PV fleet size", f"{summary['pv_capacity_mw']:.2f} MW")
             c2.metric("Accessible storage energy", f"{summary['bess_energy_mwh'] + summary['ev_energy_mwh']:.2f} MWh")
             c1.metric("Market data", str(market_data_status.get("mode_used", "synthetic")).title())
-            c2.metric("Raw market observations", f"{int(market_data_status.get('training_observations', 0) or 0):,}")
+            c2.metric("Realtime replay", replay_source_label)
             c1.metric("Traceable devices", f"{int(summary.get('device_count', len(device_roster))):,}")
             c2.metric("Simulated gateways", f"{int(summary.get('gateway_count', 0)):,}")
             st.markdown(
@@ -1321,6 +1332,7 @@ def main() -> None:
         )
         explain_col.info(
             f"Market mode: {market_data_status.get('mode_used', 'synthetic')}. "
+            f"Realtime replay: {replay_source_label}. "
             f"ENTSO-E: {market_data_status.get('entsoe', 'not_configured')}. "
             f"Fingrid: {market_data_status.get('fingrid', 'not_configured')}. "
             f"TimescaleDB: {market_data_status.get('timescaledb', 'not_configured')}."
@@ -1865,6 +1877,9 @@ def main() -> None:
                 "dt_seconds": 4,
                 "market_mode": market_mode,
                 "resource_mode": resource_mode,
+                "market_data_source": str(market_data_status.get("mode_used", "synthetic")),
+                "real_time_preview_source": str(market_data_status.get("real_time_preview_source", "synthetic")),
+                "real_time_preview_columns": list(market_data_status.get("real_time_preview_columns", [])),
             }
             market_feed_for_simulator = build_live_market_feed(
                 preview_4s,
@@ -1972,7 +1987,15 @@ def main() -> None:
                     market_fig.add_trace(go.Scatter(x=visible_market_feed.index, y=visible_market_feed["fcr_signal_norm"], name="FCR signal", line={"color": RESOURCE_COLORS["Frequency"]}))
                     market_fig.add_trace(go.Scatter(x=visible_market_feed.index, y=visible_market_feed["afrr_signal_norm"], name="aFRR signal", line={"color": RESOURCE_COLORS["Net"], "dash": "dot"}))
                     market_fig.update_layout(yaxis_title="normalized signal")
-                    st.caption("Simulated market-pressure replay for MVP/demo use; this is not a live Fingrid activation feed.")
+                    runtime_source = str(live_market_session.get("real_time_preview_source", market_data_status.get("real_time_preview_source", "synthetic")))
+                    runtime_columns = live_market_session.get("real_time_preview_columns", market_data_status.get("real_time_preview_columns", []))
+                    if runtime_source == "real_activation":
+                        st.caption(
+                            "Market-pressure replay uses loaded historical activation overlay "
+                            f"({', '.join(runtime_columns) or 'activation'}); this is still a replay, not a live Fingrid dispatch feed."
+                        )
+                    else:
+                        st.caption("Simulated market-pressure replay for MVP/demo use; this is not a live Fingrid activation feed.")
                     st.plotly_chart(
                         apply_chart_style(market_fig, template, height=260, title="Simulated Market Pressure"),
                         use_container_width=True,
@@ -2353,7 +2376,11 @@ def main() -> None:
                     height=260,
                 )
 
-            lower_tracking_full = result_frame(lower_view_result, "tracking_4s")
+            lower_tracking_full = (
+                pd.DataFrame()
+                if st.session_state.get("live_market_session")
+                else result_frame(lower_view_result, "tracking_4s")
+            )
             if not lower_tracking_full.empty:
                 st.markdown("### Lower MPC 4-second Optimization Trace")
                 live_lower_tracking = live_visible_frame(lower_tracking_full, st.session_state.get("live_market_session", {}))
@@ -2451,8 +2478,6 @@ def main() -> None:
                     use_container_width=True,
                     height=320,
                 )
-            elif st.session_state.get("live_market_session"):
-                st.info("Lower MPC has not produced a tracking trace yet. If it is armed early, it will attach when the Market Pressure countdown reaches zero.")
 
     with tabs[5]:
         st.subheader("Settlement & Impact")
@@ -2465,7 +2490,8 @@ def main() -> None:
             lower_tracking_source = result_frame(lower_result_for_viz, "tracking_4s")
             if lower_tracking_source.empty:
                 lower_tracking_source = result.get("tracking_4s", pd.DataFrame())
-            tracking_df = live_visible_frame(lower_tracking_source, st.session_state.get("live_market_session", {}))
+            visible_tracking_df = live_visible_frame(lower_tracking_source, st.session_state.get("live_market_session", {}))
+            tracking_df = visible_tracking_df if not visible_tracking_df.empty else lower_tracking_source
             viz_df = tracking_df if not tracking_df.empty else result_df
             contribution_df = viz_df
             s = result["summary"]
@@ -2646,7 +2672,23 @@ def main() -> None:
                         height=310,
                     )
             else:
-                st.info("The upper market decision is available. Start the centralized 4-second MPC from the MPC tab to generate requested-vs-delivered tracking and gateway commands.")
+                if st.session_state.get("live_market_session"):
+                    with st.expander("Debug: Lower result structure", expanded=False):
+                        st.write("patch: settlement_live_trace_debug")
+                        st.write(f"live_market_status: {live_market_status(st.session_state.get('live_market_session', {}))}")
+                        st.write(f"live_lower_result type: {type(lower_result_for_viz).__name__}")
+                        if isinstance(lower_result_for_viz, dict):
+                            st.write(f"live_lower_result keys: {list(lower_result_for_viz.keys())}")
+                            for key, value in lower_result_for_viz.items():
+                                if isinstance(value, pd.DataFrame):
+                                    st.write(f"{key}: DataFrame shape {value.shape}")
+                                else:
+                                    st.write(f"{key}: {type(value).__name__}")
+                        st.write(f"lower_tracking_source shape: {getattr(lower_tracking_source, 'shape', None)}")
+                        st.write(f"visible_tracking_df shape: {getattr(visible_tracking_df, 'shape', None)}")
+                        st.write(f"tracking_df shape: {getattr(tracking_df, 'shape', None)}")
+                else:
+                    st.info("The upper market decision is available. Start the centralized 4-second MPC from the MPC tab to generate requested-vs-delivered tracking and gateway commands.")
 
             st.markdown("### What-if scenario playground")
             wf1, wf2, wf3 = st.columns(3)

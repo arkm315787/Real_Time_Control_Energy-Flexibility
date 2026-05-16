@@ -229,7 +229,7 @@ git pull
 
 The main runtime dependencies are in `requirements.txt`. The file intentionally pins `numpy<2` and compatible Pandas, SciPy, and control-system ranges because the VPP technical-audit path imports `python-control` and Matplotlib-backed response tooling. Without the NumPy upper bound, local installs can resolve to NumPy 2.x and fail before the dashboard or smoke tests start.
 
-Use `requirements-dev.txt` for the FastAPI smoke test client. Use `requirements-airflow.txt` only inside the Airflow Docker image. Install `requirements-lstm.txt` only if you want to try the optional LSTM forecaster in the Forecasting Lab.
+Use `requirements-dev.txt` for the FastAPI smoke test client. Use `requirements-airflow.txt` only inside the Airflow Docker image. Install `requirements-lstm.txt` only if you want to try the optional LSTM forecaster in the Forecasting Lab. The bundled forecasters include the default XGBoost residual-quantile model and a LightGBM-style quantile model for probabilistic MPC price inputs.
 
 ## Run The Dashboard
 

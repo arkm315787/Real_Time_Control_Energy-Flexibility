@@ -78,6 +78,7 @@ class ResultsSerializationStage(BasePipelineStage):
             "history",
             "tracking_4s",
             "first_schedule",
+            "forecast_trace",
             "household_contributions",
             "appliance_contributions",
             "upper_device_schedule",

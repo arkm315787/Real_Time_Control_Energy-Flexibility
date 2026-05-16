@@ -152,6 +152,7 @@ def main() -> None:
     for name in (
         "household_contributions",
         "appliance_contributions",
+        "forecast_trace",
         "upper_device_schedule",
         "inner_mpc_trace",
         "gateway_commands",
@@ -194,6 +195,7 @@ def main() -> None:
                 "history": "history.csv",
                 "tracking_4s": "tracking_4s.csv",
                 "first_schedule": "first_schedule.csv",
+                "forecast_trace": "forecast_trace.csv",
                 "household_contributions": "household_contributions.csv",
                 "appliance_contributions": "appliance_contributions.csv",
                 "upper_device_schedule": "upper_device_schedule.csv",

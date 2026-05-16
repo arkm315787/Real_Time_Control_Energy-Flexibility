@@ -79,29 +79,30 @@ def main() -> None:
     )
     df = bundle["data"]
 
-    forecaster = registry.get_forecaster(DEFAULT_FORECASTER_PLUGIN, seed=42)
-    comparison = forecaster.fit_from_frame(
-        df=df,
-        target="net_load_baseline_kw",
-        predictors=FORECAST_PREDICTORS,
-        lags=2,
-        horizon_steps=1,
-    )
-    if comparison.empty or not forecaster.metrics:
-        raise SystemExit("Forecaster plugin did not produce validation predictions and metrics.")
-    sample_features = None
-    for feature in getattr(forecaster, "feature_columns", []):
+    for forecaster_key in (DEFAULT_FORECASTER_PLUGIN, "lightgbm_quantile"):
+        forecaster = registry.get_forecaster(forecaster_key, seed=42)
+        comparison = forecaster.fit_from_frame(
+            df=df,
+            target="net_load_baseline_kw",
+            predictors=FORECAST_PREDICTORS,
+            lags=2,
+            horizon_steps=1,
+        )
+        if comparison.empty or not forecaster.metrics:
+            raise SystemExit(f"{forecaster_key} did not produce validation predictions and metrics.")
+        sample_features = None
+        for feature in getattr(forecaster, "feature_columns", []):
+            if sample_features is None:
+                sample_features = {}
+            sample_features[feature] = float(df[feature.split("_lag")[0]].iloc[-1]) if feature.split("_lag")[0] in df else 0.0
         if sample_features is None:
-            sample_features = {}
-        sample_features[feature] = float(df[feature.split("_lag")[0]].iloc[-1]) if feature.split("_lag")[0] in df else 0.0
-    if sample_features is None:
-        raise SystemExit("Forecaster plugin did not expose fitted feature columns.")
-    sample_frame = pd.DataFrame([sample_features], index=df.tail(1).index)
-    _, uncertainty = forecaster.predict(sample_frame, horizon_steps=1)
-    required_quantiles = {"p05", "p20", "p50", "p80", "p95"}
-    if uncertainty is None or not required_quantiles.issubset(set(uncertainty.columns)):
-        raise SystemExit("XGBoost forecaster must expose calibrated quantile forecast bands.")
-    print("forecast metrics:", forecaster.metrics)
+            raise SystemExit(f"{forecaster_key} did not expose fitted feature columns.")
+        sample_frame = pd.DataFrame([sample_features], index=df.tail(1).index)
+        _, uncertainty = forecaster.predict(sample_frame, horizon_steps=1)
+        required_quantiles = {"p05", "p20", "p50", "p80", "p95"}
+        if uncertainty is None or not required_quantiles.issubset(set(uncertainty.columns)):
+            raise SystemExit(f"{forecaster_key} must expose quantile forecast bands.")
+        print(f"{forecaster_key} forecast metrics:", forecaster.metrics)
 
     optimizer = registry.get_optimizer(DEFAULT_OPTIMIZER_PLUGIN)
     forecast_horizon = df[OPTIMIZER_COLUMNS].iloc[1:5].copy()

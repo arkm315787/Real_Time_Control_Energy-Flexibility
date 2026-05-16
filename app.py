@@ -13,7 +13,7 @@ README
 This educational Streamlit application demonstrates how aggregated residential
 flexibility from EVs, BESS, PV, and thermal loads can participate in
 Fingrid's FCR-N and aFRR balancing products. It uses fully synthetic but
-realistic Finland-inspired data, XGBoost forecasting, dynamic response
+realistic Finland-inspired data, probabilistic forecasting, dynamic response
 models, and a receding-horizon MPC-style optimizer built with PuLP.
 """
 
@@ -397,6 +397,109 @@ def signal_line_figure(df: pd.DataFrame, columns: List[str], title: str, y_title
     if y_title:
         fig.update_layout(yaxis_title=y_title)
     fig.update_layout(title=title)
+    return fig
+
+
+def forecast_performance_figure(comparison: pd.DataFrame, target: str) -> go.Figure:
+    fig = go.Figure()
+    for lower_col, upper_col, label, color in [
+        ("prediction_p05", "prediction_p95", "P05-P95", "rgba(11, 114, 133, 0.12)"),
+        ("prediction_p20", "prediction_p80", "P20-P80", "rgba(11, 114, 133, 0.20)"),
+    ]:
+        if {lower_col, upper_col}.issubset(comparison.columns):
+            fig.add_trace(
+                go.Scatter(
+                    x=comparison.index,
+                    y=comparison[lower_col],
+                    line={"width": 0},
+                    hoverinfo="skip",
+                    showlegend=False,
+                    name=f"{label} lower",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=comparison.index,
+                    y=comparison[upper_col],
+                    fill="tonexty",
+                    fillcolor=color,
+                    line={"width": 0},
+                    name=label,
+                )
+            )
+    fig.add_trace(go.Scatter(x=comparison.index, y=comparison["actual"], name=f"Actual {target}", line={"color": RESOURCE_COLORS["Base"]}))
+    fig.add_trace(
+        go.Scatter(
+            x=comparison.index,
+            y=comparison["prediction"],
+            name=f"Predicted {target}",
+            line={"color": RESOURCE_COLORS["Net"], "dash": "dot"},
+        )
+    )
+    fig.update_layout(yaxis_title=target)
+    return fig
+
+
+def forecast_revision_figure(forecast_trace: pd.DataFrame, target: str, max_iterations: int) -> go.Figure:
+    fig = go.Figure()
+    required = {"mpc_iteration", "issued_at", "horizon_timestamp", "horizon_step", target}
+    if forecast_trace.empty or not required.issubset(forecast_trace.columns):
+        fig.update_layout(yaxis_title=target, xaxis_title="Horizon timestamp")
+        return fig
+
+    working = forecast_trace.copy()
+    working["mpc_iteration"] = pd.to_numeric(working["mpc_iteration"], errors="coerce").astype("Int64")
+    working["horizon_step"] = pd.to_numeric(working["horizon_step"], errors="coerce").astype("Int64")
+    working["issued_at"] = pd.to_datetime(working["issued_at"], errors="coerce")
+    working["horizon_timestamp"] = pd.to_datetime(working["horizon_timestamp"], errors="coerce")
+    working = working.dropna(subset=["mpc_iteration", "issued_at", "horizon_timestamp", target])
+    iterations = list(working["mpc_iteration"].dropna().drop_duplicates().sort_values().tail(max_iterations))
+    if not iterations:
+        fig.update_layout(yaxis_title=target, xaxis_title="Horizon timestamp")
+        return fig
+
+    latest_iteration = iterations[-1]
+    latest = working[working["mpc_iteration"] == latest_iteration].sort_values("horizon_step")
+    lower_col = f"{target}_forecast_p05"
+    upper_col = f"{target}_forecast_p95"
+    if {lower_col, upper_col}.issubset(latest.columns):
+        fig.add_trace(
+            go.Scatter(
+                x=latest["horizon_timestamp"],
+                y=latest[lower_col],
+                line={"width": 0},
+                hoverinfo="skip",
+                showlegend=False,
+                name="Latest P05",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=latest["horizon_timestamp"],
+                y=latest[upper_col],
+                fill="tonexty",
+                fillcolor="rgba(194, 37, 92, 0.15)",
+                line={"width": 0},
+                name="Latest P05-P95",
+            )
+        )
+
+    palette = px.colors.qualitative.Safe + px.colors.qualitative.Set2
+    for offset, iteration in enumerate(iterations):
+        slice_df = working[working["mpc_iteration"] == iteration].sort_values("horizon_step")
+        if slice_df.empty:
+            continue
+        issued_at = pd.Timestamp(slice_df["issued_at"].iloc[0])
+        fig.add_trace(
+            go.Scatter(
+                x=slice_df["horizon_timestamp"],
+                y=slice_df[target],
+                mode="lines+markers",
+                name=f"MPC {int(iteration)} - {issued_at:%m-%d %H:%M}",
+                line={"color": palette[offset % len(palette)], "width": 3 if iteration == latest_iteration else 1.5},
+            )
+        )
+    fig.update_layout(yaxis_title=target, xaxis_title="Horizon timestamp")
     return fig
 
 
@@ -1676,11 +1779,12 @@ def main() -> None:
                 f"{int(forecast_market_status.get('training_observations', 0) or 0):,}."
             )
 
-            pred_fig = go.Figure()
-            pred_fig.add_trace(go.Scatter(x=comparison.index, y=comparison["actual"], name=f"Actual {spec_target}", line={"color": RESOURCE_COLORS["Base"]}))
-            pred_fig.add_trace(go.Scatter(x=comparison.index, y=comparison["prediction"], name=f"Predicted {spec_target}", line={"color": RESOURCE_COLORS["Net"], "dash": "dot"}))
-            pred_fig.update_layout(yaxis_title=spec_target)
+            pred_fig = forecast_performance_figure(comparison, str(spec_target))
             st.plotly_chart(apply_chart_style(pred_fig, template, height=380, title=f"Forecast performance: {spec_target}"), use_container_width=True)
+            quantile_cols = [col for col in comparison.columns if col.startswith("prediction_p")]
+            if quantile_cols:
+                with st.expander("Forecast quantiles", expanded=False):
+                    st.dataframe(styled_dataframe(comparison[["actual", "prediction", *quantile_cols]].tail(48).round(3)), use_container_width=True, height=260)
 
             if forecaster is not None and hasattr(forecaster, "get_feature_importance"):
                 importance = forecaster.get_feature_importance()
@@ -2218,6 +2322,41 @@ def main() -> None:
                 f"`{st.session_state.get('mpc_config', {}).get('optimizer_plugin', DEFAULT_OPTIMIZER_PLUGIN)}` chooses reserve bids and resource dispatch, "
                 "the market clock runs as a separate pressure process, and the lower 4-second tracker attaches to that live market state inside the upper socket."
             )
+            forecast_trace = result_frame(upper_view_result, "forecast_trace").copy()
+            if not forecast_trace.empty:
+                trace_targets = [target_name for target_name in SUPPORTED_MPC_TARGETS if target_name in forecast_trace.columns]
+                if trace_targets:
+                    revision_controls = st.columns([1.2, 0.8, 1.0])
+                    default_trace_target = "fcrn_capacity_eur_per_mw_h" if "fcrn_capacity_eur_per_mw_h" in trace_targets else trace_targets[0]
+                    revision_target = revision_controls[0].selectbox(
+                        "MPC forecast target",
+                        trace_targets,
+                        index=trace_targets.index(default_trace_target),
+                        key="mpc_forecast_revision_target",
+                    )
+                    iteration_count = (
+                        int(pd.to_numeric(forecast_trace["mpc_iteration"], errors="coerce").dropna().nunique())
+                        if "mpc_iteration" in forecast_trace
+                        else 0
+                    )
+                    max_iterations = revision_controls[1].slider(
+                        "Forecast issues",
+                        2,
+                        max(2, min(12, iteration_count)),
+                        min(6, max(2, min(12, iteration_count))),
+                        key="mpc_forecast_revision_count",
+                    )
+                    if {"mpc_iteration", "horizon_step"}.issubset(forecast_trace.columns):
+                        latest_rows = forecast_trace.sort_values(["mpc_iteration", "horizon_step"]).tail(1)
+                    else:
+                        latest_rows = pd.DataFrame()
+                    latest_observations = int(latest_rows["observations_available"].iloc[0]) if "observations_available" in latest_rows and not latest_rows.empty else 0
+                    revision_controls[2].metric("Latest observed rows", f"{latest_observations:,}")
+                    revision_fig = forecast_revision_figure(forecast_trace, revision_target, max_iterations)
+                    st.plotly_chart(
+                        apply_chart_style(revision_fig, template, height=360, title="MPC forecast revisions"),
+                        use_container_width=True,
+                    )
 
             left, right = st.columns([1.45, 1.0])
             with left:

@@ -54,6 +54,7 @@ def serialize_optimization_result(result: Dict[str, Any]) -> Dict[str, Any]:
     history = result.get("history", pd.DataFrame())
     tracking = result.get("tracking_4s", pd.DataFrame())
     first_schedule = result.get("first_schedule", pd.DataFrame())
+    forecast_trace = result.get("forecast_trace", pd.DataFrame())
     household_contributions = result.get("household_contributions", pd.DataFrame())
     appliance_contributions = result.get("appliance_contributions", pd.DataFrame())
     upper_device_schedule = result.get("upper_device_schedule", pd.DataFrame())
@@ -68,6 +69,7 @@ def serialize_optimization_result(result: Dict[str, Any]) -> Dict[str, Any]:
         "history": dataframe_to_records(history),
         "tracking_4s": dataframe_to_records(tracking),
         "first_schedule": dataframe_to_records(first_schedule),
+        "forecast_trace": dataframe_to_records(forecast_trace),
         "household_contributions": dataframe_to_records(household_contributions),
         "appliance_contributions": dataframe_to_records(appliance_contributions),
         "upper_device_schedule": dataframe_to_records(upper_device_schedule),
@@ -79,6 +81,7 @@ def serialize_optimization_result(result: Dict[str, Any]) -> Dict[str, Any]:
             "history": int(len(history)) if history is not None else 0,
             "tracking_4s": int(len(tracking)) if tracking is not None else 0,
             "first_schedule": int(len(first_schedule)) if first_schedule is not None else 0,
+            "forecast_trace": int(len(forecast_trace)) if forecast_trace is not None else 0,
             "household_contributions": int(len(household_contributions)) if household_contributions is not None else 0,
             "appliance_contributions": int(len(appliance_contributions)) if appliance_contributions is not None else 0,
             "upper_device_schedule": int(len(upper_device_schedule)) if upper_device_schedule is not None else 0,

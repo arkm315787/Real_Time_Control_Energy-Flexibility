@@ -158,7 +158,7 @@ class ForecastSpec:
     predictors: List[str]
     lags: int
     horizon_steps: int
-    model: XGBRegressor
+    model: Any
     metrics: Dict[str, float]
     residual_quantiles: Dict[str, float] | None = None
 
@@ -894,6 +894,7 @@ def serialize_forecast_spec(spec: ForecastSpec) -> bytes:
         "horizon_steps": spec.horizon_steps,
         "metrics": spec.metrics,
         "model": spec.model,
+        "residual_quantiles": spec.residual_quantiles or {},
     }
     return pickle.dumps(payload)
 
@@ -1456,6 +1457,24 @@ def iterative_forecast(
         if step_callback:
             step_callback(step_ahead, horizon_steps)
     return output
+
+
+def mpc_forecast_trace_frame(
+    predictions: pd.DataFrame,
+    mpc_iteration: int,
+    issued_at: pd.Timestamp,
+    observations_available: int,
+) -> pd.DataFrame:
+    if predictions.empty:
+        return pd.DataFrame()
+    trace = predictions.copy()
+    trace.insert(0, "horizon_timestamp", pd.DatetimeIndex(trace.index))
+    trace.insert(0, "horizon_step", np.arange(1, len(trace) + 1, dtype=int))
+    trace.insert(0, "observations_available", int(observations_available))
+    trace.insert(0, "issued_at", pd.Timestamp(issued_at))
+    trace.insert(0, "mpc_iteration", int(mpc_iteration))
+    return trace.reset_index(drop=True)
+
 
 def _predict_one_step(spec: Any, row: pd.DataFrame) -> float:
     return _predict_one_step_with_uncertainty(spec, row)[0]
@@ -2813,6 +2832,7 @@ def run_mpc_controller(
     }
     history: List[Dict[str, float]] = []
     schedule_snapshots: List[pd.DataFrame] = []
+    forecast_trace_snapshots: List[pd.DataFrame] = []
     tracking_history: List[pd.DataFrame] = []
     upper_device_schedules: List[pd.DataFrame] = []
     gateway_command_summaries: List[pd.DataFrame] = []
@@ -2850,6 +2870,14 @@ def run_mpc_controller(
             models,
             list(dict.fromkeys(SUPPORTED_MPC_TARGETS)),
             step_callback=_forecast_step_callback,
+        )
+        forecast_trace_snapshots.append(
+            mpc_forecast_trace_frame(
+                predictions=preds,
+                mpc_iteration=t + 1,
+                issued_at=pd.Timestamp(df.index[t]),
+                observations_available=t + 1,
+            )
         )
         if progress_callback:
             progress_callback(
@@ -3141,6 +3169,7 @@ def run_mpc_controller(
             "summary": {},
             "compliance": {},
             "first_schedule": pd.DataFrame(),
+            "forecast_trace": pd.DataFrame(),
             "tracking_4s": pd.DataFrame(),
             "inner_mpc_trace": pd.DataFrame(),
             "upper_device_schedule": pd.DataFrame(),
@@ -3419,9 +3448,11 @@ def run_mpc_controller(
     }
     summary.update(technical_summary)
     gateway_commands = pd.concat(gateway_command_summaries, ignore_index=True) if gateway_command_summaries else pd.DataFrame()
+    forecast_trace = pd.concat(forecast_trace_snapshots, ignore_index=True) if forecast_trace_snapshots else pd.DataFrame()
     household_contrib, appliance_contrib, usage_fatigue = centralized_controller.contribution_frames(gateway_commands)
     return {
         "history": result_df,
+        "forecast_trace": forecast_trace,
         "tracking_4s": tracking_df,
         "inner_mpc_trace": tracking_df,
         "summary": summary,
@@ -3466,6 +3497,7 @@ def run_lower_mpc_from_upper_result(
             "summary": {},
             "compliance": {},
             "first_schedule": pd.DataFrame(),
+            "forecast_trace": empty,
             "tracking_4s": empty,
             "inner_mpc_trace": empty,
             "upper_device_schedule": empty,
@@ -3715,6 +3747,7 @@ def run_lower_mpc_from_upper_result(
             "summary": {**(dict(upper_result.get("summary", {})) if isinstance(upper_result, dict) else {}), "execute_lower_mpc": True},
             "compliance": dict(upper_result.get("compliance", {})) if isinstance(upper_result, dict) else {},
             "first_schedule": upper_result.get("first_schedule", pd.DataFrame()) if isinstance(upper_result, dict) else pd.DataFrame(),
+            "forecast_trace": upper_result.get("forecast_trace", pd.DataFrame()) if isinstance(upper_result, dict) else pd.DataFrame(),
             "tracking_4s": empty,
             "inner_mpc_trace": empty,
             "upper_device_schedule": empty,
@@ -3817,6 +3850,7 @@ def run_lower_mpc_from_upper_result(
         "summary": summary,
         "compliance": compliance,
         "first_schedule": upper_result.get("first_schedule", pd.DataFrame()) if isinstance(upper_result, dict) else pd.DataFrame(),
+        "forecast_trace": upper_result.get("forecast_trace", pd.DataFrame()) if isinstance(upper_result, dict) else pd.DataFrame(),
         "upper_device_schedule": pd.concat(upper_device_schedules, ignore_index=True) if upper_device_schedules else pd.DataFrame(),
         "gateway_commands": gateway_commands,
         "household_contributions": household_contrib,

@@ -152,17 +152,18 @@ def portfolio_bundle_is_current(session_state: Dict[str, object], signature: tup
 
 
 RESOURCE_COLORS = {
-    "BESS": "#3B6EA8",
-    "EV": "#5A7D3A",
-    "PV": "#2F8A57",
-    "HVAC": "#B87514",
-    "Base": "#34495E",
-    "Net": "#006D77",
-    "Frequency": "#A23E48",
-    "aFRR": "#6D597A",
+    "BESS": "#2563EB",
+    "EV": "#16A34A",
+    "PV": "#059669",
+    "HVAC": "#D97706",
+    "Base": "#64748B",
+    "Net": "#0E7490",
+    "Frequency": "#DC2626",
+    "aFRR": "#7C3AED",
 }
 
 PLOTLY_TEMPLATE = {"Dark": "plotly_dark", "Light": "plotly_white"}
+SUPPORT_LINE_COLOR = "#94A3B8"
 
 APP_BUILD_ID = "ui-lightgbm-visible-2026-05-16"
 
@@ -295,6 +296,19 @@ def inject_css(theme_mode: str) -> None:
                 color: {text_color};
                 font-family: "Aptos", "Segoe UI", "Trebuchet MS", sans-serif;
             }}
+            [data-stale="true"],
+            [data-stale="true"] *,
+            div[data-testid="stElementContainer"].stale,
+            div[data-testid="stElementContainer"][data-stale="true"],
+            div[data-testid="stVerticalBlock"].stale,
+            div[data-testid="stVerticalBlock"][data-stale="true"],
+            div[data-testid="stHorizontalBlock"].stale,
+            div[data-testid="stHorizontalBlock"][data-stale="true"],
+            .element-container.stale {{
+                opacity: 1 !important;
+                filter: none !important;
+                transition: none !important;
+            }}
             .block-container {{
                 padding-top: 0.85rem !important;
                 padding-bottom: 2rem !important;
@@ -346,6 +360,17 @@ def inject_css(theme_mode: str) -> None:
             h4, .stApp h4 {{
                 font-size: 1.05rem !important;
                 font-weight: 700 !important;
+            }}
+            .stApp,
+            .stApp p,
+            .stApp li,
+            .stApp label,
+            .stApp span,
+            [data-testid="stMarkdownContainer"],
+            .stMarkdown,
+            .stCaption,
+            .small-note {{
+                color: {text_color};
             }}
             p, li, label, .stMarkdown, .stCaption, .small-note {{
                 font-size: 0.94rem !important;
@@ -451,6 +476,23 @@ def inject_css(theme_mode: str) -> None:
                 font-size: 0.88rem !important;
                 line-height: 1.35 !important;
             }}
+            [data-testid="stDataFrame"] {{
+                border: 1px solid {card_border} !important;
+                border-radius: 8px !important;
+                overflow: hidden !important;
+                background: transparent !important;
+            }}
+            [data-testid="stTable"],
+            [data-testid="stTable"] table,
+            [data-testid="stTable"] thead,
+            [data-testid="stTable"] tbody,
+            [data-testid="stTable"] tr,
+            [data-testid="stTable"] th,
+            [data-testid="stTable"] td {{
+                background: {surface} !important;
+                color: {text_color} !important;
+                border-color: {card_border} !important;
+            }}
             .modebar {{
                 display: none !important;
             }}
@@ -459,9 +501,27 @@ def inject_css(theme_mode: str) -> None:
             textarea,
             input {{
                 border-radius: 6px !important;
+                background: {surface} !important;
+                color: {text_color} !important;
+                border-color: {card_border} !important;
+            }}
+            div[data-baseweb="select"] input,
+            div[data-baseweb="input"] input,
+            textarea {{
+                color: {text_color} !important;
+                -webkit-text-fill-color: {text_color} !important;
+            }}
+            div[data-baseweb="select"] span,
+            div[data-baseweb="select"] svg,
+            div[data-baseweb="input"] svg {{
+                color: {text_color} !important;
+                fill: {text_color} !important;
             }}
             div[role="listbox"] {{
                 min-width: 340px !important;
+                background: {surface} !important;
+                color: {text_color} !important;
+                border: 1px solid {card_border} !important;
             }}
             div[data-baseweb="select"] span {{
                 font-size: 0.92rem !important;
@@ -711,26 +771,115 @@ def inject_css(theme_mode: str) -> None:
 
 
 
+def chart_theme_tokens(template: str) -> Dict[str, str]:
+    dark = "dark" in str(template).lower()
+    if dark:
+        return {
+            "paper": "#0F172A",
+            "plot": "#0B1220",
+            "text": "#E5E7EB",
+            "muted": "#CBD5E1",
+            "grid": "rgba(148,163,184,0.18)",
+            "axis": "rgba(203,213,225,0.45)",
+            "zero": "rgba(203,213,225,0.38)",
+            "legend_bg": "rgba(15,23,42,0.96)",
+            "legend_border": "rgba(148,163,184,0.26)",
+        }
+    return {
+        "paper": "#FFFFFF",
+        "plot": "#F8FAFC",
+        "text": "#111827",
+        "muted": "#475569",
+        "grid": "rgba(148,163,184,0.28)",
+        "axis": "rgba(100,116,139,0.42)",
+        "zero": "rgba(100,116,139,0.34)",
+        "legend_bg": "rgba(255,255,255,0.96)",
+        "legend_border": "rgba(203,213,225,0.90)",
+    }
+
+
+def visible_legend_items(fig: go.Figure) -> int:
+    if fig.layout.showlegend is False:
+        return 0
+    return sum(
+        1
+        for trace in fig.data
+        if getattr(trace, "showlegend", None) is not False and bool(getattr(trace, "name", None))
+    )
+
+
 def apply_chart_style(fig: go.Figure, template: str, height: int | None = None, title: str | None = None) -> go.Figure:
     existing_title = fig.layout.title.text if fig.layout.title and fig.layout.title.text else None
     if isinstance(existing_title, str) and existing_title.strip().lower() == "undefined":
         existing_title = None
     resolved_title = title if title not in {None, "undefined"} else existing_title
+    tokens = chart_theme_tokens(template)
+    legend_items = visible_legend_items(fig)
+    legend_rows = max(1, min(4, (legend_items + 4) // 5)) if legend_items else 0
+    resolved_height = height if height is not None else fig.layout.height
+    small_chart = bool(resolved_height and int(resolved_height) <= 320)
+    top_margin = 74 if resolved_title else 34
+    legend_y = -0.30 if small_chart else -0.18
+    bottom_margin = (76 + legend_rows * 24) if small_chart and legend_items else (54 + legend_rows * 24 if legend_items else 30)
     layout_updates = dict(
         template=template,
-        height=height if height is not None else fig.layout.height,
-        font=dict(size=13),
-        legend=dict(font=dict(size=11), title_font=dict(size=12), orientation="h", yanchor="bottom", y=1.06, xanchor="left", x=0),
-        hoverlabel=dict(font_size=13),
-        margin=dict(l=20, r=20, t=72, b=12),
+        height=resolved_height,
+        paper_bgcolor=tokens["paper"],
+        plot_bgcolor=tokens["plot"],
+        font=dict(size=13, color=tokens["text"]),
+        legend=dict(
+            font=dict(size=11, color=tokens["text"]),
+            title_font=dict(size=12, color=tokens["muted"]),
+            orientation="h",
+            yanchor="top",
+            y=legend_y,
+            xanchor="left",
+            x=0,
+            bgcolor="rgba(0,0,0,0)",
+            bordercolor=tokens["legend_border"],
+            borderwidth=0,
+            itemsizing="constant",
+            itemwidth=34,
+            tracegroupgap=16,
+        ),
+        hoverlabel=dict(font_size=13, bgcolor=tokens["paper"], font_color=tokens["text"], bordercolor=tokens["legend_border"]),
+        margin=dict(l=54, r=36, t=top_margin, b=bottom_margin),
     )
     if resolved_title:
-        layout_updates["title"] = dict(text=resolved_title, font=dict(size=16))
+        layout_updates["title"] = dict(
+            text=resolved_title,
+            font=dict(size=16, color=tokens["text"]),
+            x=0,
+            xanchor="left",
+            y=0.985,
+            yanchor="top",
+        )
     else:
         fig.update_layout(title=None)
     fig.update_layout(**layout_updates)
-    fig.update_xaxes(title_font=dict(size=13), tickfont=dict(size=11), showgrid=True, gridcolor="rgba(148,163,184,0.25)")
-    fig.update_yaxes(title_font=dict(size=13), tickfont=dict(size=11), showgrid=True, gridcolor="rgba(148,163,184,0.25)")
+    fig.update_annotations(font=dict(size=13, color=tokens["muted"]))
+    fig.update_xaxes(
+        title_font=dict(size=13, color=tokens["muted"]),
+        tickfont=dict(size=11, color=tokens["muted"]),
+        showgrid=True,
+        gridcolor=tokens["grid"],
+        zeroline=True,
+        zerolinecolor=tokens["zero"],
+        linecolor=tokens["axis"],
+        color=tokens["muted"],
+        automargin=True,
+    )
+    fig.update_yaxes(
+        title_font=dict(size=13, color=tokens["muted"]),
+        tickfont=dict(size=11, color=tokens["muted"]),
+        showgrid=True,
+        gridcolor=tokens["grid"],
+        zeroline=True,
+        zerolinecolor=tokens["zero"],
+        linecolor=tokens["axis"],
+        color=tokens["muted"],
+        automargin=True,
+    )
     return fig
 
 
@@ -753,10 +902,40 @@ def make_progress_tracker(
 
 
 def styled_dataframe(frame: pd.DataFrame) -> pd.io.formats.style.Styler:
-    return frame.style.set_properties(**{"font-size": "16px"}).set_table_styles(
+    dark = st.session_state.get("dashboard_theme_mode", "Light") == "Dark"
+    bg = "#0F172A" if dark else "#FFFFFF"
+    header_bg = "#111827" if dark else "#F8FAFC"
+    text = "#E5E7EB" if dark else "#111827"
+    muted = "#CBD5E1" if dark else "#475569"
+    border = "#334155" if dark else "#D4DCE7"
+    return frame.style.set_properties(
+        **{
+            "background-color": bg,
+            "border-color": border,
+            "color": text,
+            "font-size": "16px",
+        }
+    ).set_table_styles(
         [
-            {"selector": "th", "props": [("font-size", "16px"), ("font-weight", "700")]},
-            {"selector": "td", "props": [("font-size", "15px")]},
+            {
+                "selector": "th",
+                "props": [
+                    ("background-color", header_bg),
+                    ("border-color", border),
+                    ("color", muted),
+                    ("font-size", "16px"),
+                    ("font-weight", "700"),
+                ],
+            },
+            {
+                "selector": "td",
+                "props": [
+                    ("background-color", bg),
+                    ("border-color", border),
+                    ("color", text),
+                    ("font-size", "15px"),
+                ],
+            },
         ]
     )
 
@@ -784,6 +963,11 @@ def numeric_trace(df: pd.DataFrame, column: str, scale: float = 1.0) -> pd.Serie
     if column not in df.columns:
         return pd.Series(0.0, index=df.index)
     return pd.to_numeric(df[column], errors="coerce").fillna(0.0) / float(scale)
+
+
+def has_visible_signal(series: pd.Series, threshold: float = 1e-6) -> bool:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    return not values.empty and float(values.abs().max()) > threshold
 
 
 def upper_mpc_decision_figure(upper_plot_df: pd.DataFrame) -> go.Figure:
@@ -850,66 +1034,184 @@ def upper_mpc_decision_figure(upper_plot_df: pd.DataFrame) -> go.Figure:
 
 def lower_mpc_execution_figure(tracking_window: pd.DataFrame) -> go.Figure:
     fig = make_subplots(
-        rows=4,
+        rows=3,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.075,
-        row_heights=[0.30, 0.25, 0.25, 0.20],
-        specs=[[{}], [{}], [{}], [{"secondary_y": True}]],
+        vertical_spacing=0.105,
+        row_heights=[0.42, 0.28, 0.30],
+        specs=[[{}], [{}], [{"secondary_y": True}]],
         subplot_titles=(
-            "Request and delivered reserve",
-            "Resource allocation",
-            "Power state and tracking diagnostics",
-            "Accuracy envelope and control latency",
+            "Reserve tracking",
+            "Resource dispatch",
+            "Control error and latency",
         ),
     )
+
+    def add_line(
+        row: int,
+        col: int,
+        y: pd.Series,
+        name: str,
+        color: str,
+        *,
+        dash: str = "solid",
+        width: float = 2.0,
+        opacity: float = 1.0,
+        secondary_y: bool | None = None,
+        visible: bool | str | None = None,
+        legendgroup: str | None = None,
+        hover_suffix: str = "",
+        show_if_zero: bool = False,
+        showlegend: bool = True,
+    ) -> None:
+        if not show_if_zero and not has_visible_signal(y):
+            return
+        trace = go.Scatter(
+            x=tracking_window.index,
+            y=y,
+            name=name,
+            mode="lines",
+            line={"color": color, "dash": dash, "width": width},
+            opacity=opacity,
+            connectgaps=True,
+            legendgroup=legendgroup,
+            showlegend=showlegend,
+            hovertemplate=f"%{{x|%H:%M:%S}}<br>{name}: %{{y:.3f}}{hover_suffix}<extra></extra>",
+        )
+        if visible is not None:
+            trace.visible = visible
+        if secondary_y is None:
+            fig.add_trace(trace, row=row, col=col)
+        else:
+            fig.add_trace(trace, row=row, col=col, secondary_y=secondary_y)
+
     signed_request = numeric_trace(tracking_window, "requested_up_kw") - numeric_trace(tracking_window, "requested_down_kw")
     signed_delivery = numeric_trace(tracking_window, "delivered_up_kw") - numeric_trace(tracking_window, "delivered_down_kw")
-    fig.add_trace(go.Scatter(x=tracking_window.index, y=signed_request / 1000.0, name="TSO request", line={"color": RESOURCE_COLORS["Frequency"], "dash": "dot"}), row=1, col=1)
-    fig.add_trace(go.Scatter(x=tracking_window.index, y=signed_delivery / 1000.0, name="Delivered", line={"color": RESOURCE_COLORS["Net"], "width": 3}), row=1, col=1)
+    signed_request_mw = signed_request / 1000.0
+    signed_delivery_mw = signed_delivery / 1000.0
+    tolerance_mw = numeric_trace(tracking_window, "tracking_tolerance_kw", 1000.0)
+    if has_visible_signal(tolerance_mw):
+        fig.add_trace(
+            go.Scatter(
+                x=tracking_window.index,
+                y=signed_request_mw - tolerance_mw,
+                mode="lines",
+                line={"width": 0},
+                name="Tolerance lower",
+                hoverinfo="skip",
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=tracking_window.index,
+                y=signed_request_mw + tolerance_mw,
+                mode="lines",
+                line={"width": 0},
+                fill="tonexty",
+                fillcolor="rgba(14,116,144,0.12)",
+                name="Tolerance band",
+                legendgroup="reserve",
+                hovertemplate="%{x|%H:%M:%S}<br>Tolerance band<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+    add_line(1, 1, signed_request_mw, "TSO request", RESOURCE_COLORS["Frequency"], dash="dash", width=2.4, legendgroup="reserve", hover_suffix=" MW", show_if_zero=True)
+    add_line(1, 1, signed_delivery_mw, "Delivered reserve", RESOURCE_COLORS["Net"], width=3.4, legendgroup="reserve", hover_suffix=" MW", show_if_zero=True)
     if {"committed_up_kw", "committed_down_kw"}.issubset(tracking_window.columns):
-        fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, "committed_up_kw", 1000.0), name="Committed up", line={"color": "#6b7280", "dash": "dash"}), row=1, col=1)
-        fig.add_trace(go.Scatter(x=tracking_window.index, y=-numeric_trace(tracking_window, "committed_down_kw", 1000.0), name="Committed down", line={"color": "#6b7280", "dash": "dash"}), row=1, col=1)
+        add_line(1, 1, numeric_trace(tracking_window, "committed_up_kw", 1000.0), "Upper socket", SUPPORT_LINE_COLOR, dash="dash", opacity=0.7, hover_suffix=" MW", showlegend=False)
+        add_line(1, 1, -numeric_trace(tracking_window, "committed_down_kw", 1000.0), "Lower socket", SUPPORT_LINE_COLOR, dash="dash", opacity=0.7, hover_suffix=" MW", showlegend=False)
 
     for resource, up_col, down_col, color in [
         ("BESS", "bess_up_kw", "bess_down_kw", RESOURCE_COLORS["BESS"]),
-        ("EV", "ev_up_kw", "ev_down_kw", RESOURCE_COLORS["EV"]),
         ("HVAC", "hvac_up_kw", "hvac_down_kw", RESOURCE_COLORS["HVAC"]),
+        ("EV", "ev_up_kw", "ev_down_kw", RESOURCE_COLORS["EV"]),
         ("PV", "", "pv_down_kw", RESOURCE_COLORS["PV"]),
     ]:
-        if up_col and up_col in tracking_window:
-            fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, up_col, 1000.0), name=f"{resource} up", line={"color": color}), row=2, col=1)
-        if down_col in tracking_window:
-            fig.add_trace(go.Scatter(x=tracking_window.index, y=-numeric_trace(tracking_window, down_col, 1000.0), name=f"{resource} down", line={"color": color, "dash": "dot"}), row=2, col=1)
+        up = numeric_trace(tracking_window, up_col, 1000.0) if up_col else pd.Series(0.0, index=tracking_window.index)
+        down = numeric_trace(tracking_window, down_col, 1000.0) if down_col in tracking_window else pd.Series(0.0, index=tracking_window.index)
+        signed_resource = up - down
+        if has_visible_signal(signed_resource):
+            fig.add_trace(
+                go.Bar(
+                    x=tracking_window.index,
+                    y=signed_resource,
+                    name=resource,
+                    marker={"color": color, "line": {"width": 0}},
+                    opacity=0.86,
+                    legendgroup="resources",
+                    hovertemplate=f"%{{x|%H:%M:%S}}<br>{resource}: %{{y:.3f}} MW<extra></extra>",
+                ),
+                row=2,
+                col=1,
+            )
 
-    for column, label, color, dash in [
-        ("fleet_power_before_kw", "Power before", RESOURCE_COLORS["Base"], "dot"),
-        ("fleet_power_after_kw", "Power after", RESOURCE_COLORS["Net"], "solid"),
-        ("target_command_kw", "Target command", RESOURCE_COLORS["Frequency"], "dash"),
-        ("tracking_error_kw", "Tracking error", "#B42318", "solid"),
-        ("tracking_tolerance_kw", "Tolerance", "#6b7280", "dash"),
-        ("shortfall_kw", "Shortfall", RESOURCE_COLORS["aFRR"], "dot"),
-        ("buffer_used_kw", "Buffer used", "#B87514", "longdash"),
-        ("fast_bridge_used_kw", "Fast bridge", RESOURCE_COLORS["PV"], "longdashdot"),
-    ]:
-        if column in tracking_window:
-            fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, column), name=label, line={"color": color, "dash": dash}), row=3, col=1)
-
-    if {"afrr_accuracy_ratio", "afrr_accuracy_low", "afrr_accuracy_high"}.issubset(tracking_window.columns):
-        fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, "afrr_accuracy_ratio"), name="aFRR ratio", line={"color": RESOURCE_COLORS["Net"], "width": 3}), row=4, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, "afrr_accuracy_low"), name="90% floor", line={"color": "#6b7280", "dash": "dash"}), row=4, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, "afrr_accuracy_high"), name="110% ceiling", line={"color": "#6b7280", "dash": "dash"}), row=4, col=1, secondary_y=False)
+    tracking_error = numeric_trace(tracking_window, "tracking_error_kw")
+    if has_visible_signal(tolerance_mw):
+        tolerance_kw = tolerance_mw * 1000.0
+        fig.add_trace(
+            go.Scatter(
+                x=tracking_window.index,
+                y=-tolerance_kw,
+                mode="lines",
+                line={"width": 0},
+                name="Error tolerance lower",
+                hoverinfo="skip",
+                showlegend=False,
+            ),
+            row=3,
+            col=1,
+            secondary_y=False,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=tracking_window.index,
+                y=tolerance_kw,
+                mode="lines",
+                line={"width": 0},
+                fill="tonexty",
+                fillcolor="rgba(148,163,184,0.16)",
+                name="Error tolerance",
+                legendgroup="control",
+                hovertemplate="%{x|%H:%M:%S}<br>Error tolerance<extra></extra>",
+            ),
+            row=3,
+            col=1,
+            secondary_y=False,
+        )
+    if has_visible_signal(tracking_error):
+        error_colors = np.where(tracking_error.abs() <= (tolerance_mw * 1000.0), "#16A34A", "#DC2626")
+        fig.add_trace(
+            go.Bar(
+                x=tracking_window.index,
+                y=tracking_error,
+                name="Tracking error",
+                marker={"color": error_colors, "line": {"width": 0}},
+                opacity=0.82,
+                legendgroup="control",
+                hovertemplate="%{x|%H:%M:%S}<br>Tracking error: %{y:.1f} kW<extra></extra>",
+            ),
+            row=3,
+            col=1,
+            secondary_y=False,
+        )
     if "control_latency_ms" in tracking_window:
-        fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, "control_latency_ms"), name="Latency ms", line={"color": RESOURCE_COLORS["Frequency"], "dash": "dot"}), row=4, col=1, secondary_y=True)
+        add_line(3, 1, numeric_trace(tracking_window, "control_latency_ms"), "Latency", RESOURCE_COLORS["aFRR"], width=2.6, secondary_y=True, legendgroup="control", hover_suffix=" ms")
     if "control_deadline_ms" in tracking_window:
-        fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, "control_deadline_ms"), name="Deadline ms", line={"color": "#6b7280", "dash": "dash"}), row=4, col=1, secondary_y=True)
+        add_line(3, 1, numeric_trace(tracking_window, "control_deadline_ms"), "Deadline", SUPPORT_LINE_COLOR, dash="dash", width=1.4, opacity=0.62, secondary_y=True, legendgroup="control", hover_suffix=" ms", showlegend=False)
 
     fig.update_yaxes(title_text="MW", row=1, col=1)
     fig.update_yaxes(title_text="MW", row=2, col=1)
     fig.update_yaxes(title_text="kW", row=3, col=1)
-    fig.update_yaxes(title_text="ratio", row=4, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="ms", row=4, col=1, secondary_y=True)
-    fig.update_layout(hovermode="x unified")
+    fig.update_yaxes(title_text="ms", row=3, col=1, secondary_y=True)
+    for row in range(1, 3):
+        fig.add_hline(y=0, row=row, col=1, line_color="rgba(148,163,184,0.42)", line_width=1)
+    fig.add_hline(y=0, row=3, col=1, line_color="rgba(148,163,184,0.42)", line_width=1)
+    fig.update_layout(barmode="relative", bargap=0.08, hovermode="x unified", legend_traceorder="grouped")
+    fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", spikecolor="rgba(148,163,184,0.45)", spikethickness=1)
     return fig
 
 
@@ -1021,6 +1323,14 @@ def live_market_status(session: Dict[str, object] | None, now_s: float | None = 
         return {"status": "idle", "countdown_seconds": 0.0, "elapsed_seconds": 0.0, "remaining_seconds": 0.0}
     now = float(time.time() if now_s is None else now_s)
     start_at = float(session.get("start_at_wall_s", now))
+    if session.get("stopped_at_wall_s") is not None:
+        stopped_at = float(session.get("stopped_at_wall_s", now))
+        return {
+            "status": "closed",
+            "countdown_seconds": 0.0,
+            "elapsed_seconds": max(stopped_at - start_at, 0.0),
+            "remaining_seconds": 0.0,
+        }
     duration = max(float(session.get("duration_seconds", 0.0)), 0.0)
     end_at = start_at + duration
     if now < start_at:
@@ -1198,7 +1508,7 @@ def render_lower_live_trace(
     lm4.metric("Visible recovery ticks", f"{int(lower_visible.get('recovery_mode', pd.Series(dtype=bool)).astype(bool).sum()):,}")
 
     st.plotly_chart(
-        apply_chart_style(lower_mpc_execution_figure(lower_visible), template, height=720, title="Lower MPC execution console"),
+        apply_chart_style(lower_mpc_execution_figure(lower_visible), template, height=560, title="Lower MPC execution console"),
         use_container_width=True,
         key=f"{key_prefix}_execution_console",
     )
@@ -1331,7 +1641,8 @@ def sync_market_simulator_feed(
         st.session_state["market_simulator"] = simulator
         st.session_state["live_market_ticks"] = []
 
-    signal = simulator.get_current_signal(float(time.time() if now_s is None else now_s))
+    signal_time = float(session.get("stopped_at_wall_s", time.time() if now_s is None else now_s))
+    signal = simulator.get_current_signal(signal_time)
     ticks: List[Dict[str, object]] = list(st.session_state.get("live_market_ticks", []))
     if signal is not None:
         tick_index = int(signal.get("tick_index", 0))
@@ -1482,7 +1793,8 @@ def indicator_figure(value: float, title: str, threshold: float, mode: str = "ga
 
 
 
-def plot_sankey(summary: Dict[str, float]) -> go.Figure:
+def plot_sankey(summary: Dict[str, float], template: str = "plotly_white") -> go.Figure:
+    tokens = chart_theme_tokens(template)
     labels = ["Homes", "EV", "BESS", "PV", "HVAC", "Aggregator", "FCR-N", "aFRR Up", "aFRR Down"]
     values = [summary["n_ev"], summary["n_bess"], summary["n_pv"], summary["n_hvac"]]
     source = [0, 0, 0, 0, 1, 2, 4, 3, 5, 5, 5]
@@ -1511,31 +1823,38 @@ def plot_sankey(summary: Dict[str, float]) -> go.Figure:
                     color=["#2E86DE", "#74C0FC", "#FF6B6B", "#FFB3B3", "#4ECDC4", "#8CE99A", "#95A5A6", "#F783AC", "#B197FC"],
                     x=[0.02, 0.33, 0.33, 0.33, 0.33, 0.67, 0.94, 0.94, 0.94],
                     y=[0.50, 0.70, 0.88, 0.52, 0.20, 0.50, 0.54, 0.40, 0.68],
-                    line=dict(color="rgba(24,49,83,0.30)", width=1),
+                    line=dict(color=tokens["axis"], width=1),
                 ),
-                textfont=dict(size=22, color="#183153"),
+                textfont=dict(size=22, color=tokens["text"]),
                 link=dict(
                     source=source,
                     target=target,
                     value=flow,
                     color=[
-                        "rgba(170,170,170,0.55)",
-                        "rgba(170,170,170,0.55)",
-                        "rgba(170,170,170,0.55)",
-                        "rgba(170,170,170,0.55)",
-                        "rgba(123,97,255,0.18)",
-                        "rgba(123,97,255,0.18)",
-                        "rgba(255,146,43,0.22)",
-                        "rgba(47,158,68,0.20)",
-                        "rgba(149,39,204,0.16)",
-                        "rgba(220,53,69,0.24)",
-                        "rgba(102,126,234,0.24)",
+                        "rgba(148,163,184,0.48)",
+                        "rgba(148,163,184,0.48)",
+                        "rgba(148,163,184,0.48)",
+                        "rgba(148,163,184,0.48)",
+                        "rgba(37,99,235,0.24)",
+                        "rgba(37,99,235,0.24)",
+                        "rgba(217,119,6,0.28)",
+                        "rgba(5,150,105,0.26)",
+                        "rgba(124,58,237,0.24)",
+                        "rgba(220,38,38,0.26)",
+                        "rgba(14,116,144,0.26)",
                     ],
                 ),
             )
         ]
     )
-    fig.update_layout(height=470, margin=dict(l=15, r=40, t=20, b=10), font=dict(size=18))
+    fig.update_layout(
+        template=template,
+        paper_bgcolor=tokens["paper"],
+        plot_bgcolor=tokens["plot"],
+        height=470,
+        margin=dict(l=15, r=40, t=20, b=10),
+        font=dict(size=18, color=tokens["text"]),
+    )
     return fig
 
 
@@ -1599,6 +1918,7 @@ def line_dual_axis(result_df: pd.DataFrame, template: str) -> go.Figure:
 
 def main() -> None:
     theme_mode = st.sidebar.radio("Dashboard theme", ["Light", "Dark"], horizontal=True, help="Applies to charts and dashboard styling.")
+    st.session_state["dashboard_theme_mode"] = theme_mode
     dev_mode = st.sidebar.toggle(
         "Developer / research panels",
         value=False,
@@ -1867,8 +2187,6 @@ def main() -> None:
             "Advanced / Export",
         ]
     )
-    live_refresh_requested = False
-
     with tabs[0]:
         st.markdown(
             f"""
@@ -1908,7 +2226,7 @@ def main() -> None:
             overview_fig.update_layout(yaxis_title="MW")
             st.plotly_chart(apply_chart_style(overview_fig, template, height=360, title="Portfolio availability and load"), use_container_width=True)
             if dev_mode:
-                st.plotly_chart(plot_sankey(summary), use_container_width=True, key="dev_home_sankey")
+                st.plotly_chart(plot_sankey(summary, template), use_container_width=True, key="dev_home_sankey")
         with right:
             st.markdown('<div class="section-label">Readiness snapshot</div>', unsafe_allow_html=True)
             render_status_grid(
@@ -2433,7 +2751,7 @@ def main() -> None:
             isinstance(existing_history, pd.DataFrame)
             and not existing_history.empty
             and not bool(st.session_state.get("mpc_result_stale", False))
-            and st.session_state.get("mpc_phase") in {"upper", "market_scheduled", "market_live", "lower_waiting", "lower_live", "lower"}
+            and st.session_state.get("mpc_phase") in {"upper", "market_scheduled", "market_live", "lower_waiting", "lower_live", "lower_stopped", "lower"}
         )
         socket_metrics = upper_socket_metrics(existing_upper_result)
         upper_socket_ready = bool(upper_market_ready and socket_metrics["ready"])
@@ -2455,7 +2773,7 @@ def main() -> None:
             "Lower MPC Auto-Armed" if lower_already_armed else "Activate Lower MPC",
             disabled=not market_started or not upper_socket_ready or lower_already_armed,
         )
-        stop_live_market = btn_stop.button("Stop Simulated Market", disabled=not bool(live_market_session))
+        stop_live_market = btn_stop.button("Stop Simulated Market", disabled=not bool(live_market_session) or market_status["status"] == "closed")
         if upper_market_ready and not socket_metrics["ready"]:
             st.warning(
                 "No executable market period is available yet: "
@@ -2594,12 +2912,13 @@ def main() -> None:
             st.rerun()
 
         if stop_live_market:
-            st.session_state.pop("live_market_session", None)
-            st.session_state.pop("market_simulator", None)
-            st.session_state.pop("live_market_ticks", None)
+            if live_market_session:
+                stopped_session = dict(live_market_session)
+                stopped_session["stopped_at_wall_s"] = time.time()
+                stopped_session["stopped_reason"] = "operator_stop"
+                st.session_state["live_market_session"] = stopped_session
             st.session_state.pop("lower_mpc_armed", None)
-            st.session_state.pop("live_lower_result", None)
-            st.session_state["mpc_phase"] = "upper" if upper_market_ready else "idle"
+            st.session_state["mpc_phase"] = "lower_stopped" if st.session_state.get("live_lower_result") else ("upper" if upper_market_ready else "idle")
             st.rerun()
 
         if activate_lower_mpc:
@@ -2667,7 +2986,7 @@ def main() -> None:
                 st.session_state["mpc_phase"] = "lower_live"
 
             if live_market_session:
-                status_label = str(market_status["status"]).replace("_", " ").title()
+                status_label = "Stopped" if live_market_session.get("stopped_reason") else str(market_status["status"]).replace("_", " ").title()
                 live_cols = st.columns(4)
                 live_cols[0].metric("Market process", status_label)
                 live_cols[1].metric("Start countdown", f"{float(market_status['countdown_seconds']):.0f} s")
@@ -2719,7 +3038,9 @@ def main() -> None:
 
             live_market_fragment()
         else:
-            live_refresh_requested = render_live_market_tile()
+            render_live_market_tile()
+            if current_live_session and current_live_status["status"] in {"scheduled", "live"}:
+                st.info("Live auto-refresh requires Streamlit fragments. Upgrade Streamlit to keep updates scoped to the live plots.")
         active_result = st.session_state.get(
             "mpc_result",
             {
@@ -3115,7 +3436,7 @@ def main() -> None:
                 lm4.metric("Visible recovery ticks", f"{int(metric_frame.get('recovery_mode', pd.Series(dtype=bool)).astype(bool).sum()):,}")
 
                 st.plotly_chart(
-                    apply_chart_style(lower_mpc_execution_figure(lower_visible), template, height=720, title="Lower MPC execution console"),
+                    apply_chart_style(lower_mpc_execution_figure(lower_visible), template, height=560, title="Lower MPC execution console"),
                     use_container_width=True,
                     key="lower_live_execution_console",
                 )
@@ -3349,7 +3670,7 @@ def main() -> None:
                 window_ticks = min(len(tracking_df), max(450, int(3600 / 4)))
                 tracking_window = tracking_df.tail(window_ticks)
                 st.plotly_chart(
-                    apply_chart_style(lower_mpc_execution_figure(tracking_window), template, height=720, title="Lower MPC execution console"),
+                    apply_chart_style(lower_mpc_execution_figure(tracking_window), template, height=560, title="Lower MPC execution console"),
                     use_container_width=True,
                     key="settlement_lower_execution_console",
                 )
@@ -3589,11 +3910,6 @@ def main() -> None:
                 - **Accuracy check**: expected delivery in the {100 * FINGRID_RULES['aFRR']['accuracy_low']:.0f}-{100 * FINGRID_RULES['aFRR']['accuracy_high']:.0f}% band.
                 """
             )
-
-    if live_refresh_requested:
-        time.sleep(4)
-        st.rerun()
-
 
 if __name__ == "__main__":
     main()

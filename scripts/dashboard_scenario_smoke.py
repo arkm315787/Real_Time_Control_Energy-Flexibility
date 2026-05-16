@@ -89,6 +89,30 @@ def main() -> None:
         raise SystemExit("Dashboard must not overwrite the upper MPC result with the live lower-MPC attachment.")
     if "time.sleep(1)" in source:
         raise SystemExit("Dashboard live refresh must not force a one-second full app rerun.")
+    if "time.sleep(4)" in source or "live_refresh_requested" in source:
+        raise SystemExit("Dashboard live refresh must stay scoped to Streamlit fragments, not a timed full-page rerun.")
+    for fragment in [
+        '[data-stale="true"]',
+        "chart_theme_tokens(",
+        "plot_bgcolor=tokens",
+        "legend_y = -0.30",
+        "Reserve tracking",
+        "Resource dispatch",
+        "Control error and latency",
+        'barmode="relative"',
+        'st.session_state["dashboard_theme_mode"]',
+        "plot_sankey(summary, template)",
+        '"stopped_at_wall_s"',
+        '"stopped_reason"',
+    ]:
+        if fragment not in source:
+            raise SystemExit(f"Dashboard chart polish regression guard is missing: {fragment}")
+    if 'st.session_state.pop("live_lower_result", None)\n            st.session_state["mpc_phase"] = "upper" if upper_market_ready else "idle"' in source:
+        raise SystemExit("Stop Simulated Market must preserve the latest live lower-MPC result for post-stop review.")
+    if '[data-testid="stDataFrame"] canvas' in source or '[data-testid="stDataFrame"],\n            [data-testid="stTable"]' in source:
+        raise SystemExit("Interactive st.dataframe canvases must not be forced dark; that hides cell text in Streamlit.")
+    if "Power state and tracking diagnostics" in source or "Accuracy envelope and control latency" in source:
+        raise SystemExit("Lower-MPC default chart should stay compact; detailed diagnostics must not be restored as default stacked line panels.")
     if "Lower MPC has not produced a tracking trace yet" in source:
         raise SystemExit("Dashboard must not leave a stale static lower-MPC pending message while the live fragment owns replay rendering.")
     if 'if st.session_state.get("live_market_session")\n                else result_frame(lower_view_result, "tracking_4s")' not in source:
@@ -111,6 +135,10 @@ def main() -> None:
         raise SystemExit("Live market session should become live at the start wall-clock.")
     if live_market_status(session, now_s=135.0)["status"] != "closed":
         raise SystemExit("Live market session should close after its duration.")
+    stopped_session = {**session, "stopped_at_wall_s": 118.0}
+    stopped_status = live_market_status(stopped_session, now_s=112.0)
+    if stopped_status["status"] != "closed" or stopped_status["elapsed_seconds"] != 8.0:
+        raise SystemExit("Operator-stopped live market sessions should remain visible as closed replay snapshots.")
     frame = pd.DataFrame({"signal": range(10)}, index=pd.date_range("2026-01-01", periods=10, freq="4s"))
     if len(live_visible_frame(frame, session, now_s=119.0)) != 3:
         raise SystemExit("Live visible frame should reveal rows according to elapsed market seconds.")

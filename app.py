@@ -298,9 +298,22 @@ def inject_css(theme_mode: str) -> None:
             .block-container {{
                 padding-top: 0.85rem !important;
                 padding-bottom: 2rem !important;
-                max-width: 1480px !important;
-                padding-left: 1.25rem !important;
-                padding-right: 1.25rem !important;
+                max-width: none !important;
+                width: 100% !important;
+                margin-left: 0 !important;
+                margin-right: 0 !important;
+                padding-left: 0.9rem !important;
+                padding-right: 1rem !important;
+            }}
+            .main .block-container {{
+                margin-left: 0 !important;
+            }}
+            div[data-testid="stVerticalBlock"],
+            div[data-testid="column"],
+            div[data-testid="stHorizontalBlock"],
+            .element-container {{
+                min-width: 0 !important;
+                box-sizing: border-box !important;
             }}
             [data-testid="stToolbar"],
             [data-testid="stDecoration"],
@@ -336,24 +349,31 @@ def inject_css(theme_mode: str) -> None:
             }}
             p, li, label, .stMarkdown, .stCaption, .small-note {{
                 font-size: 0.94rem !important;
-                line-height: 1.45 !important;
+                line-height: 1.5 !important;
+                overflow-wrap: normal !important;
+                word-break: normal !important;
             }}
             [data-testid="stMetricLabel"] {{
-                font-size: 0.84rem !important;
+                font-size: 0.80rem !important;
                 font-weight: 650 !important;
                 color: {muted_text} !important;
+                line-height: 1.25 !important;
+                white-space: normal !important;
             }}
             [data-testid="stMetricValue"] {{
-                font-size: 1.65rem !important;
+                font-size: 1.46rem !important;
                 font-weight: 760 !important;
-                line-height: 1.05 !important;
+                line-height: 1.12 !important;
                 color: {text_color} !important;
+                overflow-wrap: anywhere !important;
             }}
             [data-testid="stMetric"] {{
                 background: {surface};
                 border: 1px solid {card_border};
                 border-radius: 8px;
                 padding: 0.78rem 0.85rem;
+                min-height: 5.15rem;
+                overflow: hidden;
             }}
             [data-baseweb="tab-list"] {{
                 align-items: center !important;
@@ -363,6 +383,8 @@ def inject_css(theme_mode: str) -> None:
                 background: {surface};
                 border: 1px solid {card_border};
                 border-radius: 8px;
+                overflow-x: auto !important;
+                overflow-y: hidden !important;
             }}
             div[data-testid="stTabs"] {{
                 margin-top: 0.45rem !important;
@@ -398,8 +420,8 @@ def inject_css(theme_mode: str) -> None:
                 color: {accent} !important;
             }}
             [data-testid="stSidebar"] {{
-                min-width: 315px !important;
-                max-width: 315px !important;
+                min-width: 292px !important;
+                max-width: 292px !important;
                 background: {sidebar_bg};
                 border-right: 1px solid {card_border};
             }}
@@ -427,6 +449,10 @@ def inject_css(theme_mode: str) -> None:
             [data-testid="stDataFrame"] div,
             [data-testid="stTable"] div {{
                 font-size: 0.88rem !important;
+                line-height: 1.35 !important;
+            }}
+            .modebar {{
+                display: none !important;
             }}
             div[data-baseweb="select"] > div,
             div[data-baseweb="input"] > div,
@@ -547,7 +573,9 @@ def inject_css(theme_mode: str) -> None:
                 font-size: 0.72rem;
                 line-height: 1.25;
                 margin-top: 0.35rem;
-                word-break: break-word;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
             }}
             .ops-header {{
                 display: flex;
@@ -638,8 +666,8 @@ def inject_css(theme_mode: str) -> None:
             }}
             .status-value {{
                 color: {text_color};
-                font-size: 1.28rem;
-                line-height: 1.12;
+                font-size: 1.18rem;
+                line-height: 1.18;
                 font-weight: 780;
                 margin-top: 0.32rem;
                 overflow-wrap: anywhere;
@@ -692,9 +720,9 @@ def apply_chart_style(fig: go.Figure, template: str, height: int | None = None, 
         template=template,
         height=height if height is not None else fig.layout.height,
         font=dict(size=13),
-        legend=dict(font=dict(size=12), title_font=dict(size=13), orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        legend=dict(font=dict(size=11), title_font=dict(size=12), orientation="h", yanchor="bottom", y=1.06, xanchor="left", x=0),
         hoverlabel=dict(font_size=13),
-        margin=dict(l=20, r=20, t=50, b=12),
+        margin=dict(l=20, r=20, t=72, b=12),
     )
     if resolved_title:
         layout_updates["title"] = dict(text=resolved_title, font=dict(size=16))
@@ -749,6 +777,139 @@ def signal_line_figure(df: pd.DataFrame, columns: List[str], title: str, y_title
     if y_title:
         fig.update_layout(yaxis_title=y_title)
     fig.update_layout(title=title)
+    return fig
+
+
+def numeric_trace(df: pd.DataFrame, column: str, scale: float = 1.0) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(0.0, index=df.index)
+    return pd.to_numeric(df[column], errors="coerce").fillna(0.0) / float(scale)
+
+
+def upper_mpc_decision_figure(upper_plot_df: pd.DataFrame) -> go.Figure:
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.11,
+        row_heights=[0.58, 0.42],
+        specs=[[{}], [{"secondary_y": True}]],
+        subplot_titles=("Reserve socket and accepted bid", "Revenue response and market prices"),
+    )
+    fig.add_trace(
+        go.Scatter(x=upper_plot_df.index, y=numeric_trace(upper_plot_df, "fcr_bid_kw", 1000.0), name="FCR-N symmetric bid", line={"color": RESOURCE_COLORS["Frequency"], "width": 3}),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(x=upper_plot_df.index, y=numeric_trace(upper_plot_df, "afrr_up_bid_kw", 1000.0), name="aFRR up bid", line={"color": RESOURCE_COLORS["Net"], "dash": "dash"}),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(x=upper_plot_df.index, y=-numeric_trace(upper_plot_df, "afrr_down_bid_kw", 1000.0), name="aFRR down bid", line={"color": RESOURCE_COLORS["aFRR"], "dash": "dot"}),
+        row=1,
+        col=1,
+    )
+    if {"socket_up_kw", "socket_down_kw"}.issubset(upper_plot_df.columns):
+        fig.add_trace(
+            go.Scatter(x=upper_plot_df.index, y=numeric_trace(upper_plot_df, "socket_up_kw", 1000.0), name="Executable up socket", line={"color": "#6b7280", "dash": "longdash"}),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(x=upper_plot_df.index, y=-numeric_trace(upper_plot_df, "socket_down_kw", 1000.0), name="Executable down socket", line={"color": "#6b7280", "dash": "longdashdot"}),
+            row=1,
+            col=1,
+        )
+    if "net_revenue_eur" in upper_plot_df:
+        fig.add_trace(
+            go.Scatter(x=upper_plot_df.index, y=numeric_trace(upper_plot_df, "net_revenue_eur"), name="Net revenue", line={"color": RESOURCE_COLORS["Net"], "width": 3}),
+            row=2,
+            col=1,
+            secondary_y=False,
+        )
+    for column, label, dash in [
+        ("fcrn_capacity_eur_per_mw_h", "FCR-N price", "dot"),
+        ("afrr_up_capacity_eur_per_mw_h", "aFRR up price", "dash"),
+        ("afrr_down_capacity_eur_per_mw_h", "aFRR down price", "longdash"),
+    ]:
+        if column in upper_plot_df:
+            fig.add_trace(
+                go.Scatter(x=upper_plot_df.index, y=numeric_trace(upper_plot_df, column), name=label, line={"dash": dash}),
+                row=2,
+                col=1,
+                secondary_y=True,
+            )
+    fig.update_yaxes(title_text="MW", row=1, col=1)
+    fig.update_yaxes(title_text="EUR", row=2, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="EUR/MW/h", row=2, col=1, secondary_y=True)
+    fig.update_layout(hovermode="x unified")
+    return fig
+
+
+def lower_mpc_execution_figure(tracking_window: pd.DataFrame) -> go.Figure:
+    fig = make_subplots(
+        rows=4,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.075,
+        row_heights=[0.30, 0.25, 0.25, 0.20],
+        specs=[[{}], [{}], [{}], [{"secondary_y": True}]],
+        subplot_titles=(
+            "Request and delivered reserve",
+            "Resource allocation",
+            "Power state and tracking diagnostics",
+            "Accuracy envelope and control latency",
+        ),
+    )
+    signed_request = numeric_trace(tracking_window, "requested_up_kw") - numeric_trace(tracking_window, "requested_down_kw")
+    signed_delivery = numeric_trace(tracking_window, "delivered_up_kw") - numeric_trace(tracking_window, "delivered_down_kw")
+    fig.add_trace(go.Scatter(x=tracking_window.index, y=signed_request / 1000.0, name="TSO request", line={"color": RESOURCE_COLORS["Frequency"], "dash": "dot"}), row=1, col=1)
+    fig.add_trace(go.Scatter(x=tracking_window.index, y=signed_delivery / 1000.0, name="Delivered", line={"color": RESOURCE_COLORS["Net"], "width": 3}), row=1, col=1)
+    if {"committed_up_kw", "committed_down_kw"}.issubset(tracking_window.columns):
+        fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, "committed_up_kw", 1000.0), name="Committed up", line={"color": "#6b7280", "dash": "dash"}), row=1, col=1)
+        fig.add_trace(go.Scatter(x=tracking_window.index, y=-numeric_trace(tracking_window, "committed_down_kw", 1000.0), name="Committed down", line={"color": "#6b7280", "dash": "dash"}), row=1, col=1)
+
+    for resource, up_col, down_col, color in [
+        ("BESS", "bess_up_kw", "bess_down_kw", RESOURCE_COLORS["BESS"]),
+        ("EV", "ev_up_kw", "ev_down_kw", RESOURCE_COLORS["EV"]),
+        ("HVAC", "hvac_up_kw", "hvac_down_kw", RESOURCE_COLORS["HVAC"]),
+        ("PV", "", "pv_down_kw", RESOURCE_COLORS["PV"]),
+    ]:
+        if up_col and up_col in tracking_window:
+            fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, up_col, 1000.0), name=f"{resource} up", line={"color": color}), row=2, col=1)
+        if down_col in tracking_window:
+            fig.add_trace(go.Scatter(x=tracking_window.index, y=-numeric_trace(tracking_window, down_col, 1000.0), name=f"{resource} down", line={"color": color, "dash": "dot"}), row=2, col=1)
+
+    for column, label, color, dash in [
+        ("fleet_power_before_kw", "Power before", RESOURCE_COLORS["Base"], "dot"),
+        ("fleet_power_after_kw", "Power after", RESOURCE_COLORS["Net"], "solid"),
+        ("target_command_kw", "Target command", RESOURCE_COLORS["Frequency"], "dash"),
+        ("tracking_error_kw", "Tracking error", "#B42318", "solid"),
+        ("tracking_tolerance_kw", "Tolerance", "#6b7280", "dash"),
+        ("shortfall_kw", "Shortfall", RESOURCE_COLORS["aFRR"], "dot"),
+        ("buffer_used_kw", "Buffer used", "#B87514", "longdash"),
+        ("fast_bridge_used_kw", "Fast bridge", RESOURCE_COLORS["PV"], "longdashdot"),
+    ]:
+        if column in tracking_window:
+            fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, column), name=label, line={"color": color, "dash": dash}), row=3, col=1)
+
+    if {"afrr_accuracy_ratio", "afrr_accuracy_low", "afrr_accuracy_high"}.issubset(tracking_window.columns):
+        fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, "afrr_accuracy_ratio"), name="aFRR ratio", line={"color": RESOURCE_COLORS["Net"], "width": 3}), row=4, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, "afrr_accuracy_low"), name="90% floor", line={"color": "#6b7280", "dash": "dash"}), row=4, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, "afrr_accuracy_high"), name="110% ceiling", line={"color": "#6b7280", "dash": "dash"}), row=4, col=1, secondary_y=False)
+    if "control_latency_ms" in tracking_window:
+        fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, "control_latency_ms"), name="Latency ms", line={"color": RESOURCE_COLORS["Frequency"], "dash": "dot"}), row=4, col=1, secondary_y=True)
+    if "control_deadline_ms" in tracking_window:
+        fig.add_trace(go.Scatter(x=tracking_window.index, y=numeric_trace(tracking_window, "control_deadline_ms"), name="Deadline ms", line={"color": "#6b7280", "dash": "dash"}), row=4, col=1, secondary_y=True)
+
+    fig.update_yaxes(title_text="MW", row=1, col=1)
+    fig.update_yaxes(title_text="MW", row=2, col=1)
+    fig.update_yaxes(title_text="kW", row=3, col=1)
+    fig.update_yaxes(title_text="ratio", row=4, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="ms", row=4, col=1, secondary_y=True)
+    fig.update_layout(hovermode="x unified")
     return fig
 
 
@@ -1036,88 +1197,11 @@ def render_lower_live_trace(
     lm3.metric("Visible max latency", f"{float(lower_visible.get('control_latency_ms', pd.Series([0.0])).max()):.1f} ms")
     lm4.metric("Visible recovery ticks", f"{int(lower_visible.get('recovery_mode', pd.Series(dtype=bool)).astype(bool).sum()):,}")
 
-    lower_trace_fig = go.Figure()
-    signed_request = lower_visible["requested_up_kw"] - lower_visible["requested_down_kw"]
-    signed_delivery = lower_visible["delivered_up_kw"] - lower_visible["delivered_down_kw"]
-    lower_trace_fig.add_trace(
-        go.Scatter(
-            x=lower_visible.index,
-            y=signed_request / 1000.0,
-            name="TSO request",
-            line={"color": RESOURCE_COLORS["Frequency"], "dash": "dot"},
-        )
-    )
-    lower_trace_fig.add_trace(
-        go.Scatter(
-            x=lower_visible.index,
-            y=signed_delivery / 1000.0,
-            name="Lower delivered",
-            line={"color": RESOURCE_COLORS["Net"], "width": 3},
-        )
-    )
-    if {"committed_up_kw", "committed_down_kw"}.issubset(lower_visible.columns):
-        lower_trace_fig.add_trace(
-            go.Scatter(
-                x=lower_visible.index,
-                y=lower_visible["committed_up_kw"] / 1000.0,
-                name="Committed up limit",
-                line={"color": "#6b7280", "dash": "dash"},
-            )
-        )
-        lower_trace_fig.add_trace(
-            go.Scatter(
-                x=lower_visible.index,
-                y=-lower_visible["committed_down_kw"] / 1000.0,
-                name="Committed down limit",
-                line={"color": "#6b7280", "dash": "dash"},
-            )
-        )
-    lower_trace_fig.update_layout(yaxis_title="MW")
     st.plotly_chart(
-        apply_chart_style(lower_trace_fig, template, height=340, title="Lower MPC live request vs delivered"),
+        apply_chart_style(lower_mpc_execution_figure(lower_visible), template, height=720, title="Lower MPC execution console"),
         use_container_width=True,
-        key=f"{key_prefix}_request_delivery",
+        key=f"{key_prefix}_execution_console",
     )
-
-    lower_diag_left, lower_diag_right = st.columns([1.15, 1.0])
-    if {"fleet_power_before_kw", "fleet_power_after_kw", "target_command_kw"}.issubset(lower_visible.columns):
-        power_fig = signal_line_figure(
-            lower_visible,
-            ["fleet_power_before_kw", "fleet_power_after_kw", "target_command_kw"],
-            "Lower MPC internal power state",
-            "kW",
-        )
-        lower_diag_left.plotly_chart(
-            apply_chart_style(power_fig, template, height=320),
-            use_container_width=True,
-            key=f"{key_prefix}_internal_power",
-        )
-    if {"control_latency_ms", "control_deadline_ms"}.issubset(lower_visible.columns):
-        latency_fig = signal_line_figure(lower_visible, ["control_latency_ms", "control_deadline_ms"], "4-second control deadline check", "ms")
-        lower_diag_right.plotly_chart(
-            apply_chart_style(latency_fig, template, height=320),
-            use_container_width=True,
-            key=f"{key_prefix}_latency",
-        )
-
-    if {"afrr_accuracy_ratio", "afrr_accuracy_low", "afrr_accuracy_high"}.issubset(lower_visible.columns):
-        accuracy_fig = go.Figure()
-        accuracy_fig.add_trace(
-            go.Scatter(
-                x=lower_visible.index,
-                y=lower_visible["afrr_accuracy_ratio"],
-                name="aFRR delivered/requested",
-                line={"color": RESOURCE_COLORS["Net"], "width": 3},
-            )
-        )
-        accuracy_fig.add_trace(go.Scatter(x=lower_visible.index, y=lower_visible["afrr_accuracy_low"], name="90% floor", line={"color": "#6b7280", "dash": "dash"}))
-        accuracy_fig.add_trace(go.Scatter(x=lower_visible.index, y=lower_visible["afrr_accuracy_high"], name="110% ceiling", line={"color": "#6b7280", "dash": "dash"}))
-        accuracy_fig.update_layout(yaxis_title="ratio")
-        st.plotly_chart(
-            apply_chart_style(accuracy_fig, template, height=300, title="aFRR 90-110% tracking audit"),
-            use_container_width=True,
-            key=f"{key_prefix}_afrr_accuracy",
-        )
 
     afrr_energy_audit = result_frame(lower_result, "afrr_energy_audit")
     if afrr_energy_audit.empty:
@@ -2778,15 +2862,10 @@ def main() -> None:
 
             left, right = st.columns([1.45, 1.0])
             with left:
-                dispatch_fig = go.Figure()
-                dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=upper_plot_df["fcr_bid_kw"] / 1000.0, name="FCR-N symmetric bid", line={"color": RESOURCE_COLORS["Frequency"], "width": 3}))
-                dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=upper_plot_df["afrr_up_bid_kw"] / 1000.0, name="aFRR up bid", line={"color": RESOURCE_COLORS["Net"], "dash": "dash"}))
-                dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=-upper_plot_df["afrr_down_bid_kw"] / 1000.0, name="aFRR down bid", line={"color": RESOURCE_COLORS["aFRR"], "dash": "dot"}))
-                if {"socket_up_kw", "socket_down_kw"}.issubset(upper_plot_df.columns):
-                    dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=upper_plot_df["socket_up_kw"] / 1000.0, name="Executable up socket", line={"color": "#6b7280", "dash": "longdash"}))
-                    dispatch_fig.add_trace(go.Scatter(x=upper_plot_df.index, y=-upper_plot_df["socket_down_kw"] / 1000.0, name="Executable down socket", line={"color": "#6b7280", "dash": "longdashdot"}))
-                dispatch_fig.update_layout(yaxis_title="MW")
-                st.plotly_chart(apply_chart_style(dispatch_fig, template, height=400, title="Upper MPC reserve socket"), use_container_width=True)
+                st.plotly_chart(
+                    apply_chart_style(upper_mpc_decision_figure(upper_plot_df), template, height=520, title="Upper MPC decision console"),
+                    use_container_width=True,
+                )
                 waterfall_cols = {"raw_fcr_symmetric_kw", "fcr_dynamic_cap_total_kw", "fcr_energy_cap_total_kw", "reserve_buffer_kw", "fcr_bid_kw"}
                 if waterfall_cols.issubset(upper_plot_df.columns):
                     if "market_gate_status" in upper_plot_df and (upper_plot_df["market_gate_status"].astype(str) == "Participate").any():
@@ -2838,27 +2917,24 @@ def main() -> None:
                     )
                     bidirectional_fig.update_layout(yaxis_title="MW, up positive / down negative")
                     st.plotly_chart(apply_chart_style(bidirectional_fig, template, height=320), use_container_width=True)
-                if {"fcrn_capacity_eur_per_mw_h", "afrr_up_capacity_eur_per_mw_h", "afrr_down_capacity_eur_per_mw_h"}.issubset(upper_plot_df.columns):
-                    price_overlay = make_subplots(specs=[[{"secondary_y": True}]])
-                    price_overlay.add_trace(
-                        go.Scatter(x=upper_plot_df.index, y=upper_plot_df["net_revenue_eur"], name="Net revenue EUR", line={"color": RESOURCE_COLORS["Net"], "width": 3}),
-                        secondary_y=False,
-                    )
-                    price_overlay.add_trace(
-                        go.Scatter(x=upper_plot_df.index, y=upper_plot_df["fcrn_capacity_eur_per_mw_h"], name="FCR-N price", line={"dash": "dot"}),
-                        secondary_y=True,
-                    )
-                    price_overlay.add_trace(
-                        go.Scatter(x=upper_plot_df.index, y=upper_plot_df["afrr_up_capacity_eur_per_mw_h"], name="aFRR up price", line={"dash": "dash"}),
-                        secondary_y=True,
-                    )
-                    price_overlay.update_yaxes(title_text="EUR", secondary_y=False)
-                    price_overlay.update_yaxes(title_text="EUR/MW/h", secondary_y=True)
-                    st.plotly_chart(apply_chart_style(price_overlay, template, height=330, title="Revenue response to market prices"), use_container_width=True)
             with right:
-                compliance_cols = st.columns(2)
-                compliance_cols[0].plotly_chart(apply_chart_style(indicator_figure(float(upper_plot_df["fcr_bid_kw"].mean()), "Average FCR bid (kW)", 100.0), template, height=240), use_container_width=True)
-                compliance_cols[1].plotly_chart(apply_chart_style(indicator_figure(float(np.maximum(upper_plot_df["afrr_up_bid_kw"], upper_plot_df["afrr_down_bid_kw"]).mean()), "Average aFRR bid (kW)", 1000.0), template, height=240), use_container_width=True)
+                render_status_grid(
+                    [
+                        {
+                            "label": "Average FCR bid",
+                            "value": f"{float(upper_plot_df['fcr_bid_kw'].mean()):.0f} kW",
+                            "note": "Minimum threshold 100 kW",
+                            "tone": "good" if float(upper_plot_df["fcr_bid_kw"].mean()) >= 100.0 else "warn",
+                        },
+                        {
+                            "label": "Average aFRR bid",
+                            "value": f"{float(np.maximum(upper_plot_df['afrr_up_bid_kw'], upper_plot_df['afrr_down_bid_kw']).mean()):.0f} kW",
+                            "note": "Minimum threshold 1000 kW",
+                            "tone": "good" if float(np.maximum(upper_plot_df["afrr_up_bid_kw"], upper_plot_df["afrr_down_bid_kw"]).mean()) >= 1000.0 else "warn",
+                        },
+                    ],
+                    class_name="readiness-grid",
+                )
                 st.markdown(
                     f"""
                     <div class="flexi-card">
@@ -3038,32 +3114,11 @@ def main() -> None:
                 lm3.metric("Visible max latency", f"{float(metric_frame.get('control_latency_ms', pd.Series([0.0])).max()):.1f} ms")
                 lm4.metric("Visible recovery ticks", f"{int(metric_frame.get('recovery_mode', pd.Series(dtype=bool)).astype(bool).sum()):,}")
 
-                lower_trace_fig = go.Figure()
-                signed_request = lower_visible["requested_up_kw"] - lower_visible["requested_down_kw"]
-                signed_delivery = lower_visible["delivered_up_kw"] - lower_visible["delivered_down_kw"]
-                lower_trace_fig.add_trace(go.Scatter(x=lower_visible.index, y=signed_request / 1000.0, name="TSO request", line={"color": RESOURCE_COLORS["Frequency"], "dash": "dot"}))
-                lower_trace_fig.add_trace(go.Scatter(x=lower_visible.index, y=signed_delivery / 1000.0, name="Lower delivered", line={"color": RESOURCE_COLORS["Net"], "width": 3}))
-                if {"committed_up_kw", "committed_down_kw"}.issubset(lower_visible.columns):
-                    lower_trace_fig.add_trace(go.Scatter(x=lower_visible.index, y=lower_visible["committed_up_kw"] / 1000.0, name="Committed up limit", line={"color": "#6b7280", "dash": "dash"}))
-                    lower_trace_fig.add_trace(go.Scatter(x=lower_visible.index, y=-lower_visible["committed_down_kw"] / 1000.0, name="Committed down limit", line={"color": "#6b7280", "dash": "dash"}))
-                lower_trace_fig.update_layout(yaxis_title="MW")
-                st.plotly_chart(apply_chart_style(lower_trace_fig, template, height=340, title="Lower MPC live request vs delivered"), use_container_width=True, key="lower_live_request_delivery")
-
-                lower_diag_left, lower_diag_right = st.columns([1.15, 1.0])
-                if {"fleet_power_before_kw", "fleet_power_after_kw", "target_command_kw"}.issubset(lower_visible.columns):
-                    power_fig = signal_line_figure(lower_visible, ["fleet_power_before_kw", "fleet_power_after_kw", "target_command_kw"], "Lower MPC internal power state", "kW")
-                    lower_diag_left.plotly_chart(apply_chart_style(power_fig, template, height=320), use_container_width=True, key="lower_live_internal_power")
-                if {"control_latency_ms", "control_deadline_ms"}.issubset(lower_visible.columns):
-                    latency_fig = signal_line_figure(lower_visible, ["control_latency_ms", "control_deadline_ms"], "4-second control deadline check", "ms")
-                    lower_diag_right.plotly_chart(apply_chart_style(latency_fig, template, height=320), use_container_width=True, key="lower_live_latency")
-
-                if {"afrr_accuracy_ratio", "afrr_accuracy_low", "afrr_accuracy_high"}.issubset(lower_visible.columns):
-                    accuracy_fig = go.Figure()
-                    accuracy_fig.add_trace(go.Scatter(x=lower_visible.index, y=lower_visible["afrr_accuracy_ratio"], name="aFRR delivered/requested", line={"color": RESOURCE_COLORS["Net"], "width": 3}))
-                    accuracy_fig.add_trace(go.Scatter(x=lower_visible.index, y=lower_visible["afrr_accuracy_low"], name="90% floor", line={"color": "#6b7280", "dash": "dash"}))
-                    accuracy_fig.add_trace(go.Scatter(x=lower_visible.index, y=lower_visible["afrr_accuracy_high"], name="110% ceiling", line={"color": "#6b7280", "dash": "dash"}))
-                    accuracy_fig.update_layout(yaxis_title="ratio")
-                    st.plotly_chart(apply_chart_style(accuracy_fig, template, height=300, title="aFRR 90-110% tracking audit"), use_container_width=True, key="lower_live_afrr_accuracy")
+                st.plotly_chart(
+                    apply_chart_style(lower_mpc_execution_figure(lower_visible), template, height=720, title="Lower MPC execution console"),
+                    use_container_width=True,
+                    key="lower_live_execution_console",
+                )
 
                 afrr_energy_audit = result_frame(lower_view_result, "afrr_energy_audit")
                 if afrr_energy_audit.empty:
@@ -3293,81 +3348,11 @@ def main() -> None:
                 st.caption("This view shows the centralized lower-layer MPC following the reserve request through simulated gateway commands.")
                 window_ticks = min(len(tracking_df), max(450, int(3600 / 4)))
                 tracking_window = tracking_df.tail(window_ticks)
-                tracking_fig = go.Figure()
-                tracking_fig.add_trace(
-                    go.Scatter(
-                        x=tracking_window.index,
-                        y=(tracking_window["requested_up_kw"] - tracking_window["requested_down_kw"]) / 1000.0,
-                        name="Requested reserve (MW)",
-                        line={"color": RESOURCE_COLORS["Frequency"], "dash": "dot"},
-                    )
+                st.plotly_chart(
+                    apply_chart_style(lower_mpc_execution_figure(tracking_window), template, height=720, title="Lower MPC execution console"),
+                    use_container_width=True,
+                    key="settlement_lower_execution_console",
                 )
-                tracking_fig.add_trace(
-                    go.Scatter(
-                        x=tracking_window.index,
-                        y=(tracking_window["delivered_up_kw"] - tracking_window["delivered_down_kw"]) / 1000.0,
-                        name="Delivered reserve (MW)",
-                        line={"color": RESOURCE_COLORS["Net"], "width": 3},
-                    )
-                )
-                tracking_fig.add_trace(
-                    go.Scatter(x=tracking_window.index, y=tracking_window["bess_up_kw"] / 1000.0, name="BESS up", line={"color": RESOURCE_COLORS["BESS"]})
-                )
-                tracking_fig.add_trace(
-                    go.Scatter(x=tracking_window.index, y=-tracking_window["bess_down_kw"] / 1000.0, name="BESS down", line={"color": RESOURCE_COLORS["BESS"], "dash": "dot"})
-                )
-                tracking_fig.add_trace(
-                    go.Scatter(x=tracking_window.index, y=tracking_window["ev_up_kw"] / 1000.0, name="EV up", line={"color": RESOURCE_COLORS["EV"]})
-                )
-                tracking_fig.add_trace(
-                    go.Scatter(x=tracking_window.index, y=-tracking_window["ev_down_kw"] / 1000.0, name="EV down", line={"color": RESOURCE_COLORS["EV"], "dash": "dot"})
-                )
-                tracking_fig.add_trace(
-                    go.Scatter(x=tracking_window.index, y=tracking_window["hvac_up_kw"] / 1000.0, name="HVAC up", line={"color": RESOURCE_COLORS["HVAC"]})
-                )
-                tracking_fig.add_trace(
-                    go.Scatter(x=tracking_window.index, y=-tracking_window["hvac_down_kw"] / 1000.0, name="HVAC down", line={"color": RESOURCE_COLORS["HVAC"], "dash": "dot"})
-                )
-                tracking_fig.add_trace(
-                    go.Scatter(x=tracking_window.index, y=-tracking_window["pv_down_kw"] / 1000.0, name="PV down", line={"color": RESOURCE_COLORS["PV"], "dash": "dot"})
-                )
-                tracking_fig.update_layout(yaxis_title="MW")
-                st.plotly_chart(apply_chart_style(tracking_fig, template, height=380, title="Lower MPC reserve tracking"), use_container_width=True, key="settlement_lower_tracking")
-
-                lower_left, lower_right = st.columns([1.15, 1.0])
-                allocation_fig = go.Figure()
-                allocation_fig.add_trace(go.Scatter(x=tracking_window.index, y=tracking_window["bess_up_kw"] / 1000.0, name="BESS up", stackgroup="up", line={"color": RESOURCE_COLORS["BESS"]}))
-                allocation_fig.add_trace(go.Scatter(x=tracking_window.index, y=tracking_window["ev_up_kw"] / 1000.0, name="EV up", stackgroup="up", line={"color": RESOURCE_COLORS["EV"]}))
-                allocation_fig.add_trace(go.Scatter(x=tracking_window.index, y=tracking_window["hvac_up_kw"] / 1000.0, name="HVAC up", stackgroup="up", line={"color": RESOURCE_COLORS["HVAC"]}))
-                allocation_fig.add_trace(go.Scatter(x=tracking_window.index, y=-tracking_window["bess_down_kw"] / 1000.0, name="BESS down", stackgroup="down", line={"color": RESOURCE_COLORS["BESS"], "dash": "dot"}))
-                allocation_fig.add_trace(go.Scatter(x=tracking_window.index, y=-tracking_window["ev_down_kw"] / 1000.0, name="EV down", stackgroup="down", line={"color": RESOURCE_COLORS["EV"], "dash": "dot"}))
-                allocation_fig.add_trace(go.Scatter(x=tracking_window.index, y=-tracking_window["pv_down_kw"] / 1000.0, name="PV down", stackgroup="down", line={"color": RESOURCE_COLORS["PV"]}))
-                allocation_fig.update_layout(yaxis_title="MW")
-                lower_left.plotly_chart(apply_chart_style(allocation_fig, template, height=340, title="Lower MPC appliance allocation"), use_container_width=True, key="settlement_lower_allocation")
-
-                diagnostic_cols = [
-                    col
-                    for col in [
-                        "tracking_error_kw",
-                        "tracking_tolerance_kw",
-                        "shortfall_kw",
-                        "buffer_used_kw",
-                        "fast_bridge_used_kw",
-                        "afrr_reporting_error_kw",
-                    ]
-                    if col in tracking_window.columns
-                ]
-                if diagnostic_cols:
-                    diagnostic_fig = signal_line_figure(tracking_window, diagnostic_cols, "Lower MPC tracking diagnostics", "kW")
-                    lower_right.plotly_chart(apply_chart_style(diagnostic_fig, template, height=340), use_container_width=True, key="settlement_lower_diagnostics")
-
-                if {"afrr_accuracy_ratio", "afrr_accuracy_low", "afrr_accuracy_high"}.issubset(tracking_window.columns):
-                    accuracy_fig = go.Figure()
-                    accuracy_fig.add_trace(go.Scatter(x=tracking_window.index, y=tracking_window["afrr_accuracy_ratio"], name="aFRR ratio", line={"color": RESOURCE_COLORS["Net"], "width": 3}))
-                    accuracy_fig.add_trace(go.Scatter(x=tracking_window.index, y=tracking_window["afrr_accuracy_low"], name="90%", line={"color": "#6b7280", "dash": "dash"}))
-                    accuracy_fig.add_trace(go.Scatter(x=tracking_window.index, y=tracking_window["afrr_accuracy_high"], name="110%", line={"color": "#6b7280", "dash": "dash"}))
-                    accuracy_fig.update_layout(yaxis_title="delivered/requested")
-                    st.plotly_chart(apply_chart_style(accuracy_fig, template, height=300, title="aFRR tracking ratio in plotted data"), use_container_width=True, key="settlement_lower_afrr_ratio")
 
                 gateway_commands = result_frame(lower_result_for_viz, "gateway_commands")
                 if gateway_commands.empty:

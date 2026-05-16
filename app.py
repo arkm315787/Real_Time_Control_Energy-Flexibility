@@ -20,7 +20,9 @@ models, and a receding-horizon MPC-style optimizer built with PuLP.
 from __future__ import annotations
 
 import json
+import subprocess
 import time
+from html import escape
 from pathlib import Path
 from typing import Callable, Dict, List
 
@@ -162,6 +164,8 @@ RESOURCE_COLORS = {
 
 PLOTLY_TEMPLATE = {"Dark": "plotly_dark", "Light": "plotly_white"}
 
+APP_BUILD_ID = "ui-lightgbm-visible-2026-05-16"
+
 
 FORECASTER_LABELS = {
     "lightgbm_quantile": "LightGBM quantile (P05-P95)",
@@ -182,22 +186,107 @@ def preferred_forecaster_index(plugin_options: List[str]) -> int:
     return 0
 
 
+def _git_metadata(args: List[str]) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return "unavailable"
+    value = completed.stdout.strip()
+    return value if completed.returncode == 0 and value else "unavailable"
+
+
+def dashboard_runtime_context() -> Dict[str, str]:
+    app_path = Path(__file__).resolve()
+    commit = _git_metadata(["rev-parse", "--short", "HEAD"])
+    branch = _git_metadata(["rev-parse", "--abbrev-ref", "HEAD"])
+    return {
+        "build": APP_BUILD_ID,
+        "branch": branch,
+        "commit": commit,
+        "app_path": str(app_path),
+    }
+
+
+def lightgbm_runtime_status(plugin_options: List[str]) -> Dict[str, str]:
+    if "lightgbm_quantile" not in plugin_options:
+        return {
+            "label": "Not registered",
+            "tone": "bad",
+            "detail": "The LightGBM quantile plugin is missing from the active registry.",
+        }
+    try:
+        import lightgbm  # noqa: F401
+    except Exception as exc:
+        return {
+            "label": "Fallback active",
+            "tone": "warn",
+            "detail": f"Install requirements to use native LightGBM. Current fallback reason: {exc}",
+        }
+    return {
+        "label": "Native LightGBM ready",
+        "tone": "good",
+        "detail": "The active Python environment can import lightgbm.",
+    }
+
+
+def render_status_grid(items: List[Dict[str, str]], class_name: str = "status-grid") -> None:
+    cards = []
+    for item in items:
+        tone = escape(str(item.get("tone", "")))
+        label = escape(str(item.get("label", "")))
+        value = escape(str(item.get("value", "")))
+        note = escape(str(item.get("note", "")))
+        cards.append(
+            f'<div class="status-card {tone}">'
+            f'<div class="status-label">{label}</div>'
+            f'<div class="status-value">{value}</div>'
+            f'<div class="status-note">{note}</div>'
+            f"</div>"
+        )
+    st.markdown(f'<div class="{escape(class_name)}">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def render_sidebar_runtime(context: Dict[str, str]) -> None:
+    st.sidebar.markdown(
+        f"""
+        <div class="sidebar-brand">
+            <div class="sidebar-eyebrow">Coverly VPP</div>
+            <div class="sidebar-title">MPC Market Console</div>
+        </div>
+        <div class="runtime-card">
+            <div class="runtime-label">Running build</div>
+            <div class="runtime-value">{escape(context["branch"])} @ {escape(context["commit"])}</div>
+            <div class="runtime-note">{escape(context["build"])}</div>
+            <div class="runtime-path">{escape(context["app_path"])}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 
 
 
 
 
 def inject_css(theme_mode: str) -> None:
-    bg = "#0F172A" if theme_mode == "Dark" else "#F6F8FB"
+    bg = "#0F172A" if theme_mode == "Dark" else "#F4F7FA"
     surface = "#111827" if theme_mode == "Dark" else "#FFFFFF"
-    sidebar_bg = "#0B1220" if theme_mode == "Dark" else "#EEF3F8"
+    sidebar_bg = "#0B1220" if theme_mode == "Dark" else "#FFFFFF"
     card_bg = "#111827" if theme_mode == "Dark" else "#FFFFFF"
-    muted_bg = "#1F2937" if theme_mode == "Dark" else "#F1F5F9"
-    card_border = "#334155" if theme_mode == "Dark" else "#D7DEE8"
-    accent = "#5CC8BE" if theme_mode == "Dark" else "#006D77"
-    accent_2 = "#FCA5A5" if theme_mode == "Dark" else "#A23E48"
-    text_color = "#E5E7EB" if theme_mode == "Dark" else "#172033"
-    muted_text = "#9CA3AF" if theme_mode == "Dark" else "#5B677A"
+    muted_bg = "#1F2937" if theme_mode == "Dark" else "#F2F5F9"
+    card_border = "#334155" if theme_mode == "Dark" else "#D4DCE7"
+    accent = "#5CC8BE" if theme_mode == "Dark" else "#0F766E"
+    accent_2 = "#FCA5A5" if theme_mode == "Dark" else "#B42318"
+    text_color = "#E5E7EB" if theme_mode == "Dark" else "#111827"
+    muted_text = "#9CA3AF" if theme_mode == "Dark" else "#526071"
     st.markdown(
         f"""
         <style>
@@ -207,9 +296,9 @@ def inject_css(theme_mode: str) -> None:
                 font-family: "Aptos", "Segoe UI", "Trebuchet MS", sans-serif;
             }}
             .block-container {{
-                padding-top: 1.0rem !important;
+                padding-top: 0.85rem !important;
                 padding-bottom: 2rem !important;
-                max-width: none !important;
+                max-width: 1480px !important;
                 padding-left: 1.25rem !important;
                 padding-right: 1.25rem !important;
             }}
@@ -221,6 +310,8 @@ def inject_css(theme_mode: str) -> None:
             }}
             header {{
                 background: transparent !important;
+                height: 0 !important;
+                pointer-events: none !important;
             }}
             h1, .stApp h1 {{
                 font-size: 1.9rem !important;
@@ -266,7 +357,7 @@ def inject_css(theme_mode: str) -> None:
             }}
             [data-baseweb="tab-list"] {{
                 align-items: center !important;
-                gap: 0.25rem !important;
+                gap: 0.15rem !important;
                 min-height: 2.7rem !important;
                 padding: 0.25rem !important;
                 background: {surface};
@@ -289,6 +380,10 @@ def inject_css(theme_mode: str) -> None:
                 white-space: nowrap !important;
                 border-radius: 6px !important;
             }}
+            button[data-baseweb="tab"][aria-selected="true"] {{
+                background: {muted_bg} !important;
+                border-bottom: 2px solid {accent} !important;
+            }}
             [data-baseweb="tab-list"] button p,
             [data-baseweb="tab"] p {{
                 margin: 0 !important;
@@ -303,8 +398,8 @@ def inject_css(theme_mode: str) -> None:
                 color: {accent} !important;
             }}
             [data-testid="stSidebar"] {{
-                min-width: 330px !important;
-                max-width: 330px !important;
+                min-width: 315px !important;
+                max-width: 315px !important;
                 background: {sidebar_bg};
                 border-right: 1px solid {card_border};
             }}
@@ -318,6 +413,12 @@ def inject_css(theme_mode: str) -> None:
             [data-testid="stSidebar"] h3 {{
                 font-size: 1.05rem !important;
                 font-weight: 760 !important;
+            }}
+            [data-testid="stSidebar"] [data-testid="stForm"] {{
+                border: 1px solid {card_border};
+                border-radius: 8px;
+                background: {surface};
+                padding: 0.85rem;
             }}
             [data-testid="stExpander"] summary p {{
                 font-size: 0.92rem !important;
@@ -338,6 +439,21 @@ def inject_css(theme_mode: str) -> None:
             }}
             div[data-baseweb="select"] span {{
                 font-size: 0.92rem !important;
+            }}
+            div[data-baseweb="slider"] [role="slider"] {{
+                background-color: {accent} !important;
+                border-color: {accent} !important;
+                box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.12) !important;
+            }}
+            div[data-baseweb="tag"],
+            span[data-baseweb="tag"] {{
+                background: {accent} !important;
+                border-radius: 6px !important;
+            }}
+            div[data-baseweb="tag"] span,
+            span[data-baseweb="tag"] span {{
+                color: #FFFFFF !important;
+                font-weight: 650 !important;
             }}
             .stButton > button,
             .stDownloadButton > button {{
@@ -382,15 +498,79 @@ def inject_css(theme_mode: str) -> None:
                 opacity: 0.78;
                 font-size: 0.88rem;
             }}
-            .ops-header {{
-                padding: 0.85rem 1rem;
+            .sidebar-brand {{
+                padding: 0.7rem 0.15rem 0.55rem 0.15rem;
+            }}
+            .sidebar-eyebrow {{
+                color: {accent};
+                font-size: 0.76rem;
+                font-weight: 760;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+            }}
+            .sidebar-title {{
+                margin-top: 0.15rem;
+                color: {text_color};
+                font-size: 1.25rem;
+                font-weight: 780;
+                line-height: 1.12;
+            }}
+            .runtime-card {{
+                margin: 0.35rem 0 0.85rem 0;
+                padding: 0.75rem 0.8rem;
                 border: 1px solid {card_border};
+                border-left: 4px solid {accent};
+                border-radius: 8px;
+                background: {muted_bg};
+            }}
+            .runtime-label, .status-label {{
+                color: {muted_text};
+                font-size: 0.74rem;
+                font-weight: 760;
+                letter-spacing: 0.06em;
+                text-transform: uppercase;
+            }}
+            .runtime-value {{
+                color: {text_color};
+                font-size: 0.98rem;
+                font-weight: 760;
+                margin-top: 0.2rem;
+            }}
+            .runtime-note {{
+                color: {accent};
+                font-size: 0.82rem;
+                font-weight: 700;
+                margin-top: 0.18rem;
+            }}
+            .runtime-path {{
+                color: {muted_text};
+                font-size: 0.72rem;
+                line-height: 1.25;
+                margin-top: 0.35rem;
+                word-break: break-word;
+            }}
+            .ops-header {{
+                display: flex;
+                align-items: flex-end;
+                justify-content: space-between;
+                gap: 1rem;
+                padding: 1.0rem 1.1rem;
+                border: 1px solid {card_border};
+                border-left: 4px solid {accent};
                 border-radius: 8px;
                 background: {surface};
                 margin: 0.55rem 0 0.9rem 0;
             }}
+            .ops-kicker {{
+                color: {accent};
+                font-size: 0.76rem;
+                font-weight: 760;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+                margin-bottom: 0.18rem;
+            }}
             .ops-title {{
-                font-size: 1.72rem;
+                font-size: 1.68rem;
                 line-height: 1.18;
                 font-weight: 760;
                 color: {text_color};
@@ -401,6 +581,25 @@ def inject_css(theme_mode: str) -> None:
                 color: {muted_text};
                 margin: 0.25rem 0 0 0;
             }}
+            .ops-header-meta {{
+                display: flex;
+                flex-wrap: wrap;
+                justify-content: flex-end;
+                gap: 0.35rem;
+                min-width: 260px;
+            }}
+            .ops-pill, .model-pill {{
+                display: inline-flex;
+                align-items: center;
+                min-height: 1.65rem;
+                padding: 0.25rem 0.5rem;
+                border-radius: 6px;
+                border: 1px solid {card_border};
+                background: {muted_bg};
+                color: {text_color};
+                font-size: 0.78rem;
+                font-weight: 700;
+            }}
             .section-label {{
                 color: {muted_text};
                 font-size: 0.78rem;
@@ -408,6 +607,71 @@ def inject_css(theme_mode: str) -> None:
                 letter-spacing: 0.08em;
                 text-transform: uppercase;
                 margin-bottom: 0.45rem;
+            }}
+            .status-grid, .readiness-grid, .model-status-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                gap: 0.65rem;
+                margin: 0.35rem 0 0.9rem 0;
+            }}
+            .readiness-grid {{
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }}
+            .model-status-grid {{
+                grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            }}
+            .status-card {{
+                min-height: 5.2rem;
+                padding: 0.72rem 0.82rem;
+                border-radius: 8px;
+                background: {card_bg};
+                border: 1px solid {card_border};
+            }}
+            .status-card.good {{
+                border-left: 4px solid {accent};
+            }}
+            .status-card.warn {{
+                border-left: 4px solid #B87514;
+            }}
+            .status-card.bad {{
+                border-left: 4px solid {accent_2};
+            }}
+            .status-value {{
+                color: {text_color};
+                font-size: 1.28rem;
+                line-height: 1.12;
+                font-weight: 780;
+                margin-top: 0.32rem;
+                overflow-wrap: anywhere;
+            }}
+            .status-note {{
+                color: {muted_text};
+                font-size: 0.78rem;
+                line-height: 1.28;
+                margin-top: 0.28rem;
+            }}
+            .model-banner {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 0.7rem;
+                padding: 0.75rem 0.85rem;
+                border: 1px solid {card_border};
+                border-left: 4px solid {accent};
+                border-radius: 8px;
+                background: {surface};
+                margin-bottom: 0.85rem;
+            }}
+            .model-banner-title {{
+                color: {text_color};
+                font-size: 1.0rem;
+                font-weight: 760;
+            }}
+            .model-banner-note {{
+                color: {muted_text};
+                font-size: 0.84rem;
+                line-height: 1.35;
+                margin-top: 0.18rem;
             }}
         </style>
         """,
@@ -1258,6 +1522,8 @@ def main() -> None:
     )
     inject_css(theme_mode)
     template = PLOTLY_TEMPLATE[theme_mode]
+    runtime_context = dashboard_runtime_context()
+    render_sidebar_runtime(runtime_context)
 
     if "scenario_inputs" not in st.session_state:
         st.session_state["scenario_inputs"] = default_scenario_inputs()
@@ -1521,20 +1787,31 @@ def main() -> None:
 
     with tabs[0]:
         st.markdown(
-            """
+            f"""
             <div class="ops-header">
-                <div class="ops-title">Coverly VPP Operations</div>
-                <div class="ops-subtitle">Residential flexibility, market readiness, and MPC control state for Fingrid reserve products.</div>
+                <div>
+                    <div class="ops-kicker">MPC market console</div>
+                    <div class="ops-title">Coverly VPP Operations</div>
+                    <div class="ops-subtitle">Residential flexibility, market readiness, and MPC control state for Fingrid reserve products.</div>
+                </div>
+                <div class="ops-header-meta">
+                    <span class="ops-pill">{escape(runtime_context["branch"])}</span>
+                    <span class="ops-pill">{escape(runtime_context["commit"])}</span>
+                    <span class="ops-pill">{escape(runtime_context["build"])}</span>
+                </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        h1, h2, h3, h4, h5 = st.columns(5)
-        h1.metric("Data source", str(market_data_status.get("mode_used", "synthetic")).title())
-        h2.metric("Replay feed", replay_source_label)
-        h3.metric("Model rows", f"{len(df):,}")
-        h4.metric("Real observations", f"{int(market_data_status.get('training_observations', 0) or 0):,}")
-        h5.metric("Timescale rows", f"{int(market_data_status.get('rows_persisted', 0) or 0):,}")
+        render_status_grid(
+            [
+                {"label": "Data source", "value": str(market_data_status.get("mode_used", "synthetic")).title(), "note": "Training inputs"},
+                {"label": "Replay feed", "value": replay_source_label, "note": "Market simulation"},
+                {"label": "Model rows", "value": f"{len(df):,}", "note": f"{freq_minutes}-minute resolution"},
+                {"label": "Real observations", "value": f"{int(market_data_status.get('training_observations', 0) or 0):,}", "note": "Loaded from APIs"},
+                {"label": "Timescale rows", "value": f"{int(market_data_status.get('rows_persisted', 0) or 0):,}", "note": "Local cache"},
+            ]
+        )
         if market_data_status.get("errors"):
             st.warning("Some market API signals were unavailable. Open Training Data Explorer for the exact API messages and fallback status.")
         left, right = st.columns([1.35, 1.0], gap="large")
@@ -1550,17 +1827,19 @@ def main() -> None:
                 st.plotly_chart(plot_sankey(summary), use_container_width=True, key="dev_home_sankey")
         with right:
             st.markdown('<div class="section-label">Readiness snapshot</div>', unsafe_allow_html=True)
-            c1, c2 = st.columns(2)
-            c1.metric("Fast reserve headroom", f"{summary['peak_fast_mw']:.2f} MW")
-            c2.metric("Total upward flexibility", f"{summary['peak_total_up_mw']:.2f} MW")
-            c1.metric("Homes needed for 1 MW aFRR", f"{summary['homes_for_1mw_total']:,}")
-            c2.metric("Homes needed for fast 1 MW", f"{summary['homes_for_1mw_fast']:,}")
-            c1.metric("PV fleet size", f"{summary['pv_capacity_mw']:.2f} MW")
-            c2.metric("Accessible storage energy", f"{summary['bess_energy_mwh'] + summary['ev_energy_mwh']:.2f} MWh")
-            c1.metric("Market data", str(market_data_status.get("mode_used", "synthetic")).title())
-            c2.metric("Realtime replay", replay_source_label)
-            c1.metric("Traceable devices", f"{int(summary.get('device_count', len(device_roster))):,}")
-            c2.metric("Simulated gateways", f"{int(summary.get('gateway_count', 0)):,}")
+            render_status_grid(
+                [
+                    {"label": "Fast reserve", "value": f"{summary['peak_fast_mw']:.2f} MW", "note": "FCR-capable headroom", "tone": "good"},
+                    {"label": "Upward flex", "value": f"{summary['peak_total_up_mw']:.2f} MW", "note": "Total portfolio envelope", "tone": "good"},
+                    {"label": "Homes for 1 MW", "value": f"{summary['homes_for_1mw_total']:,}", "note": "aFRR availability"},
+                    {"label": "Homes for fast 1 MW", "value": f"{summary['homes_for_1mw_fast']:,}", "note": "Fast reserve screen"},
+                    {"label": "PV fleet", "value": f"{summary['pv_capacity_mw']:.2f} MW", "note": "Installed capacity"},
+                    {"label": "Storage energy", "value": f"{summary['bess_energy_mwh'] + summary['ev_energy_mwh']:.2f} MWh", "note": "Accessible BESS + EV"},
+                    {"label": "Devices", "value": f"{int(summary.get('device_count', len(device_roster))):,}", "note": "Traceable roster"},
+                    {"label": "Gateways", "value": f"{int(summary.get('gateway_count', 0)):,}", "note": "Simulated edge controllers"},
+                ],
+                class_name="readiness-grid",
+            )
             st.markdown(
                 """
                 <div class="flexi-card">
@@ -1762,7 +2041,18 @@ def main() -> None:
         )
 
     with tabs[3]:
-        st.subheader("Forecasting Lab")
+        st.markdown(
+            """
+            <div class="model-banner">
+                <div>
+                    <div class="model-banner-title">Forecasting Lab</div>
+                    <div class="model-banner-note">Train point and quantile forecasts, then promote the selected model into MPC.</div>
+                </div>
+                <span class="model-pill">LightGBM default</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         preferred_targets = [
             "net_load_baseline_kw",
             "pv_available_kw",
@@ -1797,6 +2087,40 @@ def main() -> None:
         predictor_pool = numeric_signal_options(df, preferred_predictors)
         forecaster_plugins = PLUGIN_REGISTRY.list_forecasters()
         plugin_options = list(forecaster_plugins)
+        selected_default_plugin = plugin_options[preferred_forecaster_index(plugin_options)] if plugin_options else DEFAULT_FORECASTER_PLUGIN
+        lgbm_status = lightgbm_runtime_status(plugin_options)
+        render_status_grid(
+            [
+                {
+                    "label": "Default model",
+                    "value": forecaster_display_name(selected_default_plugin, forecaster_plugins) if selected_default_plugin in forecaster_plugins else selected_default_plugin,
+                    "note": "Selector resets to this build default",
+                    "tone": "good" if selected_default_plugin.startswith("lightgbm") else "warn",
+                },
+                {
+                    "label": "LightGBM runtime",
+                    "value": lgbm_status["label"],
+                    "note": lgbm_status["detail"],
+                    "tone": lgbm_status["tone"],
+                },
+                {
+                    "label": "Available models",
+                    "value": str(len(plugin_options)),
+                    "note": ", ".join(forecaster_display_name(key, forecaster_plugins) for key in plugin_options),
+                },
+                {
+                    "label": "Probabilistic output",
+                    "value": "P05-P95",
+                    "note": "Bands are plotted after training and used by MPC risk policy",
+                    "tone": "good",
+                },
+            ],
+            class_name="model-status-grid",
+        )
+        if "lightgbm_quantile" not in plugin_options:
+            st.error("LightGBM is not registered in this running app. Check that Streamlit is running this repository's app.py, not the older app.py in the parent Playground folder.")
+        elif lgbm_status["tone"] == "warn":
+            st.warning("The LightGBM option is visible, but this virtual environment cannot import native lightgbm. Run `pip install -r requirements.txt` inside `.venv` to enable the native LightGBM backend.")
         col1, col2, col3, col4, col5 = st.columns([1.35, 1.55, 1.65, 0.65, 0.95])
         target = col1.selectbox("Target", target_options, index=0)
         default_predictors = [
@@ -1816,6 +2140,7 @@ def main() -> None:
             plugin_options,
             index=preferred_forecaster_index(plugin_options),
             format_func=lambda key: forecaster_display_name(key, forecaster_plugins),
+            key=f"forecasting_model_select_{APP_BUILD_ID}",
         )
         lags = col4.slider("Lag depth", 1, 8, 4)
         max_horizon_steps = max(4, min(96, int((24 * 60) / max(freq_minutes, 1))))
@@ -1857,7 +2182,12 @@ def main() -> None:
             m1.metric("MAE", f"{spec_metrics['mae']:.2f}")
             m2.metric("RMSE", f"{spec_metrics['rmse']:.2f}")
             m3.metric("Rows used", f"{st.session_state.get('last_forecast_row_count', len(df)):,}")
-            m4.metric("Model", st.session_state.get("last_forecaster_plugin", DEFAULT_FORECASTER_PLUGIN))
+            trained_plugin = st.session_state.get("last_forecaster_plugin", DEFAULT_FORECASTER_PLUGIN)
+            m4.metric("Model", forecaster_display_name(trained_plugin, forecaster_plugins) if trained_plugin in forecaster_plugins else trained_plugin)
+            if forecaster is not None and hasattr(forecaster, "get_metadata"):
+                model_metadata = forecaster.get_metadata()
+                backend = str(model_metadata.get("backend", "model"))
+                st.caption(f"Trained backend: `{backend}`. Quantile-aware models produce the P05-P95 uncertainty bands shown below.")
             st.caption(
                 f"Training frame uses {st.session_state.get('last_forecast_row_count', len(df)):,} rows at {freq_minutes}-minute resolution. "
                 f"Real market fetch window: {forecast_market_status.get('query_start_utc') or 'not used'} to "
@@ -1988,12 +2318,14 @@ def main() -> None:
             )
         forecaster_plugins = PLUGIN_REGISTRY.list_forecasters()
         optimizer_plugins = PLUGIN_REGISTRY.list_optimizers()
+        mpc_forecaster_options = list(forecaster_plugins)
         p1, p2 = st.columns(2)
         mpc_forecaster_plugin = p1.selectbox(
             "MPC forecaster",
-            list(forecaster_plugins),
-            index=preferred_forecaster_index(list(forecaster_plugins)),
+            mpc_forecaster_options,
+            index=preferred_forecaster_index(mpc_forecaster_options),
             format_func=lambda key: forecaster_display_name(key, forecaster_plugins),
+            key=f"mpc_forecaster_select_{APP_BUILD_ID}",
         )
         optimizer_plugin = p2.selectbox(
             "Optimizer",

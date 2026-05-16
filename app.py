@@ -150,17 +150,36 @@ def portfolio_bundle_is_current(session_state: Dict[str, object], signature: tup
 
 
 RESOURCE_COLORS = {
-    "BESS": "#7B61FF",
-    "EV": "#6E44FF",
-    "PV": "#2F9E44",
-    "HVAC": "#FF922B",
-    "Base": "#355070",
-    "Net": "#0B7285",
-    "Frequency": "#D9480F",
-    "aFRR": "#C2255C",
+    "BESS": "#3B6EA8",
+    "EV": "#5A7D3A",
+    "PV": "#2F8A57",
+    "HVAC": "#B87514",
+    "Base": "#34495E",
+    "Net": "#006D77",
+    "Frequency": "#A23E48",
+    "aFRR": "#6D597A",
 }
 
 PLOTLY_TEMPLATE = {"Dark": "plotly_dark", "Light": "plotly_white"}
+
+
+FORECASTER_LABELS = {
+    "lightgbm_quantile": "LightGBM quantile (P05-P95)",
+    "lightgbm_probabilistic": "LightGBM probabilistic (P05-P95)",
+    "xgboost_default": "XGBoost residual bands",
+    "xgboost_v1": "XGBoost v1 residual bands",
+}
+
+
+def forecaster_display_name(key: str, forecaster_plugins: Dict[str, str]) -> str:
+    return FORECASTER_LABELS.get(str(key), f"{key} ({forecaster_plugins[key]})")
+
+
+def preferred_forecaster_index(plugin_options: List[str]) -> int:
+    for key in ("lightgbm_quantile", "lightgbm_probabilistic", DEFAULT_FORECASTER_PLUGIN):
+        if key in plugin_options:
+            return plugin_options.index(key)
+    return 0
 
 
 
@@ -169,157 +188,226 @@ PLOTLY_TEMPLATE = {"Dark": "plotly_dark", "Light": "plotly_white"}
 
 
 def inject_css(theme_mode: str) -> None:
-    bg = (
-        "linear-gradient(140deg, rgba(12,42,74,0.16), rgba(31,100,69,0.08) 45%, rgba(255,146,43,0.10))"
-        if theme_mode == "Dark"
-        else "linear-gradient(140deg, rgba(207,231,255,0.55), rgba(226,255,244,0.68) 52%, rgba(255,236,214,0.72))"
-    )
-    card_bg = "rgba(9,17,28,0.72)" if theme_mode == "Dark" else "rgba(255,255,255,0.86)"
-    card_border = "rgba(123, 97, 255, 0.30)" if theme_mode == "Dark" else "rgba(11, 114, 133, 0.20)"
-    text_color = "#F8F9FA" if theme_mode == "Dark" else "#183153"
+    bg = "#0F172A" if theme_mode == "Dark" else "#F6F8FB"
+    surface = "#111827" if theme_mode == "Dark" else "#FFFFFF"
+    sidebar_bg = "#0B1220" if theme_mode == "Dark" else "#EEF3F8"
+    card_bg = "#111827" if theme_mode == "Dark" else "#FFFFFF"
+    muted_bg = "#1F2937" if theme_mode == "Dark" else "#F1F5F9"
+    card_border = "#334155" if theme_mode == "Dark" else "#D7DEE8"
+    accent = "#5CC8BE" if theme_mode == "Dark" else "#006D77"
+    accent_2 = "#FCA5A5" if theme_mode == "Dark" else "#A23E48"
+    text_color = "#E5E7EB" if theme_mode == "Dark" else "#172033"
+    muted_text = "#9CA3AF" if theme_mode == "Dark" else "#5B677A"
     st.markdown(
         f"""
         <style>
             .stApp {{
-                background-image: {bg};
-                background-attachment: fixed;
+                background: {bg};
                 color: {text_color};
                 font-family: "Aptos", "Segoe UI", "Trebuchet MS", sans-serif;
             }}
             .block-container {{
-                padding-top: 1.4rem !important;
+                padding-top: 1.0rem !important;
                 padding-bottom: 2rem !important;
                 max-width: none !important;
-                padding-left: 1.35rem !important;
-                padding-right: 1.65rem !important;
+                padding-left: 1.25rem !important;
+                padding-right: 1.25rem !important;
+            }}
+            [data-testid="stToolbar"],
+            [data-testid="stDecoration"],
+            footer {{
+                visibility: hidden !important;
+                height: 0 !important;
+            }}
+            header {{
+                background: transparent !important;
             }}
             h1, .stApp h1 {{
-                font-size: 3.2rem !important;
-                font-weight: 800 !important;
-                line-height: 1.08 !important;
-                letter-spacing: -0.03em !important;
+                font-size: 1.9rem !important;
+                font-weight: 760 !important;
+                line-height: 1.18 !important;
+                letter-spacing: 0 !important;
+                color: {text_color} !important;
             }}
             h2, .stApp h2 {{
-                font-size: 2.25rem !important;
-                font-weight: 760 !important;
+                font-size: 1.55rem !important;
+                font-weight: 720 !important;
                 line-height: 1.16 !important;
             }}
             h3, .stApp h3 {{
-                font-size: 1.65rem !important;
-                font-weight: 720 !important;
+                font-size: 1.25rem !important;
+                font-weight: 700 !important;
+                color: {text_color} !important;
             }}
             h4, .stApp h4 {{
-                font-size: 1.28rem !important;
-                font-weight: 720 !important;
-            }}
-            p, li, label, .stMarkdown, .stCaption, .small-note {{
-                font-size: 1.04rem !important;
-                line-height: 1.56 !important;
-            }}
-            [data-testid="stMetricLabel"] {{
-                font-size: 1.08rem !important;
+                font-size: 1.05rem !important;
                 font-weight: 700 !important;
             }}
+            p, li, label, .stMarkdown, .stCaption, .small-note {{
+                font-size: 0.94rem !important;
+                line-height: 1.45 !important;
+            }}
+            [data-testid="stMetricLabel"] {{
+                font-size: 0.84rem !important;
+                font-weight: 650 !important;
+                color: {muted_text} !important;
+            }}
             [data-testid="stMetricValue"] {{
-                font-size: 2.2rem !important;
-                font-weight: 800 !important;
+                font-size: 1.65rem !important;
+                font-weight: 760 !important;
                 line-height: 1.05 !important;
+                color: {text_color} !important;
+            }}
+            [data-testid="stMetric"] {{
+                background: {surface};
+                border: 1px solid {card_border};
+                border-radius: 8px;
+                padding: 0.78rem 0.85rem;
             }}
             [data-baseweb="tab-list"] {{
                 align-items: center !important;
-                overflow: visible !important;
-                gap: 0.15rem !important;
-                min-height: 3.2rem !important;
-                padding-top: 0.3rem !important;
-                padding-bottom: 0.15rem !important;
+                gap: 0.25rem !important;
+                min-height: 2.7rem !important;
+                padding: 0.25rem !important;
+                background: {surface};
+                border: 1px solid {card_border};
+                border-radius: 8px;
             }}
             div[data-testid="stTabs"] {{
-                margin-top: 0.65rem !important;
-            }}
-            [data-baseweb="tab"] {{
-                overflow: visible !important;
+                margin-top: 0.45rem !important;
             }}
             [data-baseweb="tab-list"] button {{
-                font-size: 1.02rem !important;
-                font-weight: 700 !important;
-                min-height: 3rem !important;
+                font-size: 0.89rem !important;
+                font-weight: 650 !important;
+                min-height: 2.25rem !important;
                 height: auto !important;
-                line-height: 1.35 !important;
-                padding: 0.55rem 0.85rem 0.55rem 0.85rem !important;
+                line-height: 1.2 !important;
+                padding: 0.38rem 0.65rem !important;
                 display: flex !important;
                 align-items: center !important;
                 justify-content: center !important;
-                overflow: visible !important;
                 white-space: nowrap !important;
+                border-radius: 6px !important;
             }}
             [data-baseweb="tab-list"] button p,
             [data-baseweb="tab"] p {{
                 margin: 0 !important;
                 padding: 0 !important;
-                line-height: 1.4 !important;
-                font-size: 1.02rem !important;
-                font-weight: 700 !important;
+                line-height: 1.25 !important;
+                font-size: 0.89rem !important;
+                font-weight: 650 !important;
                 display: inline-block !important;
-                overflow: visible !important;
-                position: relative !important;
-                top: 2px !important;
+                color: {text_color} !important;
             }}
-            div[data-testid="stTabs"] > div:first-child {{
-                overflow: visible !important;
-                min-height: 3.25rem !important;
-                padding-top: 0.2rem !important;
+            [aria-selected="true"] p {{
+                color: {accent} !important;
             }}
             [data-testid="stSidebar"] {{
-                min-width: 365px !important;
-                max-width: 365px !important;
+                min-width: 330px !important;
+                max-width: 330px !important;
+                background: {sidebar_bg};
+                border-right: 1px solid {card_border};
             }}
             [data-testid="stSidebar"] label,
             [data-testid="stSidebar"] p,
             [data-testid="stSidebar"] div[role="radiogroup"] *,
             [data-testid="stSidebar"] .stSlider p {{
-                font-size: 1rem !important;
+                font-size: 0.88rem !important;
             }}
             [data-testid="stSidebar"] h2,
             [data-testid="stSidebar"] h3 {{
-                font-size: 1.24rem !important;
+                font-size: 1.05rem !important;
                 font-weight: 760 !important;
             }}
             [data-testid="stExpander"] summary p {{
-                font-size: 1.02rem !important;
+                font-size: 0.92rem !important;
                 font-weight: 650 !important;
             }}
             [data-testid="stDataFrame"] div,
             [data-testid="stTable"] div {{
-                font-size: 0.98rem !important;
+                font-size: 0.88rem !important;
+            }}
+            div[data-baseweb="select"] > div,
+            div[data-baseweb="input"] > div,
+            textarea,
+            input {{
+                border-radius: 6px !important;
+            }}
+            div[role="listbox"] {{
+                min-width: 340px !important;
+            }}
+            div[data-baseweb="select"] span {{
+                font-size: 0.92rem !important;
+            }}
+            .stButton > button,
+            .stDownloadButton > button {{
+                border-radius: 6px !important;
+                background: {accent} !important;
+                border: 1px solid {accent} !important;
+                color: #FFFFFF !important;
+                font-weight: 650 !important;
+                min-height: 2.45rem !important;
+            }}
+            .stButton > button:hover,
+            .stDownloadButton > button:hover {{
+                background: {accent_2} !important;
+                border-color: {accent_2} !important;
             }}
             .flexi-card {{
-                padding: 1.2rem 1.35rem;
-                border-radius: 18px;
+                padding: 0.95rem 1.05rem;
+                border-radius: 8px;
                 background: {card_bg};
                 border: 1px solid {card_border};
-                box-shadow: 0 18px 36px rgba(0,0,0,0.08);
+                box-shadow: none;
                 margin-bottom: 0.7rem;
             }}
             .flexi-card h4 {{
                 margin: 0 0 0.4rem 0;
-                letter-spacing: 0.02em;
-                font-size: 1.38rem !important;
-                font-weight: 760 !important;
+                letter-spacing: 0;
+                font-size: 1.02rem !important;
+                font-weight: 720 !important;
             }}
             .flexi-badge {{
                 display: inline-block;
                 margin-right: 0.35rem;
                 margin-top: 0.2rem;
-                padding: 0.34rem 0.72rem;
-                border-radius: 999px;
-                background: rgba(123,97,255,0.12);
-                border: 1px solid rgba(123,97,255,0.25);
-                font-size: 0.96rem;
+                padding: 0.24rem 0.5rem;
+                border-radius: 6px;
+                background: {muted_bg};
+                border: 1px solid {card_border};
+                font-size: 0.82rem;
                 font-weight: 650;
             }}
             .small-note {{
                 opacity: 0.78;
-                font-size: 1rem;
+                font-size: 0.88rem;
+            }}
+            .ops-header {{
+                padding: 0.85rem 1rem;
+                border: 1px solid {card_border};
+                border-radius: 8px;
+                background: {surface};
+                margin: 0.55rem 0 0.9rem 0;
+            }}
+            .ops-title {{
+                font-size: 1.72rem;
+                line-height: 1.18;
+                font-weight: 760;
+                color: {text_color};
+                margin: 0;
+            }}
+            .ops-subtitle {{
+                font-size: 0.92rem;
+                color: {muted_text};
+                margin: 0.25rem 0 0 0;
+            }}
+            .section-label {{
+                color: {muted_text};
+                font-size: 0.78rem;
+                font-weight: 760;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+                margin-bottom: 0.45rem;
             }}
         </style>
         """,
@@ -339,18 +427,18 @@ def apply_chart_style(fig: go.Figure, template: str, height: int | None = None, 
     layout_updates = dict(
         template=template,
         height=height if height is not None else fig.layout.height,
-        font=dict(size=16),
-        legend=dict(font=dict(size=16), title_font=dict(size=17)),
-        hoverlabel=dict(font_size=16),
+        font=dict(size=13),
+        legend=dict(font=dict(size=12), title_font=dict(size=13), orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        hoverlabel=dict(font_size=13),
         margin=dict(l=20, r=20, t=50, b=12),
     )
     if resolved_title:
-        layout_updates["title"] = dict(text=resolved_title, font=dict(size=22))
+        layout_updates["title"] = dict(text=resolved_title, font=dict(size=16))
     else:
         fig.update_layout(title=None)
     fig.update_layout(**layout_updates)
-    fig.update_xaxes(title_font=dict(size=18), tickfont=dict(size=15))
-    fig.update_yaxes(title_font=dict(size=18), tickfont=dict(size=15))
+    fig.update_xaxes(title_font=dict(size=13), tickfont=dict(size=11), showgrid=True, gridcolor="rgba(148,163,184,0.25)")
+    fig.update_yaxes(title_font=dict(size=13), tickfont=dict(size=11), showgrid=True, gridcolor="rgba(148,163,184,0.25)")
     return fig
 
 
@@ -1162,7 +1250,7 @@ def line_dual_axis(result_df: pd.DataFrame, template: str) -> go.Figure:
 
 
 def main() -> None:
-    theme_mode = st.sidebar.radio("Dashboard theme", ["Dark", "Light"], horizontal=True, help="Applies to charts and dashboard styling.")
+    theme_mode = st.sidebar.radio("Dashboard theme", ["Light", "Dark"], horizontal=True, help="Applies to charts and dashboard styling.")
     dev_mode = st.sidebar.toggle(
         "Developer / research panels",
         value=False,
@@ -1432,7 +1520,15 @@ def main() -> None:
     live_refresh_requested = False
 
     with tabs[0]:
-        st.title("Coverly: Aggregated Residential Flexibility for Fingrid Balancing Markets")
+        st.markdown(
+            """
+            <div class="ops-header">
+                <div class="ops-title">Coverly VPP Operations</div>
+                <div class="ops-subtitle">Residential flexibility, market readiness, and MPC control state for Fingrid reserve products.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         h1, h2, h3, h4, h5 = st.columns(5)
         h1.metric("Data source", str(market_data_status.get("mode_used", "synthetic")).title())
         h2.metric("Replay feed", replay_source_label)
@@ -1441,27 +1537,19 @@ def main() -> None:
         h5.metric("Timescale rows", f"{int(market_data_status.get('rows_persisted', 0) or 0):,}")
         if market_data_status.get("errors"):
             st.warning("Some market API signals were unavailable. Open Training Data Explorer for the exact API messages and fallback status.")
-        left, right = st.columns([1.2, 1.0], gap="large")
+        left, right = st.columns([1.35, 1.0], gap="large")
         with left:
-            st.markdown(
-                """
-                <div class="flexi-card">
-                    <h4>What this dashboard teaches</h4>
-                    <p>
-                        Residential flexibility becomes market-relevant only when it is aggregated, forecasted well,
-                        and dispatched with product-aware control. Fast assets like <b>BESS</b> and <b>EVs</b> dominate FCR-N,
-                        while <b>thermal loads</b> and <b>PV curtailment</b> add depth for aFRR and hybrid reserve strategies.
-                    </p>
-                    <span class="flexi-badge">FCR-N: symmetric, local, seconds</span>
-                    <span class="flexi-badge">aFRR: signal-based, 4-second control, 5-minute full activation</span>
-                    <span class="flexi-badge">Aggregation unlocks 0.1 MW and 1 MW thresholds</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            st.markdown('<div class="section-label">Portfolio operating envelope</div>', unsafe_allow_html=True)
+            overview_fig = go.Figure()
+            overview_fig.add_trace(go.Scatter(x=df.index, y=df["net_load_baseline_kw"] / 1000.0, name="Net load", line={"color": RESOURCE_COLORS["Net"], "width": 2.5}))
+            overview_fig.add_trace(go.Scatter(x=df.index, y=df["fast_sym_kw"] / 1000.0, name="Fast reserve", line={"color": RESOURCE_COLORS["Frequency"]}))
+            overview_fig.add_trace(go.Scatter(x=df.index, y=df["flex_up_kw"] / 1000.0, name="Upward flexibility", line={"color": RESOURCE_COLORS["PV"]}))
+            overview_fig.update_layout(yaxis_title="MW")
+            st.plotly_chart(apply_chart_style(overview_fig, template, height=360, title="Portfolio availability and load"), use_container_width=True)
             if dev_mode:
                 st.plotly_chart(plot_sankey(summary), use_container_width=True, key="dev_home_sankey")
         with right:
+            st.markdown('<div class="section-label">Readiness snapshot</div>', unsafe_allow_html=True)
             c1, c2 = st.columns(2)
             c1.metric("Fast reserve headroom", f"{summary['peak_fast_mw']:.2f} MW")
             c2.metric("Total upward flexibility", f"{summary['peak_total_up_mw']:.2f} MW")
@@ -1476,11 +1564,9 @@ def main() -> None:
             st.markdown(
                 """
                 <div class="flexi-card">
-                    <h4>Fingrid checkpoints embedded in the app</h4>
+                    <h4>Market checkpoints</h4>
                     <p class="small-note">
-                        The optimizer and compliance view track minimum bid sizes, response speed, expected accuracy,
-                        storage endurance, and the presence of an explicit baseline. Capacity and activation prices
-                        can be synthetic or loaded from ENTSO-E/Fingrid APIs from the sidebar.
+                        Minimum bids, response speed, accuracy, endurance, baseline state, and market-price inputs are tracked across the MPC workflow.
                     </p>
                 </div>
                 """,
@@ -1711,7 +1797,7 @@ def main() -> None:
         predictor_pool = numeric_signal_options(df, preferred_predictors)
         forecaster_plugins = PLUGIN_REGISTRY.list_forecasters()
         plugin_options = list(forecaster_plugins)
-        col1, col2, col3, col4, col5 = st.columns([1.1, 1.3, 1.0, 0.7, 0.8])
+        col1, col2, col3, col4, col5 = st.columns([1.35, 1.55, 1.65, 0.65, 0.95])
         target = col1.selectbox("Target", target_options, index=0)
         default_predictors = [
             col
@@ -1728,8 +1814,8 @@ def main() -> None:
         selected_forecaster_plugin = col3.selectbox(
             "Forecasting model",
             plugin_options,
-            index=plugin_options.index(DEFAULT_FORECASTER_PLUGIN) if DEFAULT_FORECASTER_PLUGIN in plugin_options else 0,
-            format_func=lambda key: f"{key} ({forecaster_plugins[key]})",
+            index=preferred_forecaster_index(plugin_options),
+            format_func=lambda key: forecaster_display_name(key, forecaster_plugins),
         )
         lags = col4.slider("Lag depth", 1, 8, 4)
         max_horizon_steps = max(4, min(96, int((24 * 60) / max(freq_minutes, 1))))
@@ -1906,8 +1992,8 @@ def main() -> None:
         mpc_forecaster_plugin = p1.selectbox(
             "MPC forecaster",
             list(forecaster_plugins),
-            index=list(forecaster_plugins).index(DEFAULT_FORECASTER_PLUGIN) if DEFAULT_FORECASTER_PLUGIN in forecaster_plugins else 0,
-            format_func=lambda key: f"{key} ({forecaster_plugins[key]})",
+            index=preferred_forecaster_index(list(forecaster_plugins)),
+            format_func=lambda key: forecaster_display_name(key, forecaster_plugins),
         )
         optimizer_plugin = p2.selectbox(
             "Optimizer",

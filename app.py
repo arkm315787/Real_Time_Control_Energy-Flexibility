@@ -23,6 +23,7 @@ import json
 import re
 import subprocess
 import time
+from datetime import date
 from html import escape
 from pathlib import Path
 from typing import Callable, Dict, List
@@ -1350,20 +1351,57 @@ def capped_forecast_window_days(window_label: str, simulation_days: int) -> int:
     return max(1, min(int(requested_days), int(max(simulation_days, 1))))
 
 
-def windowed_time_frame(frame: pd.DataFrame, window_days: int, timestamp_col: str | None = None) -> pd.DataFrame:
+def frame_timestamp_series(frame: pd.DataFrame, timestamp_col: str | None = None) -> pd.Series:
+    if timestamp_col and timestamp_col in frame.columns:
+        return pd.Series(pd.to_datetime(frame[timestamp_col], errors="coerce"), index=frame.index)
+    return pd.Series(pd.to_datetime(frame.index, errors="coerce"), index=frame.index)
+
+
+def frame_time_bounds(frame: pd.DataFrame, timestamp_col: str | None = None) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    if frame.empty:
+        return None, None
+    timestamps = frame_timestamp_series(frame, timestamp_col).dropna()
+    if timestamps.empty:
+        return None, None
+    return pd.Timestamp(timestamps.min()), pd.Timestamp(timestamps.max())
+
+
+def default_forecast_as_of_date(frame: pd.DataFrame, today: pd.Timestamp | None = None) -> date:
+    start_at, end_at = frame_time_bounds(frame)
+    today_at = pd.Timestamp(today if today is not None else pd.Timestamp.today()).normalize()
+    if start_at is None or end_at is None:
+        return today_at.date()
+    clamped = min(max(today_at, start_at.normalize()), end_at.normalize())
+    return clamped.date()
+
+
+def end_of_day_timestamp(value: object) -> pd.Timestamp:
+    return pd.Timestamp(value).normalize() + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+
+
+def time_frame_until(frame: pd.DataFrame, end_at: pd.Timestamp, timestamp_col: str | None = None) -> pd.DataFrame:
     if frame.empty:
         return frame
     working = frame.copy()
-    if timestamp_col and timestamp_col in working.columns:
-        timestamps = pd.to_datetime(working[timestamp_col], errors="coerce")
-    else:
-        timestamps = pd.to_datetime(working.index, errors="coerce")
+    timestamps = frame_timestamp_series(working, timestamp_col)
     if timestamps.isna().all():
         return working
-    end_at = timestamps.max()
-    cutoff = end_at - pd.Timedelta(days=max(int(window_days), 1))
-    visible = working.loc[timestamps > cutoff]
-    return visible if not visible.empty else working.tail(1)
+    return working.loc[timestamps <= pd.Timestamp(end_at)]
+
+
+def windowed_time_frame(frame: pd.DataFrame, window_days: int, timestamp_col: str | None = None, end_at: pd.Timestamp | None = None) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    working = frame.copy()
+    timestamps = frame_timestamp_series(working, timestamp_col)
+    if timestamps.isna().all():
+        return working
+    resolved_end_at = pd.Timestamp(end_at) if end_at is not None else pd.Timestamp(timestamps.max())
+    eligible = working.loc[timestamps <= resolved_end_at]
+    eligible_timestamps = timestamps.loc[eligible.index]
+    cutoff = resolved_end_at - pd.Timedelta(days=max(int(window_days), 1))
+    visible = eligible.loc[eligible_timestamps > cutoff]
+    return visible if not visible.empty else eligible.tail(1)
 
 
 def forecast_window_caption(window_label: str, visible_days: int, simulation_days: int) -> str:
@@ -2641,23 +2679,38 @@ def main() -> None:
         elif lgbm_status["tone"] == "warn":
             st.warning("The LightGBM option is visible, but this virtual environment cannot import native lightgbm. Run `pip install -r requirements.txt` inside `.venv` to enable the native LightGBM backend.")
 
-        st.markdown("#### Forecast display window")
-        display_cols = st.columns([1.2, 0.85, 0.95])
+        st.markdown("#### Forecast data scope and display window")
+        dataset_start_at, dataset_end_at = frame_time_bounds(df)
+        default_as_of_date = default_forecast_as_of_date(df)
+        min_as_of_date = dataset_start_at.date() if dataset_start_at is not None else default_as_of_date
+        max_as_of_date = dataset_end_at.date() if dataset_end_at is not None else default_as_of_date
+        display_cols = st.columns([1.0, 1.1, 0.85, 0.95])
+        forecast_as_of_date = display_cols[0].date_input(
+            "Forecast as-of date",
+            value=default_as_of_date,
+            min_value=min_as_of_date,
+            max_value=max_as_of_date,
+            key=f"forecast_as_of_date_{APP_BUILD_ID}",
+        )
         default_window_index = 1 if days >= FORECAST_PLOT_WINDOW_DAYS["Week"] else 0
-        forecast_window_choice = display_cols[0].radio(
+        forecast_window_choice = display_cols[1].radio(
             "Plots show",
             list(FORECAST_PLOT_WINDOW_DAYS),
             index=default_window_index,
             horizontal=True,
             key=f"forecast_plot_window_choice_{APP_BUILD_ID}",
         )
+        forecast_as_of_ts = end_of_day_timestamp(forecast_as_of_date)
+        forecast_training_df = time_frame_until(df, forecast_as_of_ts)
+        future_rows_hidden = max(0, int(len(df) - len(forecast_training_df)))
         forecast_view_days = capped_forecast_window_days(forecast_window_choice, days)
         forecast_points = max(1, int(round(forecast_view_days * 24 * 60 / max(freq_minutes, 1))))
-        display_cols[1].metric("Visible horizon", f"{forecast_view_days} day{'s' if forecast_view_days != 1 else ''}")
-        display_cols[2].metric("Training window", f"{days:,} days")
+        display_cols[2].metric("Visible horizon", f"{forecast_view_days} day{'s' if forecast_view_days != 1 else ''}")
+        display_cols[3].metric("Training rows", f"{len(forecast_training_df):,}")
         st.caption(
             f"{forecast_window_caption(forecast_window_choice, forecast_view_days, days)} "
-            f"Training still uses the full selected {days:,}-day simulation; only time-series plots and preview tables are shortened."
+            f"Forecast training uses every dataset row available through {forecast_as_of_date}; "
+            f"{future_rows_hidden:,} later synthetic row{'s' if future_rows_hidden != 1 else ''} remain available to the simulation/MPC pages but are excluded here to avoid look-ahead leakage."
         )
 
         col1, col2, col3, col4, col5 = st.columns([1.35, 1.55, 1.65, 0.65, 0.95])
@@ -2684,7 +2737,7 @@ def main() -> None:
         lags = col4.slider("Lag depth", 1, 8, 4)
         max_horizon_steps = max(4, min(96, int((24 * 60) / max(freq_minutes, 1))))
         horizon_steps = col5.slider(f"Forecast horizon ({freq_minutes} min steps)", 1, max_horizon_steps, min(4, max_horizon_steps))
-        preview_df = windowed_time_frame(df, forecast_view_days).tail(forecast_points)
+        preview_df = windowed_time_frame(forecast_training_df, forecast_view_days, end_at=forecast_as_of_ts).tail(forecast_points)
         preview_fig = signal_line_figure(preview_df, [target], f"Selected target history: {target}")
         st.plotly_chart(apply_chart_style(preview_fig, template, height=260), use_container_width=True)
         if real_market_ready and target in market_columns:
@@ -2694,9 +2747,12 @@ def main() -> None:
             )
 
         if st.button("Train forecast", type="primary", key=f"train_forecast_{target}"):
+            if len(forecast_training_df) <= lags + horizon_steps + 1:
+                st.error("The forecast as-of date leaves too few rows for the selected lag depth and horizon. Move the as-of date later or reduce lag/horizon.")
+                st.stop()
             with st.spinner("Training the forecaster..."):
                 forecaster = PLUGIN_REGISTRY.get_forecaster(selected_forecaster_plugin, seed=int(seed))
-                comparison = forecaster.fit_from_frame(df, target, predictors, lags, horizon_steps)
+                comparison = forecaster.fit_from_frame(forecast_training_df, target, predictors, lags, horizon_steps)
                 try:
                     spec = forecaster.to_forecast_spec()
                 except ValueError:
@@ -2706,7 +2762,9 @@ def main() -> None:
             st.session_state["last_forecaster_plugin"] = selected_forecaster_plugin
             st.session_state["last_forecast_comparison"] = comparison
             st.session_state["last_forecast_market_status"] = market_data_status
-            st.session_state["last_forecast_row_count"] = int(len(df))
+            st.session_state["last_forecast_row_count"] = int(len(forecast_training_df))
+            st.session_state["last_forecast_as_of_date"] = str(forecast_as_of_date)
+            st.session_state["last_forecast_future_rows_hidden"] = int(future_rows_hidden)
 
         if "last_forecast_spec" in st.session_state:
             spec = st.session_state["last_forecast_spec"]
@@ -2718,6 +2776,10 @@ def main() -> None:
             spec_horizon_steps = getattr(spec, "horizon_steps", horizon_steps)
             if spec_target != target:
                 st.info(f"The displayed trained model is for `{spec_target}`. Click Train forecast to retrain for `{target}`.")
+            trained_as_of_date = st.session_state.get("last_forecast_as_of_date", str(forecast_as_of_date))
+            trained_future_rows_hidden = int(st.session_state.get("last_forecast_future_rows_hidden", 0) or 0)
+            if str(forecast_as_of_date) != str(trained_as_of_date):
+                st.info(f"The displayed trained model used data through `{trained_as_of_date}`. Click Train forecast to retrain through `{forecast_as_of_date}`.")
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("MAE", f"{spec_metrics['mae']:.2f}")
             m2.metric("RMSE", f"{spec_metrics['rmse']:.2f}")
@@ -2730,12 +2792,14 @@ def main() -> None:
                 st.caption(f"Trained backend: `{backend}`. Quantile-aware models produce the P05-P95 uncertainty bands shown below.")
             st.caption(
                 f"Training frame uses {st.session_state.get('last_forecast_row_count', len(df)):,} rows at {freq_minutes}-minute resolution. "
+                f"Training cut-off: {trained_as_of_date}; future synthetic rows excluded from forecasting: {trained_future_rows_hidden:,}. "
                 f"Real market fetch window: {forecast_market_status.get('query_start_utc') or 'not used'} to "
                 f"{forecast_market_status.get('query_end_utc') or 'not used'}; raw market observations loaded: "
                 f"{int(forecast_market_status.get('training_observations', 0) or 0):,}."
             )
 
-            visible_comparison = windowed_time_frame(comparison, forecast_view_days).tail(forecast_points)
+            trained_as_of_ts = end_of_day_timestamp(trained_as_of_date)
+            visible_comparison = windowed_time_frame(comparison, forecast_view_days, end_at=trained_as_of_ts).tail(forecast_points)
             pred_fig = forecast_performance_figure(visible_comparison, str(spec_target))
             st.plotly_chart(apply_chart_style(pred_fig, template, height=380, title=f"Forecast performance: {spec_target}"), use_container_width=True)
             quantile_cols = [col for col in comparison.columns if col.startswith("prediction_p")]

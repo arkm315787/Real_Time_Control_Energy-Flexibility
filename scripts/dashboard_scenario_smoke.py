@@ -22,10 +22,14 @@ from app import (
     build_live_market_feed,
     capped_forecast_window_days,
     default_scenario_inputs,
+    default_forecast_as_of_date,
+    end_of_day_timestamp,
+    frame_time_bounds,
     live_market_status,
     live_visible_frame,
     portfolio_bundle_is_current,
     scenario_portfolio_signature,
+    time_frame_until,
     upper_socket_metrics,
     windowed_time_frame,
 )
@@ -118,12 +122,16 @@ def main() -> None:
         'download_button(',
         '"Viewable HTML"',
         '"Plotly figure"',
-        "Forecast display window",
+        "Forecast data scope and display window",
+        "forecast_as_of_date_",
         "forecast_plot_window_choice_",
         "capped_forecast_window_days(",
+        "default_forecast_as_of_date(",
+        "time_frame_until(",
         "windowed_time_frame(",
         "visible_comparison",
-        "Training still uses the full selected",
+        "look-ahead leakage",
+        "last_forecast_as_of_date",
     ]:
         if fragment not in source:
             raise SystemExit(f"Dashboard chart polish regression guard is missing: {fragment}")
@@ -168,6 +176,20 @@ def main() -> None:
     window_frame = pd.DataFrame({"signal": range(10)}, index=pd.date_range("2026-01-01", periods=10, freq="D"))
     if len(windowed_time_frame(window_frame, 3)) != 3:
         raise SystemExit("Forecast display window should trim time-series plots to the selected recent window.")
+    forecast_frame = pd.DataFrame({"signal": range(365)}, index=pd.date_range("2025-11-01", periods=365, freq="D"))
+    forecast_start, forecast_end = frame_time_bounds(forecast_frame)
+    if str(forecast_start.date()) != "2025-11-01" or str(forecast_end.date()) != "2026-10-31":
+        raise SystemExit("Forecast data scope should detect the full simulation dataset bounds.")
+    if str(default_forecast_as_of_date(forecast_frame, today=pd.Timestamp("2026-05-25"))) != "2026-05-25":
+        raise SystemExit("Forecast as-of date should default to today when today is inside the simulation dataset.")
+    forecast_cutoff = end_of_day_timestamp("2026-05-25")
+    available_rows = time_frame_until(forecast_frame, forecast_cutoff)
+    if str(available_rows.index.max().date()) != "2026-05-25" or len(available_rows) != 206:
+        raise SystemExit("Forecast training scope must use all rows through today and exclude future synthetic rows.")
+    if str(windowed_time_frame(forecast_frame, 1, end_at=forecast_cutoff).index.max().date()) != "2026-05-25":
+        raise SystemExit("Forecast display window must anchor to the selected as-of date, not the simulation end date.")
+    if str(windowed_time_frame(forecast_frame, 1, end_at=forecast_cutoff).index.min().date()) != "2026-05-25":
+        raise SystemExit("Daily forecast display should show today's day for a daily-indexed frame.")
 
     session = {"start_at_wall_s": 110.0, "duration_seconds": 20.0, "dt_seconds": 4}
     if live_market_status(session, now_s=100.0)["status"] != "scheduled":

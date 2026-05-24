@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import pandas as pd
+import streamlit as st
 from streamlit.elements.plotly_chart import PlotlyMixin
 
 from app import (
@@ -120,8 +121,12 @@ def main() -> None:
             raise SystemExit(f"Dashboard chart polish regression guard is missing: {fragment}")
     if not getattr(PlotlyMixin, "_coverly_download_exporter_installed", False):
         raise SystemExit("Streamlit Plotly renderer must be globally wrapped with figure export controls.")
+    if getattr(st.plotly_chart, "__func__", None) is not PlotlyMixin.plotly_chart:
+        raise SystemExit("Top-level st.plotly_chart must be rebound after wrapping PlotlyMixin.plotly_chart.")
     if "PlotlyMixin.plotly_chart = downloadable_plotly_chart" not in source:
         raise SystemExit("Every Streamlit Plotly chart must pass through the global downloadable renderer.")
+    if "st.plotly_chart = st._main.plotly_chart" not in source:
+        raise SystemExit("Plain st.plotly_chart calls must use the wrapped Streamlit main renderer.")
     if source.count(".plotly_chart(") + source.count("st.plotly_chart(") < 35:
         raise SystemExit("Dashboard plot coverage guard detected fewer Plotly renders than expected.")
     blocked_chart_apis = ["st.line_chart(", "st.bar_chart(", "st.area_chart(", "st.altair_chart(", "st.vega_lite_chart(", "st.pyplot("]

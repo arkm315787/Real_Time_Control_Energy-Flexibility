@@ -945,6 +945,7 @@ def render_plotly_download_controls(container, fig: go.Figure, key: object | Non
 
 def install_plotly_download_exporter() -> None:
     if getattr(PlotlyMixin, "_coverly_download_exporter_installed", False):
+        st.plotly_chart = st._main.plotly_chart
         return
     native_plotly_chart = PlotlyMixin.plotly_chart
 
@@ -958,6 +959,7 @@ def install_plotly_download_exporter() -> None:
         return result
 
     PlotlyMixin.plotly_chart = downloadable_plotly_chart
+    st.plotly_chart = st._main.plotly_chart
     PlotlyMixin._coverly_download_exporter_installed = True
 
 

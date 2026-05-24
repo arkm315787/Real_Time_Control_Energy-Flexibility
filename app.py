@@ -1338,6 +1338,40 @@ def forecast_performance_figure(comparison: pd.DataFrame, target: str) -> go.Fig
     return fig
 
 
+FORECAST_PLOT_WINDOW_DAYS = {
+    "Day": 1,
+    "Week": 7,
+    "Month": 30,
+}
+
+
+def capped_forecast_window_days(window_label: str, simulation_days: int) -> int:
+    requested_days = FORECAST_PLOT_WINDOW_DAYS.get(window_label, FORECAST_PLOT_WINDOW_DAYS["Week"])
+    return max(1, min(int(requested_days), int(max(simulation_days, 1))))
+
+
+def windowed_time_frame(frame: pd.DataFrame, window_days: int, timestamp_col: str | None = None) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    working = frame.copy()
+    if timestamp_col and timestamp_col in working.columns:
+        timestamps = pd.to_datetime(working[timestamp_col], errors="coerce")
+    else:
+        timestamps = pd.to_datetime(working.index, errors="coerce")
+    if timestamps.isna().all():
+        return working
+    end_at = timestamps.max()
+    cutoff = end_at - pd.Timedelta(days=max(int(window_days), 1))
+    visible = working.loc[timestamps > cutoff]
+    return visible if not visible.empty else working.tail(1)
+
+
+def forecast_window_caption(window_label: str, visible_days: int, simulation_days: int) -> str:
+    suffix = "" if visible_days == FORECAST_PLOT_WINDOW_DAYS.get(window_label, visible_days) else f" capped by the {simulation_days}-day simulation"
+    plural = "" if visible_days == 1 else "s"
+    return f"{window_label}: showing the latest {visible_days} day{plural}{suffix}."
+
+
 def forecast_revision_figure(forecast_trace: pd.DataFrame, target: str, max_iterations: int) -> go.Figure:
     fig = go.Figure()
     required = {"mpc_iteration", "issued_at", "horizon_timestamp", "horizon_step", target}
@@ -2606,6 +2640,26 @@ def main() -> None:
             st.error("LightGBM is not registered in this running app. Check that Streamlit is running this repository's app.py, not the older app.py in the parent Playground folder.")
         elif lgbm_status["tone"] == "warn":
             st.warning("The LightGBM option is visible, but this virtual environment cannot import native lightgbm. Run `pip install -r requirements.txt` inside `.venv` to enable the native LightGBM backend.")
+
+        st.markdown("#### Forecast display window")
+        display_cols = st.columns([1.2, 0.85, 0.95])
+        default_window_index = 1 if days >= FORECAST_PLOT_WINDOW_DAYS["Week"] else 0
+        forecast_window_choice = display_cols[0].radio(
+            "Plots show",
+            list(FORECAST_PLOT_WINDOW_DAYS),
+            index=default_window_index,
+            horizontal=True,
+            key=f"forecast_plot_window_choice_{APP_BUILD_ID}",
+        )
+        forecast_view_days = capped_forecast_window_days(forecast_window_choice, days)
+        forecast_points = max(1, int(round(forecast_view_days * 24 * 60 / max(freq_minutes, 1))))
+        display_cols[1].metric("Visible horizon", f"{forecast_view_days} day{'s' if forecast_view_days != 1 else ''}")
+        display_cols[2].metric("Training window", f"{days:,} days")
+        st.caption(
+            f"{forecast_window_caption(forecast_window_choice, forecast_view_days, days)} "
+            f"Training still uses the full selected {days:,}-day simulation; only time-series plots and preview tables are shortened."
+        )
+
         col1, col2, col3, col4, col5 = st.columns([1.35, 1.55, 1.65, 0.65, 0.95])
         target = col1.selectbox("Target", target_options, index=0)
         default_predictors = [
@@ -2630,7 +2684,8 @@ def main() -> None:
         lags = col4.slider("Lag depth", 1, 8, 4)
         max_horizon_steps = max(4, min(96, int((24 * 60) / max(freq_minutes, 1))))
         horizon_steps = col5.slider(f"Forecast horizon ({freq_minutes} min steps)", 1, max_horizon_steps, min(4, max_horizon_steps))
-        preview_fig = signal_line_figure(df, [target], f"Selected target history: {target}")
+        preview_df = windowed_time_frame(df, forecast_view_days).tail(forecast_points)
+        preview_fig = signal_line_figure(preview_df, [target], f"Selected target history: {target}")
         st.plotly_chart(apply_chart_style(preview_fig, template, height=260), use_container_width=True)
         if real_market_ready and target in market_columns:
             st.info(
@@ -2680,12 +2735,13 @@ def main() -> None:
                 f"{int(forecast_market_status.get('training_observations', 0) or 0):,}."
             )
 
-            pred_fig = forecast_performance_figure(comparison, str(spec_target))
+            visible_comparison = windowed_time_frame(comparison, forecast_view_days).tail(forecast_points)
+            pred_fig = forecast_performance_figure(visible_comparison, str(spec_target))
             st.plotly_chart(apply_chart_style(pred_fig, template, height=380, title=f"Forecast performance: {spec_target}"), use_container_width=True)
             quantile_cols = [col for col in comparison.columns if col.startswith("prediction_p")]
             if quantile_cols:
                 with st.expander("Forecast quantiles", expanded=False):
-                    st.dataframe(styled_dataframe(comparison[["actual", "prediction", *quantile_cols]].tail(48).round(3)), use_container_width=True, height=260)
+                    st.dataframe(styled_dataframe(visible_comparison[["actual", "prediction", *quantile_cols]].round(3)), use_container_width=True, height=260)
 
             if forecaster is not None and hasattr(forecaster, "get_feature_importance"):
                 importance = forecaster.get_feature_importance()

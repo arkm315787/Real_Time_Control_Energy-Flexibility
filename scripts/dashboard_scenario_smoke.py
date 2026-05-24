@@ -20,12 +20,14 @@ from streamlit.elements.plotly_chart import PlotlyMixin
 
 from app import (
     build_live_market_feed,
+    capped_forecast_window_days,
     default_scenario_inputs,
     live_market_status,
     live_visible_frame,
     portfolio_bundle_is_current,
     scenario_portfolio_signature,
     upper_socket_metrics,
+    windowed_time_frame,
 )
 from flexihome.core.market_simulator import MarketSimulator, MarketSimulatorConfig
 
@@ -116,6 +118,12 @@ def main() -> None:
         'download_button(',
         '"Viewable HTML"',
         '"Plotly figure"',
+        "Forecast display window",
+        "forecast_plot_window_choice_",
+        "capped_forecast_window_days(",
+        "windowed_time_frame(",
+        "visible_comparison",
+        "Training still uses the full selected",
     ]:
         if fragment not in source:
             raise SystemExit(f"Dashboard chart polish regression guard is missing: {fragment}")
@@ -153,6 +161,13 @@ def main() -> None:
         raise SystemExit("Settlement tab should use an auto-refreshing fragment for live lower-MPC replay state.")
     if "real_time_preview_source" not in source or "Replay feed" not in source:
         raise SystemExit("Dashboard must surface whether the 4-second market replay uses synthetic or real activation data.")
+    if capped_forecast_window_days("Month", 191) != 30:
+        raise SystemExit("Monthly forecast display window should show one month, not the full long simulation.")
+    if capped_forecast_window_days("Month", 12) != 12:
+        raise SystemExit("Forecast display windows must be capped by the selected simulation length.")
+    window_frame = pd.DataFrame({"signal": range(10)}, index=pd.date_range("2026-01-01", periods=10, freq="D"))
+    if len(windowed_time_frame(window_frame, 3)) != 3:
+        raise SystemExit("Forecast display window should trim time-series plots to the selected recent window.")
 
     session = {"start_at_wall_s": 110.0, "duration_seconds": 20.0, "dt_seconds": 4}
     if live_market_status(session, now_s=100.0)["status"] != "scheduled":

@@ -900,6 +900,7 @@ def plotly_download_config(fig: go.Figure | None, config: Dict[str, object] | No
     image_options.setdefault("filename", plotly_export_name(fig, key) if fig is not None else "coverly-chart")
     image_options.setdefault("scale", 2)
     merged["toImageButtonOptions"] = image_options
+    merged.setdefault("displayModeBar", True)
     merged.setdefault("displaylogo", False)
     merged.setdefault("responsive", True)
     return merged
@@ -923,18 +924,18 @@ def render_plotly_download_controls(container, fig: go.Figure, key: object | Non
         config=plotly_download_config(fig, key=key),
     ).encode("utf-8")
     json_bytes = fig.to_json(pretty=True).encode("utf-8")
-    host = container.popover("Download chart") if hasattr(container, "popover") else container.expander("Download chart", expanded=False)
+    host = container.popover("Export / view figure") if hasattr(container, "popover") else container.expander("Export / view figure", expanded=False)
     with host:
         left, right = st.columns(2)
         left.download_button(
-            "Interactive HTML",
+            "Viewable HTML",
             data=html_bytes,
             file_name=f"{base_name}.html",
             mime="text/html",
             key=f"{widget_key}-html",
         )
         right.download_button(
-            "Plotly JSON",
+            "Plotly figure",
             data=json_bytes,
             file_name=f"{base_name}.json",
             mime="application/json",

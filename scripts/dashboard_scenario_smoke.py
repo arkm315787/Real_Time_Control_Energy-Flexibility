@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import pandas as pd
+from streamlit.elements.plotly_chart import PlotlyMixin
 
 from app import (
     build_live_market_feed,
@@ -107,15 +108,26 @@ def main() -> None:
         "PlotlyMixin.plotly_chart",
         "plotly_download_config(",
         '"toImageButtonOptions"',
-        'container.popover("Download chart")',
+        '"displayModeBar"',
+        'container.popover("Export / view figure")',
         'fig.to_html(',
         'fig.to_json(',
         'download_button(',
-        '"Interactive HTML"',
-        '"Plotly JSON"',
+        '"Viewable HTML"',
+        '"Plotly figure"',
     ]:
         if fragment not in source:
             raise SystemExit(f"Dashboard chart polish regression guard is missing: {fragment}")
+    if not getattr(PlotlyMixin, "_coverly_download_exporter_installed", False):
+        raise SystemExit("Streamlit Plotly renderer must be globally wrapped with figure export controls.")
+    if "PlotlyMixin.plotly_chart = downloadable_plotly_chart" not in source:
+        raise SystemExit("Every Streamlit Plotly chart must pass through the global downloadable renderer.")
+    if source.count(".plotly_chart(") + source.count("st.plotly_chart(") < 35:
+        raise SystemExit("Dashboard plot coverage guard detected fewer Plotly renders than expected.")
+    blocked_chart_apis = ["st.line_chart(", "st.bar_chart(", "st.area_chart(", "st.altair_chart(", "st.vega_lite_chart(", "st.pyplot("]
+    blocked = [api for api in blocked_chart_apis if api in source]
+    if blocked:
+        raise SystemExit(f"Dashboard plots must use the export-wrapped Plotly renderer, found: {blocked}")
     if 'st.session_state.pop("live_lower_result", None)\n            st.session_state["mpc_phase"] = "upper" if upper_market_ready else "idle"' in source:
         raise SystemExit("Stop Simulated Market must preserve the latest live lower-MPC result for post-stop review.")
     if '[data-testid="stDataFrame"] canvas' in source or '[data-testid="stDataFrame"],\n            [data-testid="stTable"]' in source:

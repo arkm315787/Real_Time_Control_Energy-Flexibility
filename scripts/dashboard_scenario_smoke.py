@@ -104,6 +104,15 @@ def main() -> None:
         "plot_sankey(summary, template)",
         '"stopped_at_wall_s"',
         '"stopped_reason"',
+        "PlotlyMixin.plotly_chart",
+        "plotly_download_config(",
+        '"toImageButtonOptions"',
+        'container.popover("Download chart")',
+        'fig.to_html(',
+        'fig.to_json(',
+        'download_button(',
+        '"Interactive HTML"',
+        '"Plotly JSON"',
     ]:
         if fragment not in source:
             raise SystemExit(f"Dashboard chart polish regression guard is missing: {fragment}")

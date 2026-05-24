@@ -20,6 +20,7 @@ models, and a receding-horizon MPC-style optimizer built with PuLP.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from html import escape
@@ -31,6 +32,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit.elements.plotly_chart import PlotlyMixin
 from plotly.subplots import make_subplots
 from flexihome.core.base.registry import get_global_registry
 from flexihome.core.engine import (
@@ -881,6 +883,84 @@ def apply_chart_style(fig: go.Figure, template: str, height: int | None = None, 
         automargin=True,
     )
     return fig
+
+
+def plotly_export_name(fig: go.Figure, key: object | None = None) -> str:
+    title = fig.layout.title.text if fig.layout.title and fig.layout.title.text else None
+    raw_name = key or title or "coverly-chart"
+    raw_name = re.sub(r"<[^>]+>", "", str(raw_name))
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", raw_name).strip("-").lower()
+    return (slug or "coverly-chart")[:72]
+
+
+def plotly_download_config(fig: go.Figure | None, config: Dict[str, object] | None = None, key: object | None = None) -> Dict[str, object]:
+    merged = dict(config or {})
+    image_options = dict(merged.get("toImageButtonOptions") or {})
+    image_options.setdefault("format", "png")
+    image_options.setdefault("filename", plotly_export_name(fig, key) if fig is not None else "coverly-chart")
+    image_options.setdefault("scale", 2)
+    merged["toImageButtonOptions"] = image_options
+    merged.setdefault("displaylogo", False)
+    merged.setdefault("responsive", True)
+    return merged
+
+
+def as_plotly_figure(figure_or_data: object) -> go.Figure | None:
+    if isinstance(figure_or_data, go.Figure):
+        return figure_or_data
+    try:
+        return go.Figure(figure_or_data)
+    except (TypeError, ValueError):
+        return None
+
+
+def render_plotly_download_controls(container, fig: go.Figure, key: object | None = None) -> None:
+    base_name = plotly_export_name(fig, key)
+    widget_key = f"{base_name}-{id(fig):x}"
+    html_bytes = fig.to_html(
+        include_plotlyjs="cdn",
+        full_html=True,
+        config=plotly_download_config(fig, key=key),
+    ).encode("utf-8")
+    json_bytes = fig.to_json(pretty=True).encode("utf-8")
+    host = container.popover("Download chart") if hasattr(container, "popover") else container.expander("Download chart", expanded=False)
+    with host:
+        left, right = st.columns(2)
+        left.download_button(
+            "Interactive HTML",
+            data=html_bytes,
+            file_name=f"{base_name}.html",
+            mime="text/html",
+            key=f"{widget_key}-html",
+        )
+        right.download_button(
+            "Plotly JSON",
+            data=json_bytes,
+            file_name=f"{base_name}.json",
+            mime="application/json",
+            key=f"{widget_key}-json",
+        )
+
+
+def install_plotly_download_exporter() -> None:
+    if getattr(PlotlyMixin, "_coverly_download_exporter_installed", False):
+        return
+    native_plotly_chart = PlotlyMixin.plotly_chart
+
+    def downloadable_plotly_chart(self, figure_or_data=None, *args, **kwargs):
+        fig = as_plotly_figure(figure_or_data)
+        key = kwargs.get("key")
+        kwargs["config"] = plotly_download_config(fig, kwargs.get("config"), key)
+        result = native_plotly_chart(self, figure_or_data, *args, **kwargs)
+        if fig is not None:
+            render_plotly_download_controls(self, fig, key=key)
+        return result
+
+    PlotlyMixin.plotly_chart = downloadable_plotly_chart
+    PlotlyMixin._coverly_download_exporter_installed = True
+
+
+install_plotly_download_exporter()
 
 
 def make_progress_tracker(

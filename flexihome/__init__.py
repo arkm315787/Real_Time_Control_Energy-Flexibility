@@ -1,2 +1,2 @@
-"""Coverly application package."""
+"""Residential VPP application package."""
 

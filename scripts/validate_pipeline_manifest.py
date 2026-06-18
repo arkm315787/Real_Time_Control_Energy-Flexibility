@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Validate the latest Coverly artifact directory.")
+    parser = argparse.ArgumentParser(description="Validate the latest Residential VPP artifact directory.")
     parser.add_argument("--root", default="runs")
     parser.add_argument("--prefix", required=True, help="Run directory prefix, such as pipeline, market_data, forecast, or optimization.")
     parser.add_argument("--require-file", action="append", default=[])

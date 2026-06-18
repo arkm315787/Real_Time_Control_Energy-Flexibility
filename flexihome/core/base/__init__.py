@@ -1,4 +1,4 @@
-"""Base plugin interfaces for Coverly."""
+"""Base plugin interfaces for Residential VPP."""
 
 from .data_pipeline import BasePipelineStage, PipelineContext, PipelineOrchestrator
 from .forecaster import BaseForecaster, ForecastMetrics

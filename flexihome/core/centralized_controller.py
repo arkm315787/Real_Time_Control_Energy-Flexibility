@@ -1,4 +1,4 @@
-"""Centralized household roster and 4-second MPC dispatch for Coverly."""
+"""Centralized household roster and 4-second MPC dispatch for Residential VPP."""
 
 from __future__ import annotations
 

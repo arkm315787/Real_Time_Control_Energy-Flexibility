@@ -27,7 +27,7 @@ def main() -> None:
 
     store = TimescaleOptimizationStore(
         dsn=dsn,
-        schema=os.getenv("FLEXIHOME_TIMESCALE_SCHEMA", "coverly").strip() or "coverly",
+        schema=os.getenv("FLEXIHOME_TIMESCALE_SCHEMA", "residential_vpp").strip() or "residential_vpp",
     )
     optimization_id = new_optimization_id()
     store.create(

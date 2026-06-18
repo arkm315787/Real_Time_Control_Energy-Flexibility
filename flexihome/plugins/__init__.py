@@ -1,4 +1,4 @@
-"""Bundled Coverly plugin registration."""
+"""Bundled Residential VPP plugin registration."""
 
 from flexihome.core.base.registry import PluginRegistry, get_global_registry
 

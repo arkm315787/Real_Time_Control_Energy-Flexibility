@@ -124,7 +124,7 @@ class TimescaleOptimizationStore:
     def __init__(
         self,
         dsn: str,
-        schema: str = "coverly",
+        schema: str = "residential_vpp",
         jobs_table: str = "optimization_jobs",
         events_table: str = "optimization_job_events",
     ) -> None:
@@ -422,7 +422,7 @@ def build_optimization_store() -> OptimizationStore:
     try:
         return TimescaleOptimizationStore(
             dsn=dsn,
-            schema=os.getenv("FLEXIHOME_TIMESCALE_SCHEMA", "coverly").strip() or "coverly",
+            schema=os.getenv("FLEXIHOME_TIMESCALE_SCHEMA", "residential_vpp").strip() or "residential_vpp",
             jobs_table=os.getenv("FLEXIHOME_TIMESCALE_JOBS_TABLE", "optimization_jobs").strip()
             or "optimization_jobs",
             events_table=os.getenv("FLEXIHOME_TIMESCALE_EVENTS_TABLE", "optimization_job_events").strip()

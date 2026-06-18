@@ -1,4 +1,4 @@
-"""Shared Coverly core logic."""
+"""Shared Residential VPP core logic."""
 
 from .engine import (
     FINGRID_RULES,

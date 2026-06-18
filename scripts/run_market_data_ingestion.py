@@ -18,7 +18,7 @@ from flexihome.pipeline.stages import FeatureEngineeringStage, MarketDataIngesti
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the Coverly incoming market-data pipeline slice.")
+    parser = argparse.ArgumentParser(description="Run the Residential VPP incoming market-data pipeline slice.")
     parser.add_argument("--start-date", default="2026-01-15")
     parser.add_argument("--days", type=int, default=2)
     parser.add_argument("--n-homes", type=int, default=80)

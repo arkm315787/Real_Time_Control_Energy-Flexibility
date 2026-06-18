@@ -1,12 +1,12 @@
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg17
-    container_name: coverly-timescaledb
+    container_name: residential_vpp-timescaledb
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${TIMESCALE_POSTGRES_USER:-coverly}
-      POSTGRES_PASSWORD: ${TIMESCALE_POSTGRES_PASSWORD:-coverly}
-      POSTGRES_DB: ${TIMESCALE_POSTGRES_DB:-coverly}
+      POSTGRES_USER: ${TIMESCALE_POSTGRES_USER:-residential_vpp}
+      POSTGRES_PASSWORD: ${TIMESCALE_POSTGRES_PASSWORD:-residential_vpp}
+      POSTGRES_DB: ${TIMESCALE_POSTGRES_DB:-residential_vpp}
       TIMESCALEDB_TELEMETRY: "off"
     ports:
       - "127.0.0.1:${TIMESCALE_POSTGRES_PORT:-5432}:5432"
@@ -16,7 +16,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "pg_isready -U ${TIMESCALE_POSTGRES_USER:-coverly} -d ${TIMESCALE_POSTGRES_DB:-coverly}",
+          "pg_isready -U ${TIMESCALE_POSTGRES_USER:-residential_vpp} -d ${TIMESCALE_POSTGRES_DB:-residential_vpp}",
         ]
       interval: 5s
       timeout: 5s
@@ -24,7 +24,7 @@ services:
 
   airflow-postgres:
     image: postgres:16
-    container_name: coverly-airflow-postgres
+    container_name: residential_vpp-airflow-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${AIRFLOW_POSTGRES_USER:-airflow}
@@ -46,8 +46,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.airflow
-    image: coverly-airflow:local
-    container_name: coverly-airflow-init
+    image: residential_vpp-airflow:local
+    container_name: residential_vpp-airflow-init
     depends_on:
       airflow-postgres:
         condition: service_healthy
@@ -56,7 +56,7 @@ services:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_POSTGRES_USER:-airflow}:${AIRFLOW_POSTGRES_PASSWORD:-airflow}@airflow-postgres:5432/${AIRFLOW_POSTGRES_DB:-airflow}
-      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-coverly-local-airflow-secret}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-residential_vpp-local-airflow-secret}
       PYTHONPATH: /opt/airflow/project
       ENTSOE_API_KEY: ${ENTSOE_API_KEY:-}
       FINGRID_API_KEY: ${FINGRID_API_KEY:-}
@@ -70,12 +70,12 @@ services:
       bash -c "airflow db migrate &&
       airflow users create --username ${AIRFLOW_ADMIN_USER:-admin}
       --password ${AIRFLOW_ADMIN_PASSWORD:-admin}
-      --firstname Coverly --lastname Admin
+      --firstname Residential --lastname VPP
       --role Admin --email ${AIRFLOW_ADMIN_EMAIL:-admin@example.com} || true"
 
   airflow-webserver:
-    image: coverly-airflow:local
-    container_name: coverly-airflow-webserver
+    image: residential_vpp-airflow:local
+    container_name: residential_vpp-airflow-webserver
     restart: unless-stopped
     depends_on:
       airflow-init:
@@ -85,7 +85,7 @@ services:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_POSTGRES_USER:-airflow}:${AIRFLOW_POSTGRES_PASSWORD:-airflow}@airflow-postgres:5432/${AIRFLOW_POSTGRES_DB:-airflow}
-      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-coverly-local-airflow-secret}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-residential_vpp-local-airflow-secret}
       PYTHONPATH: /opt/airflow/project
       ENTSOE_API_KEY: ${ENTSOE_API_KEY:-}
       FINGRID_API_KEY: ${FINGRID_API_KEY:-}
@@ -105,8 +105,8 @@ services:
       retries: 20
 
   airflow-scheduler:
-    image: coverly-airflow:local
-    container_name: coverly-airflow-scheduler
+    image: residential_vpp-airflow:local
+    container_name: residential_vpp-airflow-scheduler
     restart: unless-stopped
     depends_on:
       airflow-init:
@@ -116,7 +116,7 @@ services:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_POSTGRES_USER:-airflow}:${AIRFLOW_POSTGRES_PASSWORD:-airflow}@airflow-postgres:5432/${AIRFLOW_POSTGRES_DB:-airflow}
-      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-coverly-local-airflow-secret}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-residential_vpp-local-airflow-secret}
       PYTHONPATH: /opt/airflow/project
       ENTSOE_API_KEY: ${ENTSOE_API_KEY:-}
       FINGRID_API_KEY: ${FINGRID_API_KEY:-}

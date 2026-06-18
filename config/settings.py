@@ -26,7 +26,7 @@ class AppSettings:
         return cls(
             entsoe_api_key=os.getenv("ENTSOE_API_KEY") or os.getenv("ENTSOE_SECURITY_TOKEN"),
             fingrid_api_key=os.getenv("FINGRID_API_KEY") or os.getenv("FINGRID_OPENDATA_API_KEY"),
-            market_data_cache_ttl_seconds=int(os.getenv("COVERLY_MARKET_CACHE_TTL_SECONDS", "900")),
-            market_data_cache_dir=os.getenv("COVERLY_MARKET_CACHE_DIR", ".cache/market_data"),
-            default_market_lookback_days=int(os.getenv("COVERLY_MARKET_LOOKBACK_DAYS", "90")),
+            market_data_cache_ttl_seconds=int(os.getenv("RESIDENTIAL_VPP_MARKET_CACHE_TTL_SECONDS", "900")),
+            market_data_cache_dir=os.getenv("RESIDENTIAL_VPP_MARKET_CACHE_DIR", ".cache/market_data"),
+            default_market_lookback_days=int(os.getenv("RESIDENTIAL_VPP_MARKET_LOOKBACK_DAYS", "90")),
         )

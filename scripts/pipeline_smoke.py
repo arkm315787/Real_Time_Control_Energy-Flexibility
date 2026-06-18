@@ -1,4 +1,4 @@
-"""Smoke-test the explicit Coverly pipeline DAG and artifact manifest."""
+"""Smoke-test the explicit Residential VPP pipeline DAG and artifact manifest."""
 
 from __future__ import annotations
 

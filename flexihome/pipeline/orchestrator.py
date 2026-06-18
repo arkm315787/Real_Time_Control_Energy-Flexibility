@@ -1,4 +1,4 @@
-"""Pipeline sequencing for Coverly production workflows."""
+"""Pipeline sequencing for Residential VPP production workflows."""
 
 from __future__ import annotations
 

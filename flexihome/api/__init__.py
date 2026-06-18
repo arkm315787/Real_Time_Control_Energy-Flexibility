@@ -1,2 +1,2 @@
-"""FastAPI surface for Coverly."""
+"""FastAPI surface for Residential VPP."""
 

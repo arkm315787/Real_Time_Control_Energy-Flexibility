@@ -1,4 +1,4 @@
-# Coverly Production Application Guide
+# Residential VPP Production Application Guide
 
 **Repository:** `Real_Time_Control_Energy-Flexibility`  
 **Current working branch:** `codex-fastapi-api-layer`  
@@ -11,7 +11,7 @@
 ## Table Of Contents
 
 1. Executive Summary
-2. What Problem Coverly Solves
+2. What Problem Residential VPP Solves
 3. The Big Picture In Plain Language
 4. Main Application Components
 5. End-To-End Workflow
@@ -43,7 +43,7 @@
 
 ## 1. Executive Summary
 
-Coverly is an application for studying and operating aggregated residential energy flexibility. In simple words, it asks:
+Residential VPP is an application for studying and operating aggregated residential energy flexibility. In simple words, it asks:
 
 > If many homes have flexible devices such as electric vehicles, batteries, solar panels, and smart heating or cooling systems, can those homes act together like a small virtual power plant and help the electricity grid?
 
@@ -59,15 +59,15 @@ The application has grown from an educational dashboard into a production-style 
 - **Docker Compose** services for TimescaleDB and Airflow.
 - **GitHub CI checks** that compile and smoke-test important parts of the application.
 
-At a high level, Coverly produces or fetches data, forecasts future grid and market conditions, chooses how the flexible devices should behave, checks whether the result looks compliant with simplified Fingrid reserve-market rules, and presents the result visually.
+At a high level, Residential VPP produces or fetches data, forecasts future grid and market conditions, chooses how the flexible devices should behave, checks whether the result looks compliant with simplified Fingrid reserve-market rules, and presents the result visually.
 
 ---
 
-## 2. What Problem Coverly Solves
+## 2. What Problem Residential VPP Solves
 
 Electricity grids need balance. At every moment, generation and consumption must be close. If demand rises suddenly or generation drops, grid operators need flexible resources that can respond.
 
-Traditionally, this flexibility comes from large power plants, industrial loads, or grid-scale batteries. Coverly explores another idea:
+Traditionally, this flexibility comes from large power plants, industrial loads, or grid-scale batteries. Residential VPP explores another idea:
 
 > A large number of ordinary homes can be aggregated into a coordinated portfolio. Together, their devices can provide measurable grid support.
 
@@ -146,7 +146,7 @@ flowchart TB
     Operator["Operator or external system"] --> API["FastAPI service"]
     Scheduler["Airflow scheduler"] --> Pipelines["Production pipeline scripts"]
 
-    Dashboard --> Core["Shared Coverly core"]
+    Dashboard --> Core["Shared Residential VPP core"]
     API --> Core
     Pipelines --> Core
 
@@ -699,7 +699,7 @@ For production exploration, `auto` is useful. For strict validation, `real` is u
 
 Forecasting means predicting a future value from past and current data.
 
-In Coverly, forecasting is used because the optimizer needs to plan ahead. It cannot only know the present. It needs estimates of future:
+In Residential VPP, forecasting is used because the optimizer needs to plan ahead. It cannot only know the present. It needs estimates of future:
 
 - Net baseline load.
 - PV availability.
@@ -813,7 +813,7 @@ If the formal solver fails, the application has a heuristic fallback. That means
 
 MPC means Model Predictive Control.
 
-Coverly uses a receding-horizon pattern:
+Residential VPP uses a receding-horizon pattern:
 
 1. Forecast the next horizon, for example 24 hours.
 2. Optimize the schedule for that horizon.
@@ -850,7 +850,7 @@ sequenceDiagram
 
 The outer MPC typically works at the dashboard timestep, often 15 minutes. But aFRR signals can update every 4 seconds.
 
-Coverly therefore simulates an inner controller:
+Residential VPP therefore simulates an inner controller:
 
 - It receives the planned reserve allocation from the optimizer.
 - It receives a 4-second activation signal.
@@ -1219,9 +1219,9 @@ Tables:
 
 | Table | Purpose |
 | --- | --- |
-| `coverly.optimization_jobs` | Latest job status, request, result, error, timestamps |
-| `coverly.optimization_job_events` | Time-series event log for queued/running/completed/failed lifecycle |
-| `coverly.market_data_observations` | Optional raw market observations |
+| `residential_vpp.optimization_jobs` | Latest job status, request, result, error, timestamps |
+| `residential_vpp.optimization_job_events` | Time-series event log for queued/running/completed/failed lifecycle |
+| `residential_vpp.market_data_observations` | Optional raw market observations |
 
 ### 16.3 Why TimescaleDB
 
@@ -1265,7 +1265,7 @@ airflow/dags/flexihome_airflow_common.py
 
 Production defaults:
 
-- Owner: `Coverly`
+- Owner: `Residential VPP`
 - Retries: 2
 - Retry delay: 5 minutes
 - SLA: 1 hour
@@ -1383,11 +1383,11 @@ compose.yaml
 
 | Service | Container | Role |
 | --- | --- | --- |
-| `timescaledb` | `coverly-timescaledb` | Stores optimization jobs and market observations |
-| `airflow-postgres` | `coverly-airflow-postgres` | Airflow metadata database |
-| `airflow-init` | `coverly-airflow-init` | Initializes Airflow database and admin user |
-| `airflow-webserver` | `coverly-airflow-webserver` | Airflow UI |
-| `airflow-scheduler` | `coverly-airflow-scheduler` | Runs scheduled DAG tasks |
+| `timescaledb` | `residential_vpp-timescaledb` | Stores optimization jobs and market observations |
+| `airflow-postgres` | `residential_vpp-airflow-postgres` | Airflow metadata database |
+| `airflow-init` | `residential_vpp-airflow-init` | Initializes Airflow database and admin user |
+| `airflow-webserver` | `residential_vpp-airflow-webserver` | Airflow UI |
+| `airflow-scheduler` | `residential_vpp-airflow-scheduler` | Runs scheduled DAG tasks |
 
 ### 18.2 Ports
 
@@ -1426,7 +1426,7 @@ It installs:
 requirements-airflow.txt
 ```
 
-This gives Airflow enough Python packages to run the Coverly scripts.
+This gives Airflow enough Python packages to run the Residential VPP scripts.
 
 ---
 
@@ -1469,8 +1469,8 @@ docker compose up -d timescaledb
 Then set:
 
 ```cmd
-set FLEXIHOME_TIMESCALE_DSN=postgresql://coverly:coverly@127.0.0.1:5432/coverly
-set FLEXIHOME_TIMESCALE_SCHEMA=coverly
+set FLEXIHOME_TIMESCALE_DSN=postgresql://residential_vpp:residential_vpp@127.0.0.1:5432/residential_vpp
+set FLEXIHOME_TIMESCALE_SCHEMA=residential_vpp
 python scripts\timescale_store_smoke.py
 ```
 
@@ -1534,8 +1534,8 @@ FLEXIHOME_MARKET_DATA_MODE=auto
 For database persistence:
 
 ```text
-FLEXIHOME_TIMESCALE_DSN=postgresql://coverly:coverly@timescaledb:5432/coverly
-FLEXIHOME_TIMESCALE_SCHEMA=coverly
+FLEXIHOME_TIMESCALE_DSN=postgresql://residential_vpp:residential_vpp@timescaledb:5432/residential_vpp
+FLEXIHOME_TIMESCALE_SCHEMA=residential_vpp
 ```
 
 ### Step 3: Start Infrastructure
@@ -1767,7 +1767,7 @@ python scripts\timescale_store_smoke.py
 
 ## 24. Common Questions And Explanations
 
-### Is Coverly controlling real homes?
+### Is Residential VPP controlling real homes?
 
 No. It currently simulates a virtual residential portfolio. It is designed for research, education, architecture development, and production planning.
 
@@ -1956,11 +1956,11 @@ Invoke-RestMethod "http://localhost:8000$($job.results_url)"
 
 Here is a simple explanation:
 
-> Coverly is a virtual power plant prototype for residential flexibility. It simulates many homes with EVs, batteries, solar panels, and smart HVAC. It can use synthetic market conditions or real ENTSO-E and Fingrid market data. It forecasts future load, solar, prices, and activation signals. Then it uses an optimizer to decide how the home portfolio should bid into FCR-N and aFRR reserve markets while respecting comfort, battery, EV, and response-speed constraints. The results can be explored in a dashboard, requested through an API, stored in a database, or orchestrated in production-style Airflow DAGs. The system now has plugins, explicit pipeline contracts, artifact manifests, Docker services, and GitHub CI checks, so it is moving from an educational app toward a production-ready architecture.
+> Residential VPP is a virtual power plant prototype for residential flexibility. It simulates many homes with EVs, batteries, solar panels, and smart HVAC. It can use synthetic market conditions or real ENTSO-E and Fingrid market data. It forecasts future load, solar, prices, and activation signals. Then it uses an optimizer to decide how the home portfolio should bid into FCR-N and aFRR reserve markets while respecting comfort, battery, EV, and response-speed constraints. The results can be explored in a dashboard, requested through an API, stored in a database, or orchestrated in production-style Airflow DAGs. The system now has plugins, explicit pipeline contracts, artifact manifests, Docker services, and GitHub CI checks, so it is moving from an educational app toward a production-ready architecture.
 
 For a very short version:
 
-> Coverly shows how thousands of small home devices can be coordinated like one flexible energy resource for grid balancing markets.
+> Residential VPP shows how thousands of small home devices can be coordinated like one flexible energy resource for grid balancing markets.
 
 For a technical but still understandable version:
 
@@ -1970,7 +1970,7 @@ For a technical but still understandable version:
 
 ## Closing Note
 
-Coverly is now best understood as three layers:
+Residential VPP is now best understood as three layers:
 
 1. **User and operator layer:** dashboard, API, Airflow UI.
 2. **Decision layer:** forecasting, optimization, tracking, compliance.

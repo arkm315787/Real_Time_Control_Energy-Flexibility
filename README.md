@@ -1,12 +1,12 @@
-# Coverly VPP
+# Residential VPP
 
-Coverly is a development-stage Virtual Power Plant platform for residential energy flexibility. The current system models how aggregated homes with BESS, EV, HVAC, and PV resources can be forecasted, selected, and dispatched for Fingrid-oriented reserve products.
+Residential VPP is a development-stage Virtual Power Plant platform for residential energy flexibility. The current system models how aggregated homes with BESS, EV, HVAC, and PV resources can be forecasted, selected, and dispatched for Fingrid-oriented reserve products.
 
 This branch, `vpp-mvp-market-corrections`, is the active VPP MVP market/control branch. It builds on the `codex-fastapi-api-layer` API and pipeline foundation, then adds Fingrid-oriented market participation, risk-aware bidding, VPP technical audit screens, and the production-style 4-second centralized controller simulation.
 
 ## Product Direction
 
-Coverly is moving from a research dashboard toward a startup-grade VPP software foundation:
+Residential VPP is moving from a research dashboard toward a startup-grade VPP software foundation:
 
 - centralized portfolio optimization for residential flexibility
 - traceable household and appliance participation
@@ -23,7 +23,7 @@ The compliance layer is therefore a prequalification-prep screen, not a certific
 
 ## Current Control Architecture
 
-Coverly uses a centralized two-layer control structure.
+Residential VPP uses a centralized two-layer control structure.
 
 ```text
 Market and portfolio data
@@ -328,13 +328,13 @@ Configure the API:
 
 ```cmd
 set FLEXIHOME_JOB_STORE=timescale
-set FLEXIHOME_TIMESCALE_DSN=postgresql://coverly:coverly@localhost:5432/coverly
+set FLEXIHOME_TIMESCALE_DSN=postgresql://residential_vpp:residential_vpp@localhost:5432/residential_vpp
 python scripts\run_api.py --reload
 ```
 
 If the DSN is configured but unavailable, the API falls back to in-memory storage unless `FLEXIHOME_TIMESCALE_STRICT=1` is set.
 
-Compatibility note: the public product name is now Coverly, while the Python package path `flexihome` and existing `FLEXIHOME_*` environment-variable names are retained so older scripts and deployments do not break.
+Compatibility note: the public product name is now Residential VPP, while the Python package path `flexihome` and existing `FLEXIHOME_*` environment-variable names are retained so older scripts and deployments do not break.
 
 ## Airflow Orchestration
 

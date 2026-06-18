@@ -1,4 +1,4 @@
-"""Explicit data and artifact contracts for Coverly pipelines."""
+"""Explicit data and artifact contracts for Residential VPP pipelines."""
 
 from __future__ import annotations
 

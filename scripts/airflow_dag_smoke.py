@@ -1,4 +1,4 @@
-"""Static smoke checks for Coverly Airflow DAG definitions.
+"""Static smoke checks for Residential VPP Airflow DAG definitions.
 
 This avoids requiring Airflow in the normal development environment while still
 checking that production DAG files, retry/SLA settings, and plugin parameters

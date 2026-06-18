@@ -1,4 +1,4 @@
-"""Base forecasting plugin contracts for Coverly."""
+"""Base forecasting plugin contracts for Residential VPP."""
 
 from __future__ import annotations
 

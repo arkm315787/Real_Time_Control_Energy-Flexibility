@@ -1,4 +1,4 @@
-"""Core Coverly modeling, forecasting, and optimization logic.
+"""Core Residential VPP modeling, forecasting, and optimization logic.
 
 This module is intentionally free of Streamlit imports so it can be shared by
 the Streamlit dashboard, FastAPI service, tests, and future worker processes.
@@ -1940,7 +1940,7 @@ def solve_mpc_step(
         "PV": 1.0 if RESOURCE_RESPONSE_SECONDS["PV"] <= FINGRID_RULES["aFRR"]["full_activation_seconds"] else 0.0,
     }
 
-    problem = LpProblem("Coverly_MPC", LpMaximize)
+    problem = LpProblem("Residential_VPP_MPC", LpMaximize)
     idxs = list(range(horizon))
 
     soc_b = LpVariable.dicts("soc_b", range(horizon + 1), lowBound=0)
@@ -3869,7 +3869,7 @@ def make_pdf_summary(summary: Dict[str, float], compliance: Dict[str, float], co
     y = height - 40
 
     lines = [
-        "Coverly MPC Formulation Summary",
+        "Residential VPP MPC Formulation Summary",
         "",
         f"Market mode: {config['market_mode']}",
         f"Resource mode: {config['resource_mode']}",

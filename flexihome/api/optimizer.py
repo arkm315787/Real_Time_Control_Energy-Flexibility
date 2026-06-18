@@ -1,4 +1,4 @@
-"""FastAPI API layer for the Coverly optimizer."""
+"""FastAPI API layer for the Residential VPP optimizer."""
 
 from __future__ import annotations
 
@@ -33,9 +33,9 @@ from flexihome.plugins import register_default_plugins
 register_default_plugins()
 register_pipeline_stages()
 app = FastAPI(
-    title="Coverly Optimizer",
+    title="Residential VPP Optimizer",
     version="1.0.0",
-    description="Machine-readable API for Coverly forecasting and MPC optimization.",
+    description="Machine-readable API for Residential VPP forecasting and MPC optimization.",
 )
 STORE = build_optimization_store()
 
@@ -43,7 +43,7 @@ STORE = build_optimization_store()
 @app.get("/")
 async def root() -> dict:
     return {
-        "service": "Coverly Optimizer",
+        "service": "Residential VPP Optimizer",
         "version": "1.0.0",
         "docs_url": "/docs",
         "health_url": "/health",
@@ -154,13 +154,13 @@ async def get_metrics() -> str:
 
     metrics = STORE.metrics()
     lines = [
-        "# HELP coverly_optimization_jobs Number of optimization jobs by status.",
-        "# TYPE coverly_optimization_jobs gauge",
+        "# HELP residential_vpp_optimization_jobs Number of optimization jobs by status.",
+        "# TYPE residential_vpp_optimization_jobs gauge",
     ]
     for status, value in metrics.items():
         if status == "total":
             continue
-        lines.append(f'coverly_optimization_jobs{{status="{status}"}} {value}')
-    lines.append(f"coverly_optimization_jobs_total {metrics['total']}")
+        lines.append(f'residential_vpp_optimization_jobs{{status="{status}"}} {value}')
+    lines.append(f"residential_vpp_optimization_jobs_total {metrics['total']}")
     return "\n".join(lines) + "\n"
 

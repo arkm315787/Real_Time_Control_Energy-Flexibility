@@ -1,8 +1,8 @@
-# Coverly: Docker, Airflow, and Application Architecture - Detailed Explanation
+# Residential VPP: Docker, Airflow, and Application Architecture - Detailed Explanation
 
 ## 1. WHERE YOUR APPLICATION ACTUALLY LIVES
 
-Your Coverly application exists in **THREE DIFFERENT PLACES**:
+Your Residential VPP application exists in **THREE DIFFERENT PLACES**:
 
 ### 1.1 On Your Computer (Host Machine)
 - **Location**: `C:\Users\Kasutaja\OneDrive - Tallinna Tehnikaülikool\Documents\Playground\Real_Time_Control_Energy-Flexibility\`
@@ -411,7 +411,7 @@ $ docker compose up -d
 
 **What happens:**
 - Docker reads `compose.yaml`
-- Pulls images: `timescale/timescaledb:latest-pg17`, `postgres:16`, builds `coverly-airflow:local`
+- Pulls images: `timescale/timescaledb:latest-pg17`, `postgres:16`, builds `residential_vpp-airflow:local`
 - Creates a Docker network: `real_time_control_energy-flexibility_default`
 - Starts 5 containers in order:
   1. airflow-postgres (needed before airflow-init)

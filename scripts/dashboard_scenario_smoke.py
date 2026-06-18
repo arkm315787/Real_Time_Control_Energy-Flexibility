@@ -135,7 +135,7 @@ def main() -> None:
     ]:
         if fragment not in source:
             raise SystemExit(f"Dashboard chart polish regression guard is missing: {fragment}")
-    if not getattr(PlotlyMixin, "_coverly_download_exporter_installed", False):
+    if not getattr(PlotlyMixin, "_residential_vpp_download_exporter_installed", False):
         raise SystemExit("Streamlit Plotly renderer must be globally wrapped with figure export controls.")
     if getattr(st.plotly_chart, "__func__", None) is not PlotlyMixin.plotly_chart:
         raise SystemExit("Top-level st.plotly_chart must be rebound after wrapping PlotlyMixin.plotly_chart.")

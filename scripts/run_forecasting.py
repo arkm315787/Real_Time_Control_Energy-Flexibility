@@ -28,7 +28,7 @@ DEFAULT_PREDICTORS = [
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a Coverly forecast model outside the dashboard.")
+    parser = argparse.ArgumentParser(description="Train a Residential VPP forecast model outside the dashboard.")
     parser.add_argument("--target", default="net_load_baseline_kw")
     parser.add_argument("--predictors", default=",".join(DEFAULT_PREDICTORS))
     parser.add_argument("--lags", type=int, default=4)

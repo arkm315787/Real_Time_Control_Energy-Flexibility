@@ -34,7 +34,7 @@ DEFAULT_PREDICTORS = [
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Coverly MPC/MILP optimization outside the dashboard.")
+    parser = argparse.ArgumentParser(description="Run Residential VPP MPC/MILP optimization outside the dashboard.")
     parser.add_argument("--market-mode", choices=["Combined", "FCR-N", "aFRR"], default="Combined")
     parser.add_argument("--resource-mode", choices=["Hybrid portfolio", "Fast only"], default="Hybrid portfolio")
     parser.add_argument("--horizon-hours", type=float, default=24)

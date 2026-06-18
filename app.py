@@ -1,5 +1,5 @@
 """
-Coverly: Aggregated Residential Flexibility for Fingrid Balancing Markets
+Residential VPP: Aggregated Residential Flexibility for Fingrid Balancing Markets
 ============================================================================
 
 README
@@ -64,7 +64,7 @@ from utils.data_sync import merge_market_data
 PLUGIN_REGISTRY = register_default_plugins(get_global_registry())
 
 st.set_page_config(
-    page_title="Coverly",
+    page_title="Residential VPP",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -261,7 +261,7 @@ def render_sidebar_runtime(context: Dict[str, str]) -> None:
     st.sidebar.markdown(
         f"""
         <div class="sidebar-brand">
-            <div class="sidebar-eyebrow">Coverly VPP</div>
+            <div class="sidebar-eyebrow">Residential VPP</div>
             <div class="sidebar-title">MPC Market Console</div>
         </div>
         <div class="runtime-card">
@@ -888,17 +888,17 @@ def apply_chart_style(fig: go.Figure, template: str, height: int | None = None, 
 
 def plotly_export_name(fig: go.Figure, key: object | None = None) -> str:
     title = fig.layout.title.text if fig.layout.title and fig.layout.title.text else None
-    raw_name = key or title or "coverly-chart"
+    raw_name = key or title or "residential-vpp-chart"
     raw_name = re.sub(r"<[^>]+>", "", str(raw_name))
     slug = re.sub(r"[^A-Za-z0-9]+", "-", raw_name).strip("-").lower()
-    return (slug or "coverly-chart")[:72]
+    return (slug or "residential-vpp-chart")[:72]
 
 
 def plotly_download_config(fig: go.Figure | None, config: Dict[str, object] | None = None, key: object | None = None) -> Dict[str, object]:
     merged = dict(config or {})
     image_options = dict(merged.get("toImageButtonOptions") or {})
     image_options.setdefault("format", "png")
-    image_options.setdefault("filename", plotly_export_name(fig, key) if fig is not None else "coverly-chart")
+    image_options.setdefault("filename", plotly_export_name(fig, key) if fig is not None else "residential-vpp-chart")
     image_options.setdefault("scale", 2)
     merged["toImageButtonOptions"] = image_options
     merged.setdefault("displayModeBar", True)
@@ -945,7 +945,7 @@ def render_plotly_download_controls(container, fig: go.Figure, key: object | Non
 
 
 def install_plotly_download_exporter() -> None:
-    if getattr(PlotlyMixin, "_coverly_download_exporter_installed", False):
+    if getattr(PlotlyMixin, "_residential_vpp_download_exporter_installed", False):
         st.plotly_chart = st._main.plotly_chart
         return
     native_plotly_chart = PlotlyMixin.plotly_chart
@@ -961,7 +961,7 @@ def install_plotly_download_exporter() -> None:
 
     PlotlyMixin.plotly_chart = downloadable_plotly_chart
     st.plotly_chart = st._main.plotly_chart
-    PlotlyMixin._coverly_download_exporter_installed = True
+    PlotlyMixin._residential_vpp_download_exporter_installed = True
 
 
 install_plotly_download_exporter()
@@ -2348,7 +2348,7 @@ def main() -> None:
             <div class="ops-header">
                 <div>
                     <div class="ops-kicker">MPC market console</div>
-                    <div class="ops-title">Coverly VPP Operations</div>
+                    <div class="ops-title">Residential VPP Operations</div>
                     <div class="ops-subtitle">Residential flexibility, market readiness, and MPC control state for Fingrid reserve products.</div>
                 </div>
                 <div class="ops-header-meta">
@@ -2435,7 +2435,7 @@ def main() -> None:
         export_col.download_button(
             "Download active training data as CSV",
             data=df.to_csv().encode("utf-8"),
-            file_name="coverly_training_data.csv",
+            file_name="residential_vpp_training_data.csv",
             mime="text/csv",
         )
         explain_col.info(
@@ -4021,17 +4021,17 @@ def main() -> None:
         tracking_export = result.get("tracking_4s", pd.DataFrame())
 
         export_left, export_right = st.columns([1, 1])
-        export_left.download_button("Download simulation bundle (JSON)", data=json.dumps(summary, indent=2).encode("utf-8"), file_name="coverly_summary.json", mime="application/json")
+        export_left.download_button("Download simulation bundle (JSON)", data=json.dumps(summary, indent=2).encode("utf-8"), file_name="residential_vpp_summary.json", mime="application/json")
         export_right.download_button(
             "Download centralized 4-second MPC trace (CSV)",
             data=(tracking_export if not tracking_export.empty else preview_4s).to_csv().encode("utf-8"),
-            file_name="coverly_4s_tracking.csv",
+            file_name="residential_vpp_4s_tracking.csv",
             mime="text/csv",
         )
 
         if result.get("summary"):
             pdf_bytes = make_pdf_summary(result["summary"], result["compliance"], config)
-            st.download_button("Export MPC formulation summary as PDF", data=pdf_bytes, file_name="coverly_mpc_summary.pdf", mime="application/pdf")
+            st.download_button("Export MPC formulation summary as PDF", data=pdf_bytes, file_name="residential_vpp_mpc_summary.pdf", mime="application/pdf")
 
         st.markdown("### External module artifacts")
         run_root = Path("runs")

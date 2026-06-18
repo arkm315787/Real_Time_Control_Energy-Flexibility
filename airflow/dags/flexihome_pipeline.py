@@ -1,4 +1,4 @@
-"""Legacy compact Airflow DAG for local Coverly forecasting and optimization runs."""
+"""Legacy compact Airflow DAG for local Residential VPP forecasting and optimization runs."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from flexihome_airflow_common import DEFAULT_ARGS, PRODUCTION_TAGS, RUNS_ROOT, S
 
 with DAG(
     dag_id="flexihome_local_pipeline",
-    description="Run Coverly forecasting and MPC optimization modules as local artifacts.",
+    description="Run Residential VPP forecasting and MPC optimization modules as local artifacts.",
     default_args=DEFAULT_ARGS,
     start_date=START_DATE,
     schedule=None,

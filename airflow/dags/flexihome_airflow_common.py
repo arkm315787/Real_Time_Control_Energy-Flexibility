@@ -1,4 +1,4 @@
-"""Shared Airflow defaults and command helpers for Coverly DAGs."""
+"""Shared Airflow defaults and command helpers for Residential VPP DAGs."""
 
 from __future__ import annotations
 
@@ -12,14 +12,14 @@ RUNS_ROOT = f"{PROJECT_ROOT}/runs"
 START_DATE = pendulum.datetime(2026, 1, 1, tz="UTC")
 
 DEFAULT_ARGS = {
-    "owner": "coverly",
+    "owner": "residential_vpp",
     "depends_on_past": False,
     "retries": 2,
     "retry_delay": timedelta(minutes=5),
     "sla": timedelta(hours=1),
 }
 
-PRODUCTION_TAGS = ["coverly", "production"]
+PRODUCTION_TAGS = ["residential_vpp", "production"]
 
 
 def project_command(command: str) -> str:
